@@ -20,39 +20,21 @@ var (
 	tasksYAML = flag.String("tasks", "tasks.yaml", "task config YAML file")
 )
 
-func subCommand(name, desc string) *discordgo.ApplicationCommandOption {
-	return &discordgo.ApplicationCommandOption{
+func subCommandGroup(name, desc string, tasks task.Tasks) *discordgo.ApplicationCommandOption {
+	aco := &discordgo.ApplicationCommandOption{
 		Name:        name,
 		Description: desc,
-		Type:        discordgo.ApplicationCommandOptionSubCommand,
-		Options: []*discordgo.ApplicationCommandOption{
-			{
-				Name:        "task",
-				Description: "Task name",
-				Type:        discordgo.ApplicationCommandOptionString,
-				Required:    true,
-			},
-		},
+		Type:        discordgo.ApplicationCommandOptionSubCommandGroup,
 	}
+	for _, t := range tasks.Tasks {
+		aco.Options = append(aco.Options, &discordgo.ApplicationCommandOption{
+			Name:        t.Name,
+			Description: t.Name,
+			Type:        discordgo.ApplicationCommandOptionSubCommand,
+		})
+	}
+	return aco
 }
-
-var (
-	defaultMemberPermissions int64 = discordgo.PermissionManageServer
-
-	commands = []*discordgo.ApplicationCommand{
-		{
-			Name:        "ops",
-			Description: "MezzaOps",
-			Type:        discordgo.ChatApplicationCommand,
-			Options: []*discordgo.ApplicationCommandOption{
-				subCommand("start", "Start"),
-				subCommand("stop", "Stop"),
-				subCommand("restart", "Restart"),
-				subCommand("logs", "Logs"),
-			},
-		},
-	}
-)
 
 type stdoutMessager struct{}
 
@@ -72,6 +54,20 @@ func main() {
 		log.Fatal(err)
 	}
 	tasks.StartAll(stdoutMessager{})
+
+	commands := []*discordgo.ApplicationCommand{
+		{
+			Name:        "ops",
+			Description: "MezzaOps",
+			Type:        discordgo.ChatApplicationCommand,
+			Options: []*discordgo.ApplicationCommandOption{
+				subCommandGroup("start", "Start", tasks),
+				subCommandGroup("stop", "Stop", tasks),
+				subCommandGroup("restart", "Restart", tasks),
+				subCommandGroup("logs", "Logs", tasks),
+			},
+		},
+	}
 
 	token, err := ioutil.ReadFile("token.txt")
 	if err != nil {
@@ -95,9 +91,7 @@ func main() {
 			if len(options) != 0 {
 				msg = options[0].Name
 				for _, opt := range options[0].Options {
-					if opt.Name == "task" {
-						task = opt.StringValue()
-					}
+					task = opt.Name
 				}
 			}
 			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -109,23 +103,16 @@ func main() {
 		}
 	})
 
-	var cmds []*discordgo.ApplicationCommand
-	for _, c := range commands {
-		cmd, err := session.ApplicationCommandCreate(session.State.User.ID, *guildID, c)
-		if err != nil {
-			log.Fatal(err)
-		}
-		cmds = append(cmds, cmd)
+	_, err = session.ApplicationCommandBulkOverwrite(session.State.User.ID, *guildID, commands)
+	if err != nil {
+		log.Fatal(err)
 	}
+	defer session.ApplicationCommandBulkOverwrite(session.State.User.ID, *guildID, nil)
 
 	log.Println("Running.")
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-sc
-
-	for _, cmd := range cmds {
-		session.ApplicationCommandDelete(session.State.User.ID, *guildID, cmd.ID)
-	}
 
 	log.Println("Shutting down.")
 }
