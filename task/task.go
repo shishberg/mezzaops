@@ -32,6 +32,20 @@ func (ts *Tasks) StartAll(msg Messager) {
 	}
 }
 
+func (ts *Tasks) Get(name string) *Task {
+	for _, t := range ts.Tasks {
+		if t.Name == name {
+			return t
+		}
+	}
+	return nil
+}
+
+type syncOp struct {
+	op     string
+	result chan string
+}
+
 type Task struct {
 	Name       string   `yaml:"name"`
 	Dir        string   `yaml:"dir"`
@@ -40,7 +54,7 @@ type Task struct {
 	once        sync.Once
 	msg         Messager
 	cmd         *exec.Cmd
-	op          chan string
+	op          chan syncOp
 	stopped     chan bool
 	restartNext bool
 	// TODO: auto restart
@@ -52,14 +66,19 @@ type Task struct {
 func (t *Task) Loop(msg Messager) {
 	t.once.Do(func() {
 		t.msg = msg
-		t.op = make(chan string, 10)
+		t.op = make(chan syncOp, 10)
 		t.stopped = make(chan bool)
 		go t.loop()
 	})
 }
 
-func (t *Task) Do(op string) {
-	t.op <- op
+func (t *Task) Do(op string) string {
+	so := syncOp{
+		op:     op,
+		result: make(chan string),
+	}
+	t.op <- so
+	return <-so.result
 }
 
 func (t *Task) loop() {
@@ -67,7 +86,10 @@ func (t *Task) loop() {
 	for {
 		select {
 		case op := <-t.op:
-			t.do(op)
+			result := t.do(op.op)
+			if op.result != nil {
+				op.result <- result
+			}
 
 		case <-t.stopped:
 			t.msg.Send("stopped")
@@ -106,13 +128,14 @@ func (t *Task) start() string {
 	}
 	t.cmd = exec.Command(t.Entrypoint[0], t.Entrypoint[1:]...)
 	t.cmd.Dir = t.Dir
+
+	go t.readToLog(t.cmd.StderrPipe())
+	go t.readToLog(t.cmd.StdoutPipe())
+
 	if err := t.cmd.Start(); err != nil {
 		t.cmd = nil
 		return fmt.Sprintf("couldn't start: %v", err)
 	}
-
-	go t.readToLog(t.cmd.StderrPipe())
-	go t.readToLog(t.cmd.StdoutPipe())
 
 	go func() {
 		if err := t.cmd.Wait(); err != nil {
@@ -145,10 +168,13 @@ func (t *Task) readToLog(in io.ReadCloser, err error) {
 }
 
 func (t *Task) stop() string {
-	if t.cmd != nil && t.cmd.Process != nil {
+	if t.cmd == nil {
+		return "already stopped"
+	}
+	if t.cmd.Process != nil {
 		t.cmd.Process.Kill()
 	}
-	return "stopping..."
+	return "stopping"
 }
 
 func (t *Task) logs() string {
@@ -156,10 +182,16 @@ func (t *Task) logs() string {
 	defer t.muLog.Unlock()
 	log := t.logbuf.String()
 	t.logbuf = bytes.Buffer{}
-	return log
+	if log == "" {
+		return "empty logs"
+	}
+	return fmt.Sprintf("```%s```", log)
 }
 
 func (t *Task) restart() string {
+	if t.cmd == nil {
+		return t.start()
+	}
 	t.restartNext = true
 	t.stop()
 	return "restarting..."

@@ -85,19 +85,36 @@ func main() {
 	session.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		switch i.ApplicationCommandData().Name {
 		case "ops":
-			options := i.ApplicationCommandData().Options
-			msg := "ops"
-			var task string
-			if len(options) != 0 {
-				msg = options[0].Name
-				for _, opt := range options[0].Options {
-					task = opt.Name
+			resp := func() string {
+				var opOpt, taskOpt *discordgo.ApplicationCommandInteractionDataOption
+				for _, opt := range i.ApplicationCommandData().Options {
+					if opt.Type == discordgo.ApplicationCommandOptionSubCommandGroup {
+						opOpt = opt
+						break
+					}
 				}
-			}
+				if opOpt == nil {
+					return "operation required"
+				}
+				for _, opt := range opOpt.Options {
+					if opt.Type == discordgo.ApplicationCommandOptionSubCommand {
+						taskOpt = opt
+						break
+					}
+				}
+				if taskOpt == nil {
+					return "task required"
+				}
+				task := tasks.Get(taskOpt.Name)
+				if task == nil {
+					return "unknown task " + taskOpt.Name
+				}
+				return fmt.Sprintf("%s: %s", taskOpt.Name, task.Do(opOpt.Name))
+			}()
 			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 				Type: discordgo.InteractionResponseChannelMessageWithSource,
 				Data: &discordgo.InteractionResponseData{
-					Content: fmt.Sprintf("Hello %s %s!", msg, task),
+					Content: resp,
 				},
 			})
 		}
