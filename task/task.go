@@ -2,6 +2,7 @@ package task
 
 import (
 	"bytes"
+	"io"
 	"os/exec"
 	"sync"
 )
@@ -22,7 +23,10 @@ type Task struct {
 	op          chan string
 	stopped     chan bool
 	restartNext bool
-	logbuf      bytes.Buffer
+	// TODO: auto restart
+
+	muLog  sync.Mutex
+	logbuf bytes.Buffer
 }
 
 func (t *Task) Loop() {
@@ -43,6 +47,7 @@ func (t *Task) loop() {
 		select {
 		case op := <-t.op:
 			t.do(op)
+
 		case <-t.stopped:
 			t.Messager.Send("stopped")
 			t.cmd = nil
@@ -87,6 +92,9 @@ func (t *Task) start() {
 	}
 	t.Messager.Send("started")
 
+	go t.readToLog(t.cmd.StderrPipe())
+	go t.readToLog(t.cmd.StdoutPipe())
+
 	go func() {
 		if err := t.cmd.Wait(); err != nil {
 			t.Messager.Send("Wait(): %v", err)
@@ -96,6 +104,26 @@ func (t *Task) start() {
 	}()
 }
 
+func (t *Task) readToLog(in io.ReadCloser, err error) {
+	if err != nil {
+		// TODO: what?
+		return
+	}
+	var buf [1024]byte
+	for {
+		n, err := in.Read(buf[:])
+		if n > 0 {
+			t.muLog.Lock()
+			_, _ = t.logbuf.Write(buf[:n])
+			t.muLog.Unlock()
+		}
+		if err != nil {
+			// TODO: check it's EOF
+			break
+		}
+	}
+}
+
 func (t *Task) stop() {
 	if t.cmd != nil && t.cmd.Process != nil {
 		t.cmd.Process.Kill()
@@ -103,6 +131,11 @@ func (t *Task) stop() {
 }
 
 func (t *Task) log() {
+	t.muLog.Lock()
+	defer t.muLog.Unlock()
+	log := t.logbuf.String()
+	t.Messager.Send("```%s```", log)
+	t.logbuf = bytes.Buffer{}
 }
 
 func (t *Task) restart() {
