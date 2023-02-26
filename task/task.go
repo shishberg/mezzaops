@@ -1,36 +1,35 @@
 package task
 
 import (
-	"fmt"
+	"bytes"
 	"os/exec"
 	"sync"
 )
 
-type State int
-
-// const (
-// 	StateStopped State = iota
-// 	StateRunning       = iota
-// 	StateError         = iota
-// )
+type Messager interface {
+	Send(fmt string, args ...any)
+}
 
 type Task struct {
+	Name       string   `yaml:"name"`
 	Dir        string   `yaml:"dir"`
 	Entrypoint []string `yaml:"entrypoint"`
+
+	Messager Messager
 
 	once        sync.Once
 	cmd         *exec.Cmd
 	op          chan string
 	stopped     chan bool
 	restartNext bool
-	logbuf      string
+	logbuf      bytes.Buffer
 }
 
 func (t *Task) Loop() {
 	t.once.Do(func() {
 		t.op = make(chan string, 10)
 		t.stopped = make(chan bool)
-		t.loop()
+		go t.loop()
 	})
 }
 
@@ -45,9 +44,10 @@ func (t *Task) loop() {
 		case op := <-t.op:
 			t.do(op)
 		case <-t.stopped:
-			// TODO: print status
+			t.Messager.Send("stopped")
 			t.cmd = nil
 			if t.restartNext {
+				t.Messager.Send("restarting...")
 				t.restartNext = false
 				t.start()
 			}
@@ -66,27 +66,32 @@ func (t *Task) do(op string) {
 	case "log":
 		t.log()
 	default:
-		// TODO: return error
+		t.Messager.Send("unknown command %s", op)
 	}
 }
 
 func (t *Task) start() {
 	if t.cmd != nil {
-		// TODO: say "already running"
+		t.Messager.Send("already running")
 		return
 	}
 
-	// TODO: error if len(t.Entrypoint) == 0
+	if len(t.Entrypoint) == 0 {
+		t.Messager.Send("no entrypoint")
+		return
+	}
 	t.cmd = exec.Command(t.Entrypoint[0], t.Entrypoint[1:]...)
 	if err := t.cmd.Start(); err != nil {
-		// TODO: return this immediately
-		t.logbuf += fmt.Sprintf("%v\n", err)
+		t.Messager.Send("couldn't start: %v", err)
 		t.cmd = nil
 	}
+	t.Messager.Send("started")
+
 	go func() {
 		if err := t.cmd.Wait(); err != nil {
-			// TODO: log error
+			t.Messager.Send("Wait(): %v", err)
 		}
+		t.Messager.Send("stopped")
 		t.stopped <- true
 	}()
 }
@@ -101,5 +106,6 @@ func (t *Task) log() {
 }
 
 func (t *Task) restart() {
-
+	t.restartNext = true
+	t.stop()
 }
