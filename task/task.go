@@ -6,10 +6,30 @@ import (
 	"io"
 	"os/exec"
 	"sync"
+
+	"github.com/go-yaml/yaml"
 )
 
+func ParseYAML(data []byte) (Tasks, error) {
+	var tasks Tasks
+	if err := yaml.Unmarshal(data, &tasks); err != nil {
+		return Tasks{}, err
+	}
+	return tasks, nil
+}
+
 type Messager interface {
-	Send(fmt string, args ...any)
+	Send(format string, args ...any)
+}
+
+type Tasks struct {
+	Tasks []*Task `yaml:"task"`
+}
+
+func (ts *Tasks) StartAll(msg Messager) {
+	for _, t := range ts.Tasks {
+		t.Loop(msg)
+	}
 }
 
 type Task struct {
@@ -17,9 +37,8 @@ type Task struct {
 	Dir        string   `yaml:"dir"`
 	Entrypoint []string `yaml:"entrypoint"`
 
-	Messager Messager
-
 	once        sync.Once
+	msg         Messager
 	cmd         *exec.Cmd
 	op          chan string
 	stopped     chan bool
@@ -30,8 +49,9 @@ type Task struct {
 	logbuf bytes.Buffer
 }
 
-func (t *Task) Loop() {
+func (t *Task) Loop(msg Messager) {
 	t.once.Do(func() {
+		t.msg = msg
 		t.op = make(chan string, 10)
 		t.stopped = make(chan bool)
 		go t.loop()
@@ -43,17 +63,17 @@ func (t *Task) Do(op string) {
 }
 
 func (t *Task) loop() {
-	t.start()
+	t.msg.Send(t.start())
 	for {
 		select {
 		case op := <-t.op:
 			t.do(op)
 
 		case <-t.stopped:
-			t.Messager.Send("stopped")
+			t.msg.Send("stopped")
 			t.cmd = nil
 			if t.restartNext {
-				t.Messager.Send("restarting...")
+				t.msg.Send("restarting...")
 				t.restartNext = false
 				t.start()
 			}
@@ -85,6 +105,7 @@ func (t *Task) start() string {
 		return "no entrypoint"
 	}
 	t.cmd = exec.Command(t.Entrypoint[0], t.Entrypoint[1:]...)
+	t.cmd.Dir = t.Dir
 	if err := t.cmd.Start(); err != nil {
 		t.cmd = nil
 		return fmt.Sprintf("couldn't start: %v", err)
@@ -95,9 +116,8 @@ func (t *Task) start() string {
 
 	go func() {
 		if err := t.cmd.Wait(); err != nil {
-			t.Messager.Send("Wait(): %v", err)
+			t.msg.Send("Wait(): %v", err)
 		}
-		t.Messager.Send("stopped")
 		t.stopped <- true
 	}()
 

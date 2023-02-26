@@ -11,11 +11,13 @@ import (
 	"syscall"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/shishberg/mezzaops/task"
 )
 
 var (
 	tokenFile = flag.String("token", "token.txt", "file containing the bot token")
 	guildID   = flag.String("guild-id", "", "Guild ID, or empty to register globally")
+	tasksYAML = flag.String("tasks", "tasks.yaml", "task config YAML file")
 )
 
 func subCommand(name, desc string) *discordgo.ApplicationCommandOption {
@@ -52,8 +54,24 @@ var (
 	}
 )
 
+type stdoutMessager struct{}
+
+func (s stdoutMessager) Send(format string, args ...any) {
+	log.Println(fmt.Sprintf(format, args...))
+}
+
 func main() {
 	flag.Parse()
+
+	yaml, err := ioutil.ReadFile(*tasksYAML)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tasks, err := task.ParseYAML(yaml)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tasks.StartAll(stdoutMessager{})
 
 	token, err := ioutil.ReadFile("token.txt")
 	if err != nil {
