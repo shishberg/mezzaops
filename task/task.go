@@ -128,6 +128,8 @@ func (t *Task) do(op string) string {
 		return t.restart()
 	case "logs":
 		return t.logs()
+	case "pull":
+		return t.pull()
 	default:
 		return fmt.Sprintf("unknown command %s", op)
 	}
@@ -144,8 +146,8 @@ func (t *Task) start() string {
 	t.cmd = exec.Command(t.Entrypoint[0], t.Entrypoint[1:]...)
 	t.cmd.Dir = t.Dir
 
-	go t.readToLog(t.cmd.StderrPipe())
 	go t.readToLog(t.cmd.StdoutPipe())
+	go t.readToLog(t.cmd.StderrPipe())
 
 	if err := t.cmd.Start(); err != nil {
 		t.cmd = nil
@@ -210,4 +212,33 @@ func (t *Task) restart() string {
 	t.restartNext = true
 	t.stop()
 	return "restarting..."
+}
+
+func (t *Task) pull() string {
+	pullCmd := exec.Command("git", "pull")
+	pullCmd.Dir = t.Dir
+
+	stdout, err := pullCmd.StdoutPipe()
+	if err != nil {
+		return err.Error()
+	}
+	stderr, err := pullCmd.StderrPipe()
+	if err != nil {
+		return err.Error()
+	}
+
+	if err := pullCmd.Start(); err != nil {
+		return err.Error()
+	}
+
+	stdoutData, _ := io.ReadAll(stdout)
+	stderrData, _ := io.ReadAll(stderr)
+	out := string(stdoutData) + string(stderrData)
+	if out != "" {
+		out = "```" + out + "```"
+	}
+	if err := pullCmd.Wait(); err != nil {
+		out += err.Error()
+	}
+	return out
 }
