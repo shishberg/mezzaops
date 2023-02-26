@@ -11,7 +11,7 @@ mezzaops --guild_id=$SERVER_ID --channel-id=$CHANNEL_ID
 
 The processes managed by the server are configured in `tasks.yaml`.
 
-Commands currently available:
+Commands currently available (followed by a task name):
 * `/ops start`
 * `/ops stop`
 * `/ops restart`
