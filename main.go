@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
@@ -25,6 +26,28 @@ var (
 			Name:        "ops",
 			Description: "MezzaOps",
 			Type:        discordgo.ChatApplicationCommand,
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Name:        "start",
+					Description: "Start",
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+				},
+				{
+					Name:        "stop",
+					Description: "Stop",
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+				},
+				{
+					Name:        "restart",
+					Description: "Restart",
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+				},
+				{
+					Name:        "logs",
+					Description: "Logs",
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+				},
+			},
 		},
 	}
 )
@@ -48,11 +71,15 @@ func main() {
 	session.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		switch i.ApplicationCommandData().Name {
 		case "ops":
-			log.Println("hello")
+			options := i.ApplicationCommandData().Options
+			msg := "ops"
+			if len(options) != 0 {
+				msg = options[0].Name
+			}
 			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 				Type: discordgo.InteractionResponseChannelMessageWithSource,
 				Data: &discordgo.InteractionResponseData{
-					Content: "Hello ops!",
+					Content: fmt.Sprintf("Hello %s!", msg),
 				},
 			})
 		}

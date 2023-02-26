@@ -2,6 +2,7 @@ package task
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os/exec"
 	"sync"
@@ -60,37 +61,34 @@ func (t *Task) loop() {
 	}
 }
 
-func (t *Task) do(op string) {
+func (t *Task) do(op string) string {
 	switch op {
 	case "start":
-		t.start()
+		return t.start()
 	case "stop":
-		t.stop()
+		return t.stop()
 	case "restart":
-		t.restart()
-	case "log":
-		t.log()
+		return t.restart()
+	case "logs":
+		return t.logs()
 	default:
-		t.Messager.Send("unknown command %s", op)
+		return fmt.Sprintf("unknown command %s", op)
 	}
 }
 
-func (t *Task) start() {
+func (t *Task) start() string {
 	if t.cmd != nil {
-		t.Messager.Send("already running")
-		return
+		return "already running"
 	}
 
 	if len(t.Entrypoint) == 0 {
-		t.Messager.Send("no entrypoint")
-		return
+		return "no entrypoint"
 	}
 	t.cmd = exec.Command(t.Entrypoint[0], t.Entrypoint[1:]...)
 	if err := t.cmd.Start(); err != nil {
-		t.Messager.Send("couldn't start: %v", err)
 		t.cmd = nil
+		return fmt.Sprintf("couldn't start: %v", err)
 	}
-	t.Messager.Send("started")
 
 	go t.readToLog(t.cmd.StderrPipe())
 	go t.readToLog(t.cmd.StdoutPipe())
@@ -102,6 +100,8 @@ func (t *Task) start() {
 		t.Messager.Send("stopped")
 		t.stopped <- true
 	}()
+
+	return "started"
 }
 
 func (t *Task) readToLog(in io.ReadCloser, err error) {
@@ -124,21 +124,23 @@ func (t *Task) readToLog(in io.ReadCloser, err error) {
 	}
 }
 
-func (t *Task) stop() {
+func (t *Task) stop() string {
 	if t.cmd != nil && t.cmd.Process != nil {
 		t.cmd.Process.Kill()
 	}
+	return "stopping..."
 }
 
-func (t *Task) log() {
+func (t *Task) logs() string {
 	t.muLog.Lock()
 	defer t.muLog.Unlock()
 	log := t.logbuf.String()
-	t.Messager.Send("```%s```", log)
 	t.logbuf = bytes.Buffer{}
+	return log
 }
 
-func (t *Task) restart() {
+func (t *Task) restart() string {
 	t.restartNext = true
 	t.stop()
+	return "restarting..."
 }
