@@ -128,6 +128,8 @@ func (t *Task) do(op string) string {
 		return t.restart()
 	case "logs":
 		return t.logs()
+	case "status":
+		return t.status()
 	case "pull":
 		return t.pull()
 	default:
@@ -203,6 +205,13 @@ func (t *Task) logs() string {
 		return "empty logs"
 	}
 	return fmt.Sprintf("```%s```", log)
+}
+
+func (t *Task) status() string {
+	if t.cmd == nil {
+		return "stopped"
+	}
+	return "running"
 }
 
 func (t *Task) restart() string {

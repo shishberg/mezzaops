@@ -77,6 +77,7 @@ func main() {
 				subCommandGroup("stop", "Stop", tasks),
 				subCommandGroup("restart", "Restart", tasks),
 				subCommandGroup("logs", "Logs", tasks),
+				subCommandGroup("status", "Status", tasks),
 				subCommandGroup("pull", "git pull", tasks),
 			},
 		},
