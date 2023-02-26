@@ -17,6 +17,7 @@ import (
 var (
 	tokenFile = flag.String("token", "token.txt", "file containing the bot token")
 	guildID   = flag.String("guild-id", "", "Guild ID, or empty to register globally")
+	channelID = flag.String("channel-id", "", "Channel ID for broadcast messages")
 	tasksYAML = flag.String("tasks", "tasks.yaml", "task config YAML file")
 )
 
@@ -42,6 +43,18 @@ func (s stdoutMessager) Send(format string, args ...any) {
 	log.Println(fmt.Sprintf(format, args...))
 }
 
+type channelMessager struct {
+	session   *discordgo.Session
+	channelID string
+}
+
+func (c channelMessager) Send(format string, args ...any) {
+	_, err := c.session.ChannelMessageSend(c.channelID, fmt.Sprintf(format, args...))
+	if err != nil {
+		log.Println(err)
+	}
+}
+
 func main() {
 	flag.Parse()
 
@@ -53,7 +66,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	tasks.StartAll(stdoutMessager{})
 
 	commands := []*discordgo.ApplicationCommand{
 		{
@@ -81,6 +93,14 @@ func main() {
 		log.Fatal(err)
 	}
 	defer session.Close()
+
+	var msgr task.Messager
+	if *channelID != "" {
+		msgr = channelMessager{session, *channelID}
+	} else {
+		msgr = stdoutMessager{}
+	}
+	tasks.StartAll(msgr)
 
 	session.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		switch i.ApplicationCommandData().Name {
@@ -130,6 +150,8 @@ func main() {
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-sc
+
+	tasks.StopAll()
 
 	log.Println("Shutting down.")
 }

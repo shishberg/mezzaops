@@ -18,17 +18,32 @@ func ParseYAML(data []byte) (Tasks, error) {
 	return tasks, nil
 }
 
-type Messager interface {
-	Send(format string, args ...any)
-}
-
 type Tasks struct {
 	Tasks []*Task `yaml:"task"`
 }
 
-func (ts *Tasks) StartAll(msg Messager) {
+type Messager interface {
+	Send(format string, args ...any)
+}
+
+type prefixMessager struct {
+	prefix string
+	next   Messager
+}
+
+func (p prefixMessager) Send(format string, args ...any) {
+	p.next.Send("%s: %s", p.prefix, fmt.Sprintf(format, args...))
+}
+
+func (ts *Tasks) StartAll(msgr Messager) {
 	for _, t := range ts.Tasks {
-		t.Loop(msg)
+		t.Loop(prefixMessager{t.Name, msgr})
+	}
+}
+
+func (ts *Tasks) StopAll() {
+	for _, t := range ts.Tasks {
+		t.stop()
 	}
 }
 
