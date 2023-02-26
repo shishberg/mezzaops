@@ -6,6 +6,7 @@ import (
 	"io"
 	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/go-yaml/yaml"
 )
@@ -109,6 +110,11 @@ func (t *Task) loop() {
 		case <-t.stopped:
 			t.msg.Send("stopped")
 			t.cmd = nil
+
+			t.muLog.Lock()
+			t.logbuf.WriteString(fmt.Sprintf("=== Stopped at %s ===\n", time.Now().Format(time.RFC3339)))
+			t.muLog.Unlock()
+
 			if t.restartNext {
 				t.msg.Send("restarting...")
 				t.restartNext = false
@@ -148,13 +154,26 @@ func (t *Task) start() string {
 	t.cmd = exec.Command(t.Entrypoint[0], t.Entrypoint[1:]...)
 	t.cmd.Dir = t.Dir
 
-	go t.readToLog(t.cmd.StdoutPipe())
-	go t.readToLog(t.cmd.StderrPipe())
+	stdout, err := t.cmd.StdoutPipe()
+	if err != nil {
+		return err.Error()
+	}
+	stderr, err := t.cmd.StderrPipe()
+	if err != nil {
+		return err.Error()
+	}
 
 	if err := t.cmd.Start(); err != nil {
 		t.cmd = nil
 		return fmt.Sprintf("couldn't start: %v", err)
 	}
+
+	t.muLog.Lock()
+	t.logbuf.WriteString(fmt.Sprintf("=== Started at %s ===\n", time.Now().Format(time.RFC3339)))
+	t.muLog.Unlock()
+
+	go t.readToLog(stdout)
+	go t.readToLog(stderr)
 
 	go func() {
 		if err := t.cmd.Wait(); err != nil {
@@ -166,11 +185,7 @@ func (t *Task) start() string {
 	return "started"
 }
 
-func (t *Task) readToLog(in io.ReadCloser, err error) {
-	if err != nil {
-		// TODO: what?
-		return
-	}
+func (t *Task) readToLog(in io.ReadCloser) {
 	var buf [1024]byte
 	for {
 		n, err := in.Read(buf[:])
