@@ -21,7 +21,7 @@ var (
 	tasksYAML = flag.String("tasks", "tasks.yaml", "task config YAML file")
 )
 
-func subCommandGroup(name, desc string, tasks task.Tasks) *discordgo.ApplicationCommandOption {
+func subCommandGroup(name, desc string, tasks *task.Tasks) *discordgo.ApplicationCommandOption {
 	aco := &discordgo.ApplicationCommandOption{
 		Name:        name,
 		Description: desc,
@@ -58,11 +58,7 @@ func (c channelMessager) Send(format string, args ...any) {
 func main() {
 	flag.Parse()
 
-	yaml, err := ioutil.ReadFile(*tasksYAML)
-	if err != nil {
-		log.Fatal(err)
-	}
-	tasks, err := task.ParseYAML(yaml)
+	tasks, err := task.ReadConfig(*tasksYAML)
 	if err != nil {
 		log.Fatal(err)
 	}

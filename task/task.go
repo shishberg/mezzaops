@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"reflect"
 	"sync"
 	"time"
 
@@ -17,10 +18,6 @@ func ParseYAML(data []byte) (Tasks, error) {
 		return Tasks{}, err
 	}
 	return tasks, nil
-}
-
-type Tasks struct {
-	Tasks []*Task `yaml:"task"`
 }
 
 type Messager interface {
@@ -77,6 +74,10 @@ type Task struct {
 
 	muLog  sync.Mutex
 	logbuf bytes.Buffer
+}
+
+func (t *Task) Equal(t2 *Task) bool {
+	return t.Name == t2.Name && t.Dir == t2.Dir && reflect.DeepEqual(t.Entrypoint, t2.Entrypoint)
 }
 
 func (t *Task) Loop(msg Messager) {
