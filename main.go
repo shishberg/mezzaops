@@ -21,6 +21,15 @@ var (
 	tasksYAML = flag.String("tasks", "tasks.yaml", "task config YAML file")
 )
 
+func subCommand(name, desc string) *discordgo.ApplicationCommandOption {
+	aco := &discordgo.ApplicationCommandOption{
+		Name:        name,
+		Description: desc,
+		Type:        discordgo.ApplicationCommandOptionSubCommand,
+	}
+	return aco
+}
+
 func subCommandGroup(name, desc string, tasks *task.Tasks) *discordgo.ApplicationCommandOption {
 	aco := &discordgo.ApplicationCommandOption{
 		Name:        name,
@@ -83,21 +92,25 @@ func main() {
 		log.Fatal(err)
 	}
 
-	commands := []*discordgo.ApplicationCommand{
-		{
-			Name:        "ops",
-			Description: "MezzaOps",
-			Type:        discordgo.ChatApplicationCommand,
-			Options: []*discordgo.ApplicationCommandOption{
-				subCommandGroup("start", "Start", tasks),
-				subCommandGroup("stop", "Stop", tasks),
-				subCommandGroup("restart", "Restart", tasks),
-				subCommandGroup("logs", "Logs", tasks),
-				subCommandGroup("status", "Status", tasks),
-				subCommandGroup("pull", "git pull", tasks),
+	buildCommands := func(t *task.Tasks) []*discordgo.ApplicationCommand {
+		return []*discordgo.ApplicationCommand{
+			{
+				Name:        "ops",
+				Description: "MezzaOps",
+				Type:        discordgo.ChatApplicationCommand,
+				Options: []*discordgo.ApplicationCommandOption{
+					subCommand("reload", "Reload config"),
+					subCommandGroup("start", "Start", tasks),
+					subCommandGroup("stop", "Stop", tasks),
+					subCommandGroup("restart", "Restart", tasks),
+					subCommandGroup("logs", "Logs", tasks),
+					subCommandGroup("status", "Status", tasks),
+					subCommandGroup("pull", "git pull", tasks),
+				},
 			},
-		},
+		}
 	}
+	commands := buildCommands(tasks)
 
 	session.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		switch i.ApplicationCommandData().Name {
@@ -108,6 +121,18 @@ func main() {
 					if opt.Type == discordgo.ApplicationCommandOptionSubCommandGroup {
 						opOpt = opt
 						break
+					}
+					if opt.Type == discordgo.ApplicationCommandOptionSubCommand {
+						if opt.Name == "reload" {
+							err := tasks.Reload()
+							commands = buildCommands(tasks)
+							session.ApplicationCommandBulkOverwrite(session.State.User.ID, *guildID, commands)
+
+							if err != nil {
+								return "Config reload error: " + err.Error()
+							}
+							return "Config reloaded"
+						}
 					}
 				}
 				if opOpt == nil {
