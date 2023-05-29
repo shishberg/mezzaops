@@ -205,6 +205,11 @@ func (t *Task) logs() string {
 	if log == "" {
 		return "empty logs"
 	}
+	// Discord max message length is 2000.
+	const maxLen = 1500
+	if len(log) > maxLen {
+		log = "...\n" + log[len(log)-1500:]
+	}
 	return fmt.Sprintf("```%s```", log)
 }
 
