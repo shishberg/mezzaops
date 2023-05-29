@@ -58,27 +58,6 @@ func (c channelMessager) Send(format string, args ...any) {
 func main() {
 	flag.Parse()
 
-	tasks, err := task.ReadConfig(*tasksYAML)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	commands := []*discordgo.ApplicationCommand{
-		{
-			Name:        "ops",
-			Description: "MezzaOps",
-			Type:        discordgo.ChatApplicationCommand,
-			Options: []*discordgo.ApplicationCommandOption{
-				subCommandGroup("start", "Start", tasks),
-				subCommandGroup("stop", "Stop", tasks),
-				subCommandGroup("restart", "Restart", tasks),
-				subCommandGroup("logs", "Logs", tasks),
-				subCommandGroup("status", "Status", tasks),
-				subCommandGroup("pull", "git pull", tasks),
-			},
-		},
-	}
-
 	token, err := ioutil.ReadFile("token.txt")
 	if err != nil {
 		log.Fatal(err)
@@ -98,7 +77,27 @@ func main() {
 	} else {
 		msgr = stdoutMessager{}
 	}
-	tasks.StartAll(msgr)
+
+	tasks, err := task.StartFromConfig(*tasksYAML, msgr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	commands := []*discordgo.ApplicationCommand{
+		{
+			Name:        "ops",
+			Description: "MezzaOps",
+			Type:        discordgo.ChatApplicationCommand,
+			Options: []*discordgo.ApplicationCommandOption{
+				subCommandGroup("start", "Start", tasks),
+				subCommandGroup("stop", "Stop", tasks),
+				subCommandGroup("restart", "Restart", tasks),
+				subCommandGroup("logs", "Logs", tasks),
+				subCommandGroup("status", "Status", tasks),
+				subCommandGroup("pull", "git pull", tasks),
+			},
+		},
+	}
 
 	session.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		switch i.ApplicationCommandData().Name {

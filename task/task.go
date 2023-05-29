@@ -12,12 +12,12 @@ import (
 	"github.com/go-yaml/yaml"
 )
 
-func ParseYAML(data []byte) (Tasks, error) {
-	var tasks Tasks
-	if err := yaml.Unmarshal(data, &tasks); err != nil {
-		return Tasks{}, err
+func ParseYAML(data []byte) (TasksConfig, error) {
+	var cfg TasksConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return TasksConfig{}, err
 	}
-	return tasks, nil
+	return cfg, nil
 }
 
 type Messager interface {
@@ -31,27 +31,6 @@ type prefixMessager struct {
 
 func (p prefixMessager) Send(format string, args ...any) {
 	p.next.Send("%s: %s", p.prefix, fmt.Sprintf(format, args...))
-}
-
-func (ts *Tasks) StartAll(msgr Messager) {
-	for _, t := range ts.Tasks {
-		t.Loop(prefixMessager{t.Name, msgr})
-	}
-}
-
-func (ts *Tasks) StopAll() {
-	for _, t := range ts.Tasks {
-		t.stop()
-	}
-}
-
-func (ts *Tasks) Get(name string) *Task {
-	for _, t := range ts.Tasks {
-		if t.Name == name {
-			return t
-		}
-	}
-	return nil
 }
 
 type syncOp struct {
@@ -76,8 +55,14 @@ type Task struct {
 	logbuf bytes.Buffer
 }
 
-func (t *Task) Equal(t2 *Task) bool {
-	return t.Name == t2.Name && t.Dir == t2.Dir && reflect.DeepEqual(t.Entrypoint, t2.Entrypoint)
+func (t *Task) Update(t2 *Task) {
+	if t.Name == t2.Name && t.Dir == t2.Dir && reflect.DeepEqual(t.Entrypoint, t2.Entrypoint) {
+		return
+	}
+	t.Name = t2.Name
+	t.Dir = t2.Dir
+	t.Entrypoint = t2.Entrypoint
+	t.Do("restart")
 }
 
 func (t *Task) Loop(msg Messager) {
