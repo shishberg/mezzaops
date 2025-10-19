@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"reflect"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-yaml/yaml"
@@ -139,6 +140,8 @@ func (t *Task) start() string {
 	}
 	t.cmd = exec.Command(t.Entrypoint[0], t.Entrypoint[1:]...)
 	t.cmd.Dir = t.Dir
+	// Set process group so that any child processes get terminated at the same time
+	t.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdout, err := t.cmd.StdoutPipe()
 	if err != nil {
@@ -192,7 +195,8 @@ func (t *Task) stop() string {
 		return "already stopped"
 	}
 	if t.cmd.Process != nil {
-		t.cmd.Process.Kill()
+		// Kill the process group to include children
+		syscall.Kill(-t.cmd.Process.Pid, syscall.SIGKILL)
 	}
 	return "stopping"
 }
