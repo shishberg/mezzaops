@@ -102,6 +102,8 @@ func main() {
 				Type:        discordgo.ChatApplicationCommand,
 				Options: []*discordgo.ApplicationCommandOption{
 					subCommand("reload", "Reload config"),
+					subCommand("start-all", "Start all tasks"),
+					subCommand("stop-all", "Stop all tasks"),
 					subCommandGroup("start", "Start", tasks),
 					subCommandGroup("stop", "Stop", tasks),
 					subCommandGroup("restart", "Restart", tasks),
@@ -134,6 +136,14 @@ func main() {
 								return "Config reload error: " + err.Error()
 							}
 							return "Config reloaded"
+						}
+						if opt.Name == "start-all" {
+							tasks.StartAll()
+							return "all tasks starting"
+						}
+						if opt.Name == "stop-all" {
+							tasks.StopAll()
+							return "all tasks stopping"
 						}
 					}
 				}

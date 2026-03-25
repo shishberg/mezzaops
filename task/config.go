@@ -78,6 +78,12 @@ func (ts *Tasks) Reload() error {
 	return nil
 }
 
+func (ts *Tasks) StartAll() {
+	for _, t := range ts.Tasks {
+		t.Do("start")
+	}
+}
+
 func (ts *Tasks) StopAll() {
 	for _, t := range ts.Tasks {
 		t.Do("stop")
