@@ -175,7 +175,5 @@ func main() {
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-sc
 
-	tasks.StopAll()
-
-	log.Println("Shutting down.")
+	log.Println("Shutting down (tasks will keep running).")
 }
