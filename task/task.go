@@ -124,11 +124,10 @@ func (t *Task) loop() {
 					f.Close()
 				}
 			}
+			t.msg.Send("stopped")
 			if t.restartNext {
 				t.restartNext = false
 				t.msg.Send(t.start())
-			} else {
-				t.msg.Send("stopped")
 			}
 		}
 	}
