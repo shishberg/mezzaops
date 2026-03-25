@@ -192,3 +192,55 @@ func TestRestartMessages(t *testing.T) {
 		t.Errorf("expected no 'restarting...' in async messages (it's the sync return value), got %d in: %v", restartingCount, msgs)
 	}
 }
+
+func TestRestartOnChangeNotCalledWithStaleCount(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "tasks.yaml")
+	logDir := filepath.Join(dir, "logs")
+	stateDir := filepath.Join(dir, "state")
+
+	os.WriteFile(configFile, []byte(`task:
+- name: sleeper
+  dir: /tmp
+  entrypoint:
+    - sleep
+    - "60"
+`), 0644)
+
+	tasks, err := StartFromConfig(configFile, logDir, stateDir, noopMessager{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tasks.StopAll()
+
+	// Wait for auto-start
+	time.Sleep(500 * time.Millisecond)
+
+	// Track every running count reported via OnChange
+	var mu sync.Mutex
+	var counts []int
+	tasks.OnChange = func() {
+		running, _ := tasks.CountRunning()
+		mu.Lock()
+		counts = append(counts, running)
+		mu.Unlock()
+	}
+
+	// Restart
+	tasks.Get("sleeper").Do("restart")
+	time.Sleep(1 * time.Second)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// During restart, OnChange should never report 0 running.
+	// It should only fire once (from start()), showing 1 running.
+	for i, c := range counts {
+		if c == 0 {
+			t.Errorf("OnChange reported 0 running at call %d — stale intermediate state leaked; all counts: %v", i, counts)
+		}
+	}
+	if len(counts) == 0 {
+		t.Error("expected OnChange to be called at least once during restart")
+	}
+}
