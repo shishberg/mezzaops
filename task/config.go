@@ -3,7 +3,10 @@ package task
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 )
 
 type Tasks struct {
@@ -75,7 +78,35 @@ func (ts *Tasks) Reload() error {
 			delete(ts.Tasks, t.Name)
 		}
 	}
+
+	// Clean up orphaned processes: state files for tasks no longer in config.
+	// This handles the case where a task is removed from config while mezzaops is down.
+	ts.cleanOrphans(seen)
+
 	return nil
+}
+
+func (ts *Tasks) cleanOrphans(configuredTasks map[string]bool) {
+	entries, err := filepath.Glob(filepath.Join(ts.stateDir, "*.json"))
+	if err != nil {
+		return
+	}
+	for _, path := range entries {
+		name := strings.TrimSuffix(filepath.Base(path), ".json")
+		if configuredTasks[name] {
+			continue
+		}
+		s, err := LoadState(ts.stateDir, name)
+		if err != nil {
+			os.Remove(path)
+			continue
+		}
+		if s.PID != 0 && IsAlive(s.PID) && VerifyProcess(s) {
+			ts.msgr.Send("killing orphaned process %s (pid %d)", name, s.PID)
+			syscall.Kill(-s.PGID, syscall.SIGKILL)
+		}
+		os.Remove(path)
+	}
 }
 
 func (ts *Tasks) StartAll() {
