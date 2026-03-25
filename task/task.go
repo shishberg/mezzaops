@@ -57,7 +57,7 @@ type Task struct {
 	logDir   string
 	logPath  string
 	stateDir string
-	onChange func() // called after state transitions; may be nil
+	onChange func(taskName, event string) // called after state transitions; may be nil
 }
 
 // isRunning is safe to call from any goroutine.
@@ -65,9 +65,9 @@ func (t *Task) isRunning() bool {
 	return t.pid.Load() != 0
 }
 
-func (t *Task) notifyChange() {
+func (t *Task) notifyChange(event string) {
 	if t.onChange != nil {
-		t.onChange()
+		t.onChange(t.Name, event)
 	}
 }
 
@@ -128,9 +128,9 @@ func (t *Task) loop() {
 			t.msg.Send("stopped")
 			if t.restartNext {
 				t.restartNext = false
-				t.msg.Send(t.start()) // start() calls notifyChange() with correct count
+				t.msg.Send(t.start()) // start() calls notifyChange("started")
 			} else {
-				t.notifyChange()
+				t.notifyChange("stopped")
 			}
 		}
 	}
@@ -210,7 +210,7 @@ func (t *Task) start() string {
 		t.stopped <- true
 	}()
 
-	t.notifyChange()
+	t.notifyChange("started")
 	return fmt.Sprintf("started (pid %d)", pid)
 }
 
@@ -244,7 +244,7 @@ func (t *Task) adopt(s State) string {
 	// a process we didn't spawn.
 	go t.pollAlive(s.PID)
 
-	t.notifyChange()
+	t.notifyChange("adopted")
 	return fmt.Sprintf("adopted (pid %d)", s.PID)
 }
 

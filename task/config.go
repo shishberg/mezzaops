@@ -18,7 +18,7 @@ type Tasks struct {
 	stateDir string
 	msgr     Messager
 
-	onChange func() // guarded by mu
+	onChange func(taskName, event string) // guarded by mu
 }
 
 type TasksConfig struct {
@@ -72,12 +72,12 @@ func (ts *Tasks) Reload() error {
 		ts.Tasks[t.Name] = t
 		t.logDir = ts.logDir
 		t.stateDir = ts.stateDir
-		t.onChange = func() {
+		t.onChange = func(taskName, event string) {
 			ts.mu.Lock()
 			fn := ts.onChange
 			ts.mu.Unlock()
 			if fn != nil {
-				fn()
+				fn(taskName, event)
 			}
 		}
 		t.Loop(prefixMessager{t.Name, ts.msgr})
@@ -137,7 +137,7 @@ func (ts *Tasks) Get(name string) *Task {
 
 // SetOnChange registers a callback invoked after any task state change.
 // Safe to call while tasks are running.
-func (ts *Tasks) SetOnChange(fn func()) {
+func (ts *Tasks) SetOnChange(fn func(taskName, event string)) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	ts.onChange = fn

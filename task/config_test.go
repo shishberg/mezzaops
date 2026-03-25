@@ -110,7 +110,7 @@ func TestOnChangeCalledOnStartAndStop(t *testing.T) {
 	}
 	defer tasks.StopAll()
 
-	tasks.SetOnChange(func() { changes.Add(1) })
+	tasks.SetOnChange(func(_, _ string) { changes.Add(1) })
 
 	// Give the auto-start time to fire (but OnChange wasn't set yet, so no count)
 	time.Sleep(500 * time.Millisecond)
@@ -220,7 +220,7 @@ func TestRestartOnChangeNotCalledWithStaleCount(t *testing.T) {
 	// Track every running count reported via OnChange
 	var mu sync.Mutex
 	var counts []int
-	tasks.SetOnChange(func() {
+	tasks.SetOnChange(func(_, _ string) {
 		running, _ := tasks.CountRunning()
 		mu.Lock()
 		counts = append(counts, running)

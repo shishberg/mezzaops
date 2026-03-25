@@ -94,9 +94,9 @@ func main() {
 		log.Fatal(err)
 	}
 
-	tasks.SetOnChange(func() {
+	tasks.SetOnChange(func(taskName, event string) {
 		running, total := tasks.CountRunning()
-		status := fmt.Sprintf("%d/%d tasks running", running, total)
+		status := fmt.Sprintf("%d/%d | %s %s", running, total, taskName, event)
 		session.UpdateGameStatus(0, status)
 	})
 
