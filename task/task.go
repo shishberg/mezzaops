@@ -115,7 +115,6 @@ func (t *Task) loop() {
 			}
 
 		case <-t.stopped:
-			t.msg.Send("stopped")
 			t.pid = 0
 			t.pgid = 0
 			t.notifyChange()
@@ -126,9 +125,10 @@ func (t *Task) loop() {
 				}
 			}
 			if t.restartNext {
-				t.msg.Send("restarting...")
 				t.restartNext = false
-				t.start()
+				t.msg.Send(t.start())
+			} else {
+				t.msg.Send("stopped")
 			}
 		}
 	}
