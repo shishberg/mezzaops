@@ -1,8 +1,11 @@
 package task
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -10,6 +13,31 @@ import (
 type noopMessager struct{}
 
 func (n noopMessager) Send(format string, args ...any) {}
+
+type recordingMessager struct {
+	mu       sync.Mutex
+	messages []string
+}
+
+func (r *recordingMessager) Send(format string, args ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.messages = append(r.messages, fmt.Sprintf(format, args...))
+}
+
+func (r *recordingMessager) Messages() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cp := make([]string, len(r.messages))
+	copy(cp, r.messages)
+	return cp
+}
+
+func (r *recordingMessager) Clear() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.messages = nil
+}
 
 func TestCountRunning(t *testing.T) {
 	dir := t.TempDir()
@@ -101,5 +129,66 @@ func TestOnChangeCalledOnStartAndStop(t *testing.T) {
 
 	if changes <= before {
 		t.Fatalf("expected OnChange to be called after start, got %d (was %d before)", changes, before)
+	}
+}
+
+func TestRestartMessages(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "tasks.yaml")
+	logDir := filepath.Join(dir, "logs")
+	stateDir := filepath.Join(dir, "state")
+
+	os.WriteFile(configFile, []byte(`task:
+- name: sleeper
+  dir: /tmp
+  entrypoint:
+    - sleep
+    - "60"
+`), 0644)
+
+	msgr := &recordingMessager{}
+	tasks, err := StartFromConfig(configFile, logDir, stateDir, msgr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tasks.StopAll()
+
+	// Wait for auto-start
+	time.Sleep(500 * time.Millisecond)
+	msgr.Clear()
+
+	// Restart and wait for it to complete
+	result := tasks.Get("sleeper").Do("restart")
+	if result != "restarting..." {
+		t.Fatalf("expected 'restarting...', got %q", result)
+	}
+	time.Sleep(1 * time.Second)
+
+	msgs := msgr.Messages()
+
+	// Should see: "stopped" then "started (pid ...)"
+	// Should NOT see a second "restarting..."
+	var hasStarted, hasStopped bool
+	restartingCount := 0
+	for _, m := range msgs {
+		if strings.Contains(m, "stopped") {
+			hasStopped = true
+		}
+		if strings.Contains(m, "started (pid") {
+			hasStarted = true
+		}
+		if strings.Contains(m, "restarting") {
+			restartingCount++
+		}
+	}
+
+	if !hasStopped {
+		t.Errorf("expected 'stopped' message, got: %v", msgs)
+	}
+	if !hasStarted {
+		t.Errorf("expected 'started (pid ...)' message, got: %v", msgs)
+	}
+	if restartingCount > 0 {
+		t.Errorf("expected no 'restarting...' in async messages (it's the sync return value), got %d in: %v", restartingCount, msgs)
 	}
 }
