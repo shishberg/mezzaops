@@ -1,10 +1,11 @@
 package task
 
 import (
-	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"syscall"
@@ -52,8 +53,8 @@ type Task struct {
 	restartNext bool
 	// TODO: auto restart
 
-	muLog  sync.Mutex
-	logbuf bytes.Buffer
+	logDir  string
+	logPath string // path to the current log file (set after start or adopt)
 }
 
 func (t *Task) Update(t2 *Task) {
@@ -97,11 +98,12 @@ func (t *Task) loop() {
 		case <-t.stopped:
 			t.msg.Send("stopped")
 			t.cmd = nil
-
-			t.muLog.Lock()
-			t.logbuf.WriteString(fmt.Sprintf("=== Stopped at %s ===\n", time.Now().Format(time.RFC3339)))
-			t.muLog.Unlock()
-
+			if t.logPath != "" {
+				if f, err := os.OpenFile(t.logPath, os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+					fmt.Fprintf(f, "=== Stopped at %s ===\n", time.Now().Format(time.RFC3339))
+					f.Close()
+				}
+			}
 			if t.restartNext {
 				t.msg.Send("restarting...")
 				t.restartNext = false
@@ -134,35 +136,41 @@ func (t *Task) start() string {
 	if t.cmd != nil {
 		return "already running"
 	}
-
 	if len(t.Entrypoint) == 0 {
 		return "no entrypoint"
 	}
+
+	// Create log file with temp name (we don't know PID yet)
+	tmpPath := filepath.Join(t.logDir, t.Name+".starting.log")
+	logFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Sprintf("couldn't open log: %v", err)
+	}
+
 	t.cmd = exec.Command(t.Entrypoint[0], t.Entrypoint[1:]...)
 	t.cmd.Dir = t.Dir
-	// Set process group so that any child processes get terminated at the same time
 	t.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	stdout, err := t.cmd.StdoutPipe()
-	if err != nil {
-		return err.Error()
-	}
-	stderr, err := t.cmd.StderrPipe()
-	if err != nil {
-		return err.Error()
-	}
+	t.cmd.Stdout = logFile
+	t.cmd.Stderr = logFile
 
 	if err := t.cmd.Start(); err != nil {
+		logFile.Close()
+		os.Remove(tmpPath)
 		t.cmd = nil
 		return fmt.Sprintf("couldn't start: %v", err)
 	}
 
-	t.muLog.Lock()
-	t.logbuf.WriteString(fmt.Sprintf("=== Started at %s ===\n", time.Now().Format(time.RFC3339)))
-	t.muLog.Unlock()
+	// Rename log file to include PID (child keeps writing — same inode)
+	pid := t.cmd.Process.Pid
+	t.logPath = LogPath(t.logDir, t.Name, pid)
+	os.Rename(tmpPath, t.logPath)
 
-	go t.readToLog(stdout)
-	go t.readToLog(stderr)
+	// Write start marker, then close our handle — child owns the fd now
+	fmt.Fprintf(logFile, "=== Started at %s (pid %d) ===\n", time.Now().Format(time.RFC3339), pid)
+	logFile.Close()
+
+	// Clean up old log files for this task (keep last 5)
+	CleanupOldLogs(t.logDir, t.Name, 5)
 
 	go func() {
 		if err := t.cmd.Wait(); err != nil {
@@ -171,23 +179,7 @@ func (t *Task) start() string {
 		t.stopped <- true
 	}()
 
-	return "started"
-}
-
-func (t *Task) readToLog(in io.ReadCloser) {
-	var buf [1024]byte
-	for {
-		n, err := in.Read(buf[:])
-		if n > 0 {
-			t.muLog.Lock()
-			_, _ = t.logbuf.Write(buf[:n])
-			t.muLog.Unlock()
-		}
-		if err != nil {
-			// TODO: check it's EOF
-			break
-		}
-	}
+	return fmt.Sprintf("started (pid %d)", pid)
 }
 
 func (t *Task) stop() string {
@@ -202,17 +194,12 @@ func (t *Task) stop() string {
 }
 
 func (t *Task) logs() string {
-	t.muLog.Lock()
-	defer t.muLog.Unlock()
-	log := t.logbuf.String()
-	t.logbuf = bytes.Buffer{}
+	if t.logPath == "" {
+		return "no logs"
+	}
+	log := TailLogFile(t.logPath, 1500)
 	if log == "" {
 		return "empty logs"
-	}
-	// Discord max message length is 2000.
-	const maxLen = 1500
-	if len(log) > maxLen {
-		log = "...\n" + log[len(log)-1500:]
 	}
 	return fmt.Sprintf("```%s```", log)
 }
