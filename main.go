@@ -94,10 +94,18 @@ func main() {
 		log.Fatal(err)
 	}
 
-	tasks.SetOnChange(func(taskName, event string) {
+	updateStatus := func(taskName, event string) {
 		running, total := tasks.CountRunning()
 		status := fmt.Sprintf("%d/%d | %s %s", running, total, taskName, event)
 		session.UpdateGameStatus(0, status)
+	}
+
+	tasks.SetOnChange(updateStatus)
+
+	// Re-set presence on every connect/reconnect — Discord doesn't persist it.
+	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
+		running, total := tasks.CountRunning()
+		s.UpdateGameStatus(0, fmt.Sprintf("%d/%d tasks running", running, total))
 	})
 
 	buildCommands := func(t *task.Tasks) []*discordgo.ApplicationCommand {
