@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/go-yaml/yaml"
+	"github.com/shirou/gopsutil/v3/host"
+	"github.com/shirou/gopsutil/v3/process"
 )
 
 func ParseYAML(data []byte) (TasksConfig, error) {
@@ -53,8 +55,9 @@ type Task struct {
 	restartNext bool
 	// TODO: auto restart
 
-	logDir  string
-	logPath string // path to the current log file (set after start or adopt)
+	logDir   string
+	logPath  string // path to the current log file (set after start or adopt)
+	stateDir string
 }
 
 func (t *Task) Update(t2 *Task) {
@@ -169,6 +172,20 @@ func (t *Task) start() string {
 	fmt.Fprintf(logFile, "=== Started at %s (pid %d) ===\n", time.Now().Format(time.RFC3339), pid)
 	logFile.Close()
 
+	// Write running state with process identity
+	bootTime, _ := host.BootTime()
+	proc, _ := process.NewProcess(int32(pid))
+	createTime, _ := proc.CreateTime()
+
+	SaveState(t.stateDir, t.Name, State{
+		Status:     "running",
+		PID:        pid,
+		PGID:       pid,
+		LogPath:    t.logPath,
+		BootTime:   int64(bootTime),
+		CreateTime: createTime,
+	})
+
 	// Clean up old log files for this task (keep last 5)
 	CleanupOldLogs(t.logDir, t.Name, 5)
 
@@ -187,6 +204,7 @@ func (t *Task) stop() string {
 		return "already stopped"
 	}
 	if t.cmd.Process != nil {
+		SaveState(t.stateDir, t.Name, State{Status: "stopped"})
 		// Kill the process group to include children
 		syscall.Kill(-t.cmd.Process.Pid, syscall.SIGKILL)
 	}

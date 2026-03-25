@@ -12,6 +12,7 @@ type Tasks struct {
 
 	filename string
 	logDir   string
+	stateDir string
 	msgr     Messager
 }
 
@@ -19,14 +20,18 @@ type TasksConfig struct {
 	Tasks []*Task `yaml:"task"`
 }
 
-func StartFromConfig(filename, logDir string, msgr Messager) (*Tasks, error) {
+func StartFromConfig(filename, logDir, stateDir string, msgr Messager) (*Tasks, error) {
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return nil, fmt.Errorf("create log dir: %w", err)
+	}
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		return nil, fmt.Errorf("create state dir: %w", err)
 	}
 	tasks := &Tasks{
 		Tasks:    make(map[string]*Task),
 		filename: filename,
 		logDir:   logDir,
+		stateDir: stateDir,
 		msgr:     msgr,
 	}
 	if err := tasks.Reload(); err != nil {
@@ -61,6 +66,7 @@ func (ts *Tasks) Reload() error {
 		}
 		ts.Tasks[t.Name] = t
 		t.logDir = ts.logDir
+		t.stateDir = ts.stateDir
 		t.Loop(prefixMessager{t.Name, ts.msgr})
 	}
 	for _, t := range ts.Tasks {

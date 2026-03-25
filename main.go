@@ -20,6 +20,7 @@ var (
 	channelID = flag.String("channel-id", "", "Channel ID for broadcast messages")
 	tasksYAML = flag.String("tasks", "tasks.yaml", "task config YAML file")
 	logDir    = flag.String("log-dir", "logs", "directory for task log files")
+	stateDir  = flag.String("state-dir", "state", "directory for task PID state files")
 )
 
 func subCommand(name, desc string) *discordgo.ApplicationCommandOption {
@@ -88,7 +89,7 @@ func main() {
 		msgr = stdoutMessager{}
 	}
 
-	tasks, err := task.StartFromConfig(*tasksYAML, *logDir, msgr)
+	tasks, err := task.StartFromConfig(*tasksYAML, *logDir, *stateDir, msgr)
 	if err != nil {
 		log.Fatal(err)
 	}
