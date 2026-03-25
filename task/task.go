@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -51,16 +52,17 @@ type Task struct {
 	stopped     chan bool
 	restartNext bool
 
-	pid      int // nonzero when running (spawned or adopted)
-	pgid     int
+	pid  atomic.Int32 // nonzero when running; safe to read from any goroutine
+	pgid int          // only accessed from the task's loop goroutine
 	logDir   string
 	logPath  string
 	stateDir string
 	onChange func() // called after state transitions; may be nil
 }
 
+// isRunning is safe to call from any goroutine.
 func (t *Task) isRunning() bool {
-	return t.pid != 0
+	return t.pid.Load() != 0
 }
 
 func (t *Task) notifyChange() {
@@ -115,7 +117,7 @@ func (t *Task) loop() {
 			}
 
 		case <-t.stopped:
-			t.pid = 0
+			t.pid.Store(0)
 			t.pgid = 0
 			if t.logPath != "" {
 				if f, err := os.OpenFile(t.logPath, os.O_WRONLY|os.O_APPEND, 0644); err == nil {
@@ -182,19 +184,20 @@ func (t *Task) start() string {
 
 	// From here on, the task is running. Store pid/pgid — same fields
 	// used by adopt(), so stop/restart/status work identically.
-	t.pid = cmd.Process.Pid
-	t.pgid = cmd.Process.Pid
+	pid := cmd.Process.Pid
+	t.pid.Store(int32(pid))
+	t.pgid = pid
 
 	// Rename log file to include PID (child keeps writing — same inode)
-	t.logPath = LogPath(t.logDir, t.Name, t.pid)
+	t.logPath = LogPath(t.logDir, t.Name, pid)
 	os.Rename(tmpPath, t.logPath)
 
 	// Write start marker, then close our handle — child owns the fd now
-	fmt.Fprintf(logFile, "=== Started at %s (pid %d) ===\n", time.Now().Format(time.RFC3339), t.pid)
+	fmt.Fprintf(logFile, "=== Started at %s (pid %d) ===\n", time.Now().Format(time.RFC3339), pid)
 	logFile.Close()
 
 	// Write running state with process identity
-	SaveState(t.stateDir, t.Name, RunningState(t.pid, t.logPath))
+	SaveState(t.stateDir, t.Name, RunningState(pid, t.logPath))
 
 	// Clean up old log files for this task (keep last 5)
 	CleanupOldLogs(t.logDir, t.Name, 5)
@@ -208,7 +211,7 @@ func (t *Task) start() string {
 	}()
 
 	t.notifyChange()
-	return fmt.Sprintf("started (pid %d)", t.pid)
+	return fmt.Sprintf("started (pid %d)", pid)
 }
 
 func (t *Task) adopt(s State) string {
@@ -233,7 +236,7 @@ func (t *Task) adopt(s State) string {
 
 	// PID is alive and verified — adopt it.
 	// Same fields as start(), so stop/restart/status work identically.
-	t.pid = s.PID
+	t.pid.Store(int32(s.PID))
 	t.pgid = s.PGID
 	t.logPath = s.LogPath
 
@@ -279,7 +282,7 @@ func (t *Task) status() string {
 	if !t.isRunning() {
 		return "stopped"
 	}
-	return fmt.Sprintf("running (pid %d)", t.pid)
+	return fmt.Sprintf("running (pid %d)", t.pid.Load())
 }
 
 func (t *Task) restart() string {

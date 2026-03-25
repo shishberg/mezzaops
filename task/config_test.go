@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -102,14 +103,14 @@ func TestOnChangeCalledOnStartAndStop(t *testing.T) {
     - "60"
 `), 0644)
 
-	changes := 0
+	var changes atomic.Int32
 	tasks, err := StartFromConfig(configFile, logDir, stateDir, noopMessager{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tasks.StopAll()
 
-	tasks.OnChange = func() { changes++ }
+	tasks.SetOnChange(func() { changes.Add(1) })
 
 	// Give the auto-start time to fire (but OnChange wasn't set yet, so no count)
 	time.Sleep(500 * time.Millisecond)
@@ -118,17 +119,17 @@ func TestOnChangeCalledOnStartAndStop(t *testing.T) {
 	tasks.Get("sleeper").Do("stop")
 	time.Sleep(500 * time.Millisecond)
 
-	if changes < 1 {
-		t.Fatalf("expected OnChange to be called at least once after stop, got %d", changes)
+	if changes.Load() < 1 {
+		t.Fatalf("expected OnChange to be called at least once after stop, got %d", changes.Load())
 	}
 
 	// Start again should trigger OnChange
-	before := changes
+	before := changes.Load()
 	tasks.Get("sleeper").Do("start")
 	time.Sleep(500 * time.Millisecond)
 
-	if changes <= before {
-		t.Fatalf("expected OnChange to be called after start, got %d (was %d before)", changes, before)
+	if changes.Load() <= before {
+		t.Fatalf("expected OnChange to be called after start, got %d (was %d before)", changes.Load(), before)
 	}
 }
 
@@ -219,12 +220,12 @@ func TestRestartOnChangeNotCalledWithStaleCount(t *testing.T) {
 	// Track every running count reported via OnChange
 	var mu sync.Mutex
 	var counts []int
-	tasks.OnChange = func() {
+	tasks.SetOnChange(func() {
 		running, _ := tasks.CountRunning()
 		mu.Lock()
 		counts = append(counts, running)
 		mu.Unlock()
-	}
+	})
 
 	// Restart
 	tasks.Get("sleeper").Do("restart")

@@ -18,9 +18,7 @@ type Tasks struct {
 	stateDir string
 	msgr     Messager
 
-	// OnChange is called after any state change (start, stop, crash, adopt).
-	// Set after construction to avoid circular dependency.
-	OnChange func()
+	onChange func() // guarded by mu
 }
 
 type TasksConfig struct {
@@ -75,8 +73,11 @@ func (ts *Tasks) Reload() error {
 		t.logDir = ts.logDir
 		t.stateDir = ts.stateDir
 		t.onChange = func() {
-			if ts.OnChange != nil {
-				ts.OnChange()
+			ts.mu.Lock()
+			fn := ts.onChange
+			ts.mu.Unlock()
+			if fn != nil {
+				fn()
 			}
 		}
 		t.Loop(prefixMessager{t.Name, ts.msgr})
@@ -134,8 +135,19 @@ func (ts *Tasks) Get(name string) *Task {
 	return ts.Tasks[name]
 }
 
+// SetOnChange registers a callback invoked after any task state change.
+// Safe to call while tasks are running.
+func (ts *Tasks) SetOnChange(fn func()) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	ts.onChange = fn
+}
+
 // CountRunning returns (running, total) task counts.
+// Safe to call from any goroutine (e.g. OnChange callbacks from task loops).
 func (ts *Tasks) CountRunning() (int, int) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
 	running := 0
 	for _, t := range ts.Tasks {
 		if t.isRunning() {

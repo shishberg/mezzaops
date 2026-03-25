@@ -94,11 +94,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	tasks.OnChange = func() {
+	tasks.SetOnChange(func() {
 		running, total := tasks.CountRunning()
 		status := fmt.Sprintf("%d/%d tasks running", running, total)
 		session.UpdateGameStatus(0, status)
-	}
+	})
 
 	buildCommands := func(t *task.Tasks) []*discordgo.ApplicationCommand {
 		return []*discordgo.ApplicationCommand{
