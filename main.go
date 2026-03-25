@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/shishberg/mezzaops/task"
@@ -94,19 +96,45 @@ func main() {
 		log.Fatal(err)
 	}
 
-	updateStatus := func(taskName, event string) {
-		running, total := tasks.CountRunning()
-		status := fmt.Sprintf("%d/%d | %s %s", running, total, taskName, event)
+	// lastStatus holds the most recent status string for periodic refresh.
+	var lastStatus string
+	var statusMu sync.Mutex
+
+	setStatus := func(status string) {
+		statusMu.Lock()
+		lastStatus = status
+		statusMu.Unlock()
 		session.UpdateGameStatus(0, status)
 	}
 
-	tasks.SetOnChange(updateStatus)
-
-	// Re-set presence on every connect/reconnect — Discord doesn't persist it.
-	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
+	tasks.SetOnChange(func(taskName, event string) {
 		running, total := tasks.CountRunning()
-		s.UpdateGameStatus(0, fmt.Sprintf("%d/%d tasks running", running, total))
+		setStatus(fmt.Sprintf("%d/%d | %s %s", running, total, taskName, event))
 	})
+
+	// Re-set presence on connect/reconnect/resume — Discord doesn't persist it.
+	refreshStatus := func() {
+		statusMu.Lock()
+		s := lastStatus
+		statusMu.Unlock()
+		if s == "" {
+			running, total := tasks.CountRunning()
+			s = fmt.Sprintf("%d/%d tasks running", running, total)
+		}
+		session.UpdateGameStatus(0, s)
+	}
+	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) { refreshStatus() })
+	session.AddHandler(func(s *discordgo.Session, r *discordgo.Resumed) { refreshStatus() })
+
+	// Periodic refresh every 2 minutes — Discord drops presence silently
+	// during backend deployments even without a reconnect.
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			refreshStatus()
+		}
+	}()
 
 	buildCommands := func(t *task.Tasks) []*discordgo.ApplicationCommand {
 		return []*discordgo.ApplicationCommand{
