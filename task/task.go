@@ -117,7 +117,6 @@ func (t *Task) loop() {
 		case <-t.stopped:
 			t.pid = 0
 			t.pgid = 0
-			t.notifyChange()
 			if t.logPath != "" {
 				if f, err := os.OpenFile(t.logPath, os.O_WRONLY|os.O_APPEND, 0644); err == nil {
 					fmt.Fprintf(f, "=== Stopped at %s ===\n", time.Now().Format(time.RFC3339))
@@ -127,7 +126,9 @@ func (t *Task) loop() {
 			t.msg.Send("stopped")
 			if t.restartNext {
 				t.restartNext = false
-				t.msg.Send(t.start())
+				t.msg.Send(t.start()) // start() calls notifyChange() with correct count
+			} else {
+				t.notifyChange()
 			}
 		}
 	}
