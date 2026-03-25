@@ -1,10 +1,12 @@
-// task/state.go
 package task
 
 import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"github.com/shirou/gopsutil/v3/host"
+	"github.com/shirou/gopsutil/v3/process"
 )
 
 type State struct {
@@ -48,4 +50,24 @@ func LoadState(dir, name string) (State, error) {
 
 func RemoveState(dir, name string) {
 	os.Remove(statePath(dir, name))
+}
+
+// RunningState creates a State for a running process, capturing boot time
+// and process create time for identity verification on re-adoption.
+func RunningState(pid int, logPath string) State {
+	s := State{
+		Status:  "running",
+		PID:     pid,
+		PGID:    pid,
+		LogPath: logPath,
+	}
+	if bootTime, err := host.BootTime(); err == nil {
+		s.BootTime = int64(bootTime)
+	}
+	if proc, err := process.NewProcess(int32(pid)); err == nil {
+		if ct, err := proc.CreateTime(); err == nil {
+			s.CreateTime = ct
+		}
+	}
+	return s
 }

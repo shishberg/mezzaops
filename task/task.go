@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"github.com/go-yaml/yaml"
-	"github.com/shirou/gopsutil/v3/host"
-	"github.com/shirou/gopsutil/v3/process"
 )
 
 func ParseYAML(data []byte) (TasksConfig, error) {
@@ -60,6 +58,18 @@ type Task struct {
 	stateDir    string
 	adoptedPID  int
 	adoptedPGID int
+}
+
+func (t *Task) isRunning() bool {
+	return t.cmd != nil || t.adoptedPID != 0
+}
+
+// pgid returns the process group ID for the running task, whether spawned or adopted.
+func (t *Task) pgid() int {
+	if t.cmd != nil {
+		return t.cmd.Process.Pid
+	}
+	return t.adoptedPGID
 }
 
 func (t *Task) Update(t2 *Task) {
@@ -147,7 +157,7 @@ func (t *Task) do(op string) string {
 }
 
 func (t *Task) start() string {
-	if t.cmd != nil {
+	if t.isRunning() {
 		return "already running"
 	}
 	if len(t.Entrypoint) == 0 {
@@ -184,18 +194,7 @@ func (t *Task) start() string {
 	logFile.Close()
 
 	// Write running state with process identity
-	bootTime, _ := host.BootTime()
-	proc, _ := process.NewProcess(int32(pid))
-	createTime, _ := proc.CreateTime()
-
-	SaveState(t.stateDir, t.Name, State{
-		Status:     "running",
-		PID:        pid,
-		PGID:       pid,
-		LogPath:    t.logPath,
-		BootTime:   int64(bootTime),
-		CreateTime: createTime,
-	})
+	SaveState(t.stateDir, t.Name, RunningState(pid, t.logPath))
 
 	// Clean up old log files for this task (keep last 5)
 	CleanupOldLogs(t.logDir, t.Name, 5)
@@ -251,17 +250,12 @@ func (t *Task) pollAlive(pid int) {
 }
 
 func (t *Task) stop() string {
-	if t.cmd != nil {
-		SaveState(t.stateDir, t.Name, State{Status: "stopped"})
-		syscall.Kill(-t.cmd.Process.Pid, syscall.SIGKILL)
-		return "stopping"
+	if !t.isRunning() {
+		return "already stopped"
 	}
-	if t.adoptedPGID != 0 {
-		SaveState(t.stateDir, t.Name, State{Status: "stopped"})
-		syscall.Kill(-t.adoptedPGID, syscall.SIGKILL)
-		return "stopping (adopted)"
-	}
-	return "already stopped"
+	SaveState(t.stateDir, t.Name, State{Status: "stopped"})
+	syscall.Kill(-t.pgid(), syscall.SIGKILL)
+	return "stopping"
 }
 
 func (t *Task) logs() string {
@@ -276,7 +270,7 @@ func (t *Task) logs() string {
 }
 
 func (t *Task) status() string {
-	if t.cmd == nil && t.adoptedPID == 0 {
+	if !t.isRunning() {
 		return "stopped"
 	}
 	if t.adoptedPID != 0 {
@@ -286,7 +280,7 @@ func (t *Task) status() string {
 }
 
 func (t *Task) restart() string {
-	if t.cmd == nil && t.adoptedPID == 0 {
+	if !t.isRunning() {
 		return t.start()
 	}
 	t.restartNext = true
