@@ -47,29 +47,19 @@ type Task struct {
 
 	once        sync.Once
 	msg         Messager
-	cmd         *exec.Cmd
 	op          chan syncOp
 	stopped     chan bool
 	restartNext bool
-	// TODO: auto restart
 
-	logDir      string
-	logPath     string // path to the current log file (set after start or adopt)
-	stateDir    string
-	adoptedPID  int
-	adoptedPGID int
+	pid      int // nonzero when running (spawned or adopted)
+	pgid     int
+	logDir   string
+	logPath  string
+	stateDir string
 }
 
 func (t *Task) isRunning() bool {
-	return t.cmd != nil || t.adoptedPID != 0
-}
-
-// pgid returns the process group ID for the running task, whether spawned or adopted.
-func (t *Task) pgid() int {
-	if t.cmd != nil {
-		return t.cmd.Process.Pid
-	}
-	return t.adoptedPGID
+	return t.pid != 0
 }
 
 func (t *Task) Update(t2 *Task) {
@@ -119,9 +109,8 @@ func (t *Task) loop() {
 
 		case <-t.stopped:
 			t.msg.Send("stopped")
-			t.cmd = nil
-			t.adoptedPID = 0
-			t.adoptedPGID = 0
+			t.pid = 0
+			t.pgid = 0
 			if t.logPath != "" {
 				if f, err := os.OpenFile(t.logPath, os.O_WRONLY|os.O_APPEND, 0644); err == nil {
 					fmt.Fprintf(f, "=== Stopped at %s ===\n", time.Now().Format(time.RFC3339))
@@ -171,46 +160,50 @@ func (t *Task) start() string {
 		return fmt.Sprintf("couldn't open log: %v", err)
 	}
 
-	t.cmd = exec.Command(t.Entrypoint[0], t.Entrypoint[1:]...)
-	t.cmd.Dir = t.Dir
-	t.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	t.cmd.Stdout = logFile
-	t.cmd.Stderr = logFile
+	cmd := exec.Command(t.Entrypoint[0], t.Entrypoint[1:]...)
+	cmd.Dir = t.Dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 
-	if err := t.cmd.Start(); err != nil {
+	if err := cmd.Start(); err != nil {
 		logFile.Close()
 		os.Remove(tmpPath)
-		t.cmd = nil
 		return fmt.Sprintf("couldn't start: %v", err)
 	}
 
+	// From here on, the task is running. Store pid/pgid — same fields
+	// used by adopt(), so stop/restart/status work identically.
+	t.pid = cmd.Process.Pid
+	t.pgid = cmd.Process.Pid
+
 	// Rename log file to include PID (child keeps writing — same inode)
-	pid := t.cmd.Process.Pid
-	t.logPath = LogPath(t.logDir, t.Name, pid)
+	t.logPath = LogPath(t.logDir, t.Name, t.pid)
 	os.Rename(tmpPath, t.logPath)
 
 	// Write start marker, then close our handle — child owns the fd now
-	fmt.Fprintf(logFile, "=== Started at %s (pid %d) ===\n", time.Now().Format(time.RFC3339), pid)
+	fmt.Fprintf(logFile, "=== Started at %s (pid %d) ===\n", time.Now().Format(time.RFC3339), t.pid)
 	logFile.Close()
 
 	// Write running state with process identity
-	SaveState(t.stateDir, t.Name, RunningState(pid, t.logPath))
+	SaveState(t.stateDir, t.Name, RunningState(t.pid, t.logPath))
 
 	// Clean up old log files for this task (keep last 5)
 	CleanupOldLogs(t.logDir, t.Name, 5)
 
+	// cmd.Wait() reaps the child and notifies the loop
 	go func() {
-		if err := t.cmd.Wait(); err != nil {
+		if err := cmd.Wait(); err != nil {
 			t.msg.Send("Wait(): %v", err)
 		}
 		t.stopped <- true
 	}()
 
-	return fmt.Sprintf("started (pid %d)", pid)
+	return fmt.Sprintf("started (pid %d)", t.pid)
 }
 
 func (t *Task) adopt(s State) string {
-	if t.cmd != nil {
+	if t.isRunning() {
 		return "already running"
 	}
 
@@ -229,11 +222,14 @@ func (t *Task) adopt(s State) string {
 		return "pid reused by different process, " + t.start()
 	}
 
-	// PID is alive and verified — adopt it
-	t.adoptedPID = s.PID
-	t.adoptedPGID = s.PGID
+	// PID is alive and verified — adopt it.
+	// Same fields as start(), so stop/restart/status work identically.
+	t.pid = s.PID
+	t.pgid = s.PGID
 	t.logPath = s.LogPath
 
+	// pollAlive monitors the process since we can't cmd.Wait() on
+	// a process we didn't spawn.
 	go t.pollAlive(s.PID)
 
 	return fmt.Sprintf("adopted (pid %d)", s.PID)
@@ -254,7 +250,7 @@ func (t *Task) stop() string {
 		return "already stopped"
 	}
 	SaveState(t.stateDir, t.Name, State{Status: "stopped"})
-	syscall.Kill(-t.pgid(), syscall.SIGKILL)
+	syscall.Kill(-t.pgid, syscall.SIGKILL)
 	return "stopping"
 }
 
@@ -273,10 +269,7 @@ func (t *Task) status() string {
 	if !t.isRunning() {
 		return "stopped"
 	}
-	if t.adoptedPID != 0 {
-		return fmt.Sprintf("running (adopted, pid %d)", t.adoptedPID)
-	}
-	return "running"
+	return fmt.Sprintf("running (pid %d)", t.pid)
 }
 
 func (t *Task) restart() string {
