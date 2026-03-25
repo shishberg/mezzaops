@@ -55,9 +55,11 @@ type Task struct {
 	restartNext bool
 	// TODO: auto restart
 
-	logDir   string
-	logPath  string // path to the current log file (set after start or adopt)
-	stateDir string
+	logDir      string
+	logPath     string // path to the current log file (set after start or adopt)
+	stateDir    string
+	adoptedPID  int
+	adoptedPGID int
 }
 
 func (t *Task) Update(t2 *Task) {
@@ -74,7 +76,7 @@ func (t *Task) Loop(msg Messager) {
 	t.once.Do(func() {
 		t.msg = msg
 		t.op = make(chan syncOp, 10)
-		t.stopped = make(chan bool)
+		t.stopped = make(chan bool, 1)
 		go t.loop()
 	})
 }
@@ -89,7 +91,14 @@ func (t *Task) Do(op string) string {
 }
 
 func (t *Task) loop() {
-	t.msg.Send(t.start())
+	// Check if there's a running process to adopt from a previous session
+	if s, err := LoadState(t.stateDir, t.Name); err == nil {
+		result := t.adopt(s)
+		t.msg.Send(result)
+	} else {
+		t.msg.Send(t.start())
+	}
+
 	for {
 		select {
 		case op := <-t.op:
@@ -101,6 +110,8 @@ func (t *Task) loop() {
 		case <-t.stopped:
 			t.msg.Send("stopped")
 			t.cmd = nil
+			t.adoptedPID = 0
+			t.adoptedPGID = 0
 			if t.logPath != "" {
 				if f, err := os.OpenFile(t.logPath, os.O_WRONLY|os.O_APPEND, 0644); err == nil {
 					fmt.Fprintf(f, "=== Stopped at %s ===\n", time.Now().Format(time.RFC3339))
@@ -199,16 +210,58 @@ func (t *Task) start() string {
 	return fmt.Sprintf("started (pid %d)", pid)
 }
 
+func (t *Task) adopt(s State) string {
+	if t.cmd != nil {
+		return "already running"
+	}
+
+	// Desired state is stopped — respect it
+	if s.Status == "stopped" {
+		return "stopped (preserved from previous session)"
+	}
+
+	// PID is dead — process crashed while mezzaops was down, restart it
+	if !IsAlive(s.PID) {
+		return "stale pid (process dead), " + t.start()
+	}
+
+	// PID is alive but belongs to a different process (reboot or PID reuse)
+	if !VerifyProcess(s) {
+		return "pid reused by different process, " + t.start()
+	}
+
+	// PID is alive and verified — adopt it
+	t.adoptedPID = s.PID
+	t.adoptedPGID = s.PGID
+	t.logPath = s.LogPath
+
+	go t.pollAlive(s.PID)
+
+	return fmt.Sprintf("adopted (pid %d)", s.PID)
+}
+
+func (t *Task) pollAlive(pid int) {
+	for {
+		time.Sleep(2 * time.Second)
+		if !IsAlive(pid) {
+			t.stopped <- true
+			return
+		}
+	}
+}
+
 func (t *Task) stop() string {
-	if t.cmd == nil {
-		return "already stopped"
-	}
-	if t.cmd.Process != nil {
+	if t.cmd != nil {
 		SaveState(t.stateDir, t.Name, State{Status: "stopped"})
-		// Kill the process group to include children
 		syscall.Kill(-t.cmd.Process.Pid, syscall.SIGKILL)
+		return "stopping"
 	}
-	return "stopping"
+	if t.adoptedPGID != 0 {
+		SaveState(t.stateDir, t.Name, State{Status: "stopped"})
+		syscall.Kill(-t.adoptedPGID, syscall.SIGKILL)
+		return "stopping (adopted)"
+	}
+	return "already stopped"
 }
 
 func (t *Task) logs() string {
@@ -223,14 +276,17 @@ func (t *Task) logs() string {
 }
 
 func (t *Task) status() string {
-	if t.cmd == nil {
+	if t.cmd == nil && t.adoptedPID == 0 {
 		return "stopped"
+	}
+	if t.adoptedPID != 0 {
+		return fmt.Sprintf("running (adopted, pid %d)", t.adoptedPID)
 	}
 	return "running"
 }
 
 func (t *Task) restart() string {
-	if t.cmd == nil {
+	if t.cmd == nil && t.adoptedPID == 0 {
 		return t.start()
 	}
 	t.restartNext = true
