@@ -17,6 +17,10 @@ type Tasks struct {
 	logDir   string
 	stateDir string
 	msgr     Messager
+
+	// OnChange is called after any state change (start, stop, crash, adopt).
+	// Set after construction to avoid circular dependency.
+	OnChange func()
 }
 
 type TasksConfig struct {
@@ -70,6 +74,11 @@ func (ts *Tasks) Reload() error {
 		ts.Tasks[t.Name] = t
 		t.logDir = ts.logDir
 		t.stateDir = ts.stateDir
+		t.onChange = func() {
+			if ts.OnChange != nil {
+				ts.OnChange()
+			}
+		}
 		t.Loop(prefixMessager{t.Name, ts.msgr})
 	}
 	for _, t := range ts.Tasks {
@@ -123,4 +132,15 @@ func (ts *Tasks) StopAll() {
 
 func (ts *Tasks) Get(name string) *Task {
 	return ts.Tasks[name]
+}
+
+// CountRunning returns (running, total) task counts.
+func (ts *Tasks) CountRunning() (int, int) {
+	running := 0
+	for _, t := range ts.Tasks {
+		if t.isRunning() {
+			running++
+		}
+	}
+	return running, len(ts.Tasks)
 }

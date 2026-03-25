@@ -56,10 +56,17 @@ type Task struct {
 	logDir   string
 	logPath  string
 	stateDir string
+	onChange func() // called after state transitions; may be nil
 }
 
 func (t *Task) isRunning() bool {
 	return t.pid != 0
+}
+
+func (t *Task) notifyChange() {
+	if t.onChange != nil {
+		t.onChange()
+	}
 }
 
 func (t *Task) Update(t2 *Task) {
@@ -111,6 +118,7 @@ func (t *Task) loop() {
 			t.msg.Send("stopped")
 			t.pid = 0
 			t.pgid = 0
+			t.notifyChange()
 			if t.logPath != "" {
 				if f, err := os.OpenFile(t.logPath, os.O_WRONLY|os.O_APPEND, 0644); err == nil {
 					fmt.Fprintf(f, "=== Stopped at %s ===\n", time.Now().Format(time.RFC3339))
@@ -199,6 +207,7 @@ func (t *Task) start() string {
 		t.stopped <- true
 	}()
 
+	t.notifyChange()
 	return fmt.Sprintf("started (pid %d)", t.pid)
 }
 
@@ -232,6 +241,7 @@ func (t *Task) adopt(s State) string {
 	// a process we didn't spawn.
 	go t.pollAlive(s.PID)
 
+	t.notifyChange()
 	return fmt.Sprintf("adopted (pid %d)", s.PID)
 }
 
