@@ -25,7 +25,13 @@ func SaveState(dir, name string, s State) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(statePath(dir, name), data, 0644)
+	// Write to temp file then rename for atomic replacement.
+	// Prevents corrupt state files if the process is killed mid-write.
+	tmp := statePath(dir, name) + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, statePath(dir, name))
 }
 
 func LoadState(dir, name string) (State, error) {

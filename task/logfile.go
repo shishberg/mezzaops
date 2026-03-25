@@ -52,16 +52,26 @@ func CleanupOldLogs(dir, taskName string, keep int) {
 	if err != nil || len(matches) <= keep {
 		return
 	}
-	// Sort by modification time, oldest first
-	sort.Slice(matches, func(i, j int) bool {
-		fi, _ := os.Stat(matches[i])
-		fj, _ := os.Stat(matches[j])
-		if fi == nil || fj == nil {
-			return false
+	// Filter out files we can't stat, then sort by modification time (oldest first)
+	type fileEntry struct {
+		path  string
+		mtime int64
+	}
+	var entries []fileEntry
+	for _, path := range matches {
+		fi, err := os.Stat(path)
+		if err != nil {
+			continue
 		}
-		return fi.ModTime().Before(fj.ModTime())
+		entries = append(entries, fileEntry{path, fi.ModTime().UnixNano()})
+	}
+	if len(entries) <= keep {
+		return
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].mtime < entries[j].mtime
 	})
-	for _, path := range matches[:len(matches)-keep] {
-		os.Remove(path)
+	for _, e := range entries[:len(entries)-keep] {
+		os.Remove(e.path)
 	}
 }
