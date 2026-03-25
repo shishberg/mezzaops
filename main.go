@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -96,45 +95,57 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// lastStatus holds the most recent status string for periodic refresh.
-	var lastStatus string
-	var statusMu sync.Mutex
-
-	setStatus := func(status string) {
-		statusMu.Lock()
-		lastStatus = status
-		statusMu.Unlock()
-		session.UpdateGameStatus(0, status)
+	// Status updates are serialized through a channel so the count is
+	// always read after all preceding state changes have landed.
+	type statusEvent struct {
+		taskName, event string
 	}
+	statusCh := make(chan statusEvent, 16)
+
+	go func() {
+		var lastStatus string
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case ev := <-statusCh:
+				// Drain any queued events — only the latest matters.
+				for {
+					select {
+					case newer := <-statusCh:
+						ev = newer
+					default:
+						goto drained
+					}
+				}
+			drained:
+				running, total := tasks.CountRunning()
+				lastStatus = fmt.Sprintf("%d/%d | %s %s", running, total, ev.taskName, ev.event)
+				session.UpdateGameStatus(0, lastStatus)
+			case <-ticker.C:
+				if lastStatus == "" {
+					running, total := tasks.CountRunning()
+					lastStatus = fmt.Sprintf("%d/%d tasks running", running, total)
+				}
+				session.UpdateGameStatus(0, lastStatus)
+			}
+		}
+	}()
 
 	tasks.SetOnChange(func(taskName, event string) {
-		running, total := tasks.CountRunning()
-		setStatus(fmt.Sprintf("%d/%d | %s %s", running, total, taskName, event))
+		select {
+		case statusCh <- statusEvent{taskName, event}:
+		default: // drop if full — next event will refresh
+		}
 	})
 
 	// Re-set presence on connect/reconnect/resume — Discord doesn't persist it.
-	refreshStatus := func() {
-		statusMu.Lock()
-		s := lastStatus
-		statusMu.Unlock()
-		if s == "" {
-			running, total := tasks.CountRunning()
-			s = fmt.Sprintf("%d/%d tasks running", running, total)
-		}
-		session.UpdateGameStatus(0, s)
-	}
-	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) { refreshStatus() })
-	session.AddHandler(func(s *discordgo.Session, r *discordgo.Resumed) { refreshStatus() })
-
-	// Periodic refresh every 2 minutes — Discord drops presence silently
-	// during backend deployments even without a reconnect.
-	go func() {
-		ticker := time.NewTicker(2 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			refreshStatus()
-		}
-	}()
+	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
+		statusCh <- statusEvent{"", "connected"}
+	})
+	session.AddHandler(func(s *discordgo.Session, r *discordgo.Resumed) {
+		statusCh <- statusEvent{"", "reconnected"}
+	})
 
 	buildCommands := func(t *task.Tasks) []*discordgo.ApplicationCommand {
 		return []*discordgo.ApplicationCommand{
