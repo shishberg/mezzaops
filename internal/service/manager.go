@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/shishberg/mezzaops/internal/config"
@@ -503,6 +505,9 @@ func serviceConfigEqual(a, b config.ServiceConfig) bool {
 			return false
 		}
 	}
+	if a.RequireConfirmation != b.RequireConfirmation {
+		return false
+	}
 	return true
 }
 
@@ -639,7 +644,15 @@ func (m *Manager) cleanOrphans() {
 		if _, ok := m.services[name]; ok {
 			continue
 		}
-		// Orphan state file
+		// Orphan state file -- kill the process if it's still alive
+		s, err := LoadState(m.stateDir, name)
+		if err != nil {
+			_ = os.Remove(path)
+			continue
+		}
+		if s.PID != 0 && IsAlive(s.PID) && VerifyProcess(s) {
+			_ = syscall.Kill(-s.PGID, syscall.SIGKILL)
+		}
 		RemoveState(m.stateDir, name)
 	}
 }
