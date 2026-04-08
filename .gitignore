@@ -1,2 +1,4 @@
 mezzaops
+bin/
 token.txt
+.env
