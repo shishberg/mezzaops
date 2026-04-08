@@ -68,6 +68,13 @@ type Manager struct {
 
 // NewManager creates a Manager for the given service configs.
 func NewManager(cfg *config.Config, services []config.ServiceConfig, notifier Notifier) (*Manager, error) {
+	if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
+		return nil, fmt.Errorf("create log dir: %w", err)
+	}
+	if err := os.MkdirAll(cfg.StateDir, 0755); err != nil {
+		return nil, fmt.Errorf("create state dir: %w", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
 		services:    make(map[string]*managedService, len(services)),
