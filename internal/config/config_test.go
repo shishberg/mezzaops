@@ -129,6 +129,52 @@ func TestLoadEnv_FallbackWhenFileMissing(t *testing.T) {
 	assert.Equal(t, "fallback-secret", env.WebhookSecret)
 }
 
+func TestLoadEnv_ErrorOnUnreadableFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	require.NoError(t, os.WriteFile(path, []byte("TOKEN=x"), 0o000))
+
+	_, err := config.LoadEnv(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reading env file")
+}
+
+func TestLoadConfig_FileNotFound(t *testing.T) {
+	_, err := config.LoadConfig(filepath.Join(t.TempDir(), "missing.yaml"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reading config")
+}
+
+func TestLoadConfig_InvalidYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("{{invalid"), 0o644))
+
+	_, err := config.LoadConfig(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing config")
+}
+
+func TestLoadServices_EmptyDirectory(t *testing.T) {
+	dir := t.TempDir()
+	services, err := config.LoadServices(dir)
+	require.NoError(t, err)
+	assert.Empty(t, services)
+}
+
+func TestLoadServices_NonexistentDirectory(t *testing.T) {
+	_, err := config.LoadServices(filepath.Join(t.TempDir(), "nope"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reading services dir")
+}
+
+func TestLoadServices_InvalidYAMLFile(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "bad.yaml"), []byte("{{invalid"), 0o644))
+
+	_, err := config.LoadServices(dir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing service file")
+}
+
 func TestLoadServices_MultipleFiles(t *testing.T) {
 	dir := t.TempDir()
 

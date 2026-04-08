@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -108,7 +109,11 @@ func LoadEnv(path string) (*Env, error) {
 				WebhookSecret:   vars["GITHUB_WEBHOOK_SECRET"],
 			}, nil
 		}
-		// File doesn't exist or can't be read — fall through to os.Getenv.
+		// Only fall through to os.Getenv if the file simply doesn't exist.
+		// Other errors (permission denied, malformed content) are real problems.
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("reading env file: %w", err)
+		}
 	}
 
 	return &Env{

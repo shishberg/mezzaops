@@ -126,11 +126,13 @@ func (p *ProcessBackend) Stop(ctx context.Context) error {
 
 	pgid := p.pgid
 	done := p.done
+	logPath := p.logPath
 
 	// Clear state under the lock
 	p.pid = 0
 	p.pgid = 0
 	p.process = nil
+	p.done = nil
 
 	p.mu.Unlock()
 
@@ -146,8 +148,8 @@ func (p *ProcessBackend) Stop(ctx context.Context) error {
 	}
 
 	// Write stop marker to log
-	if p.logPath != "" {
-		if f, err := os.OpenFile(p.logPath, os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+	if logPath != "" {
+		if f, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND, 0644); err == nil {
 			_, _ = fmt.Fprintf(f, "=== Stopped at %s ===\n", time.Now().Format(time.RFC3339))
 			_ = f.Close()
 		}
