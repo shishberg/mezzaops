@@ -227,7 +227,7 @@ func (b *Bot) routeInteraction(i *discordgo.InteractionCreate) string {
 }
 
 // buildCommands creates the /ops application command structure for the given
-// service names. Exported for testing.
+// service names.
 func buildCommands(serviceNames []string) []*discordgo.ApplicationCommand {
 	return []*discordgo.ApplicationCommand{
 		{
