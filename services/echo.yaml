@@ -1,0 +1,9 @@
+branch: main
+repo: "github.com/example/echo"
+dir: "."
+process:
+  cmd: "echo 'echo service running' && sleep 3600"
+deploy:
+  - "echo 'pulling latest...'"
+  - "echo 'running tests...'"
+  - "echo 'building...'"

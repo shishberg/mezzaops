@@ -2,3 +2,5 @@ mezzaops
 bin/
 token.txt
 .env
+logs/
+state/

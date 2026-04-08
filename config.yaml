@@ -1,0 +1,22 @@
+services_dir: "./services"
+log_dir: "./logs"
+state_dir: "./state"
+
+process:
+  adopt: true
+
+# Uncomment and configure the frontends you want to use:
+
+# discord:
+#   guild_id: ""
+#   channel_id: ""
+
+# mattermost:
+#   url: "http://localhost:8065"
+#   channel: "myteam/town-square"
+
+# webhook:
+#   port: 8080
+
+# dashboard:
+#   port: 8081
