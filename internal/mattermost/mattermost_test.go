@@ -557,6 +557,25 @@ func TestHandleEvent_Start(t *testing.T) {
 	assert.Equal(t, "ok", posts[0].Message)
 }
 
+func TestHandleEvent_StartUpperCase(t *testing.T) {
+	mgr := newMockServiceManager()
+	rest := &mockRestClient{}
+
+	bot := &Bot{
+		cfg:       Config{URL: "http://localhost"},
+		manager:   mgr,
+		rest:      rest,
+		userID:    "bot-user-id",
+		channelID: "channel-123",
+	}
+
+	event := makePostEvent("channel-123", "other-user", "@mezzaops START myapp")
+	bot.handleEvent(context.Background(), event)
+
+	assert.Equal(t, "start", mgr.getLastOp())
+	assert.Equal(t, "myapp", mgr.getLastService())
+}
+
 func TestHandleEvent_Stop(t *testing.T) {
 	mgr := newMockServiceManager()
 	rest := &mockRestClient{}

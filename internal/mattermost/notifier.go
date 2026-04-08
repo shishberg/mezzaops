@@ -3,7 +3,12 @@ package mattermost
 import (
 	"context"
 	"fmt"
+
+	"github.com/shishberg/mezzaops/internal/service"
 )
+
+// Compile-time check that Notifier implements service.Notifier.
+var _ service.Notifier = (*Notifier)(nil)
 
 // Notifier implements service.Notifier by posting to Mattermost.
 type Notifier struct {

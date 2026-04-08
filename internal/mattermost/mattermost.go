@@ -320,7 +320,7 @@ func (b *Bot) dispatchCommand(cmd *Command) string {
 		return b.manager.Do(cmd.Service, "status")
 
 	case "start", "stop", "restart", "logs", "pull":
-		return b.manager.Do(cmd.Service, cmd.Action)
+		return b.manager.Do(cmd.Service, strings.ToLower(cmd.Action))
 
 	case "deploy":
 		if err := b.manager.RequestDeploy(cmd.Service); err != nil {
