@@ -1,242 +1,60 @@
 package main
 
 import (
+	"context"
+	"embed"
 	"flag"
-	"fmt"
-	"io/ioutil"
+	"io/fs"
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
-	"time"
 
-	"github.com/bwmarrin/discordgo"
-	"github.com/shishberg/mezzaops/task"
+	"github.com/shishberg/mezzaops/internal/app"
+	"github.com/shishberg/mezzaops/internal/cli"
 )
 
-var (
-	tokenFile = flag.String("token", "token.txt", "file containing the bot token")
-	guildID   = flag.String("guild-id", "", "Guild ID, or empty to register globally")
-	channelID = flag.String("channel-id", "", "Channel ID for broadcast messages")
-	tasksYAML = flag.String("tasks", "tasks.yaml", "task config YAML file")
-	logDir    = flag.String("log-dir", "logs", "directory for task log files")
-	stateDir  = flag.String("state-dir", "state", "directory for task PID state files")
-)
-
-func subCommand(name, desc string) *discordgo.ApplicationCommandOption {
-	aco := &discordgo.ApplicationCommandOption{
-		Name:        name,
-		Description: desc,
-		Type:        discordgo.ApplicationCommandOptionSubCommand,
-	}
-	return aco
-}
-
-func subCommandGroup(name, desc string, tasks *task.Tasks) *discordgo.ApplicationCommandOption {
-	aco := &discordgo.ApplicationCommandOption{
-		Name:        name,
-		Description: desc,
-		Type:        discordgo.ApplicationCommandOptionSubCommandGroup,
-	}
-	for _, t := range tasks.Tasks {
-		aco.Options = append(aco.Options, &discordgo.ApplicationCommandOption{
-			Name:        t.Name,
-			Description: t.Name,
-			Type:        discordgo.ApplicationCommandOptionSubCommand,
-		})
-	}
-	return aco
-}
-
-type stdoutMessager struct{}
-
-func (s stdoutMessager) Send(format string, args ...any) {
-	log.Println(fmt.Sprintf(format, args...))
-}
-
-type channelMessager struct {
-	session   *discordgo.Session
-	channelID string
-}
-
-func (c channelMessager) Send(format string, args ...any) {
-	_, err := c.session.ChannelMessageSend(c.channelID, fmt.Sprintf(format, args...))
-	if err != nil {
-		log.Println(err)
-	}
-}
+//go:embed templates
+var templatesFS embed.FS
 
 func main() {
+	configPath := flag.String("config", "config.yaml", "config file path")
+	envPath := flag.String("env", ".env", "env file path")
+	interactive := flag.Bool("i", false, "interactive CLI mode")
 	flag.Parse()
 
-	token, err := ioutil.ReadFile("token.txt")
+	templates, err := fs.Sub(templatesFS, "templates")
 	if err != nil {
-		log.Fatal(err)
-	}
-	session, err := discordgo.New("Bot " + strings.TrimSpace(string(token)))
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := session.Open(); err != nil {
-		log.Fatal(err)
-	}
-	defer session.Close()
-
-	var msgr task.Messager
-	if *channelID != "" {
-		msgr = channelMessager{session, *channelID}
-	} else {
-		msgr = stdoutMessager{}
+		log.Fatalf("embedded templates: %v", err)
 	}
 
-	tasks, err := task.StartFromConfig(*tasksYAML, *logDir, *stateDir, msgr)
+	a, err := app.New(*configPath, *envPath, templates)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Status updates are serialized through a channel so the count is
-	// always read after all preceding state changes have landed.
-	type statusEvent struct {
-		taskName, event string
-	}
-	statusCh := make(chan statusEvent, 16)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
+	// Signal handling.
+	sc := make(chan os.Signal, 1)
+	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		var lastStatus string
-		ticker := time.NewTicker(2 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case ev := <-statusCh:
-				// Drain any queued events — only the latest matters.
-				for {
-					select {
-					case newer := <-statusCh:
-						ev = newer
-					default:
-						goto drained
-					}
-				}
-			drained:
-				running, total := tasks.CountRunning()
-				lastStatus = fmt.Sprintf("%d/%d | %s %s", running, total, ev.taskName, ev.event)
-				session.UpdateGameStatus(0, lastStatus)
-			case <-ticker.C:
-				if lastStatus == "" {
-					running, total := tasks.CountRunning()
-					lastStatus = fmt.Sprintf("%d/%d tasks running", running, total)
-				}
-				session.UpdateGameStatus(0, lastStatus)
-			}
-		}
+		<-sc
+		log.Println("Shutting down...")
+		a.Shutdown()
+		cancel()
 	}()
 
-	tasks.SetOnChange(func(taskName, event string) {
-		select {
-		case statusCh <- statusEvent{taskName, event}:
-		default: // drop if full — next event will refresh
-		}
-	})
-
-	// Re-set presence on connect/reconnect/resume — Discord doesn't persist it.
-	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
-		statusCh <- statusEvent{"", "connected"}
-	})
-	session.AddHandler(func(s *discordgo.Session, r *discordgo.Resumed) {
-		statusCh <- statusEvent{"", "reconnected"}
-	})
-
-	buildCommands := func(t *task.Tasks) []*discordgo.ApplicationCommand {
-		return []*discordgo.ApplicationCommand{
-			{
-				Name:        "ops",
-				Description: "MezzaOps",
-				Type:        discordgo.ChatApplicationCommand,
-				Options: []*discordgo.ApplicationCommandOption{
-					subCommand("reload", "Reload config"),
-					subCommand("start-all", "Start all tasks"),
-					subCommand("stop-all", "Stop all tasks"),
-					subCommandGroup("start", "Start", tasks),
-					subCommandGroup("stop", "Stop", tasks),
-					subCommandGroup("restart", "Restart", tasks),
-					subCommandGroup("logs", "Logs", tasks),
-					subCommandGroup("status", "Status", tasks),
-					subCommandGroup("pull", "git pull", tasks),
-				},
-			},
-		}
+	if *interactive {
+		// Run the app (servers, bots) in the background; CLI in the foreground.
+		go a.Run(ctx)
+		cli.Run(ctx, a.Manager())
+		a.Shutdown()
+		return
 	}
-	commands := buildCommands(tasks)
 
-	session.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
-		switch i.ApplicationCommandData().Name {
-		case "ops":
-			resp := func() string {
-				var opOpt, taskOpt *discordgo.ApplicationCommandInteractionDataOption
-				for _, opt := range i.ApplicationCommandData().Options {
-					if opt.Type == discordgo.ApplicationCommandOptionSubCommandGroup {
-						opOpt = opt
-						break
-					}
-					if opt.Type == discordgo.ApplicationCommandOptionSubCommand {
-						if opt.Name == "reload" {
-							err := tasks.Reload()
-							commands = buildCommands(tasks)
-							session.ApplicationCommandBulkOverwrite(session.State.User.ID, *guildID, commands)
-
-							if err != nil {
-								return "Config reload error: " + err.Error()
-							}
-							return "Config reloaded"
-						}
-						if opt.Name == "start-all" {
-							tasks.StartAll()
-							return "all tasks starting"
-						}
-						if opt.Name == "stop-all" {
-							tasks.StopAll()
-							return "all tasks stopping"
-						}
-					}
-				}
-				if opOpt == nil {
-					return "operation required"
-				}
-				for _, opt := range opOpt.Options {
-					if opt.Type == discordgo.ApplicationCommandOptionSubCommand {
-						taskOpt = opt
-						break
-					}
-				}
-				if taskOpt == nil {
-					return "task required"
-				}
-				task := tasks.Get(taskOpt.Name)
-				if task == nil {
-					return "unknown task " + taskOpt.Name
-				}
-				return fmt.Sprintf("%s: %s", taskOpt.Name, task.Do(opOpt.Name))
-			}()
-			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-				Type: discordgo.InteractionResponseChannelMessageWithSource,
-				Data: &discordgo.InteractionResponseData{
-					Content: resp,
-				},
-			})
-		}
-	})
-
-	_, err = session.ApplicationCommandBulkOverwrite(session.State.User.ID, *guildID, commands)
-	if err != nil {
+	if err := a.Run(ctx); err != nil {
 		log.Fatal(err)
 	}
-	defer session.ApplicationCommandBulkOverwrite(session.State.User.ID, *guildID, nil)
-
-	log.Println("Running.")
-	sc := make(chan os.Signal, 1)
-	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
-	<-sc
-
-	log.Println("Shutting down (tasks will keep running).")
 }

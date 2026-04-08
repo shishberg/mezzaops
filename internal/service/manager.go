@@ -505,10 +505,7 @@ func serviceConfigEqual(a, b config.ServiceConfig) bool {
 			return false
 		}
 	}
-	if a.RequireConfirmation != b.RequireConfirmation {
-		return false
-	}
-	return true
+	return a.RequireConfirmation == b.RequireConfirmation
 }
 
 // ServiceNames returns a sorted list of all service names.

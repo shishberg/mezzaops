@@ -1,5 +1,0 @@
-task:
-- name: test
-  dir: ../test
-  entrypoint:
-    - ./test.sh
