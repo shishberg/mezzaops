@@ -48,6 +48,24 @@ func New(cfg Config, manager ServiceManager) *Bot {
 	}
 }
 
+// Notifier returns a Notifier that sends messages to the bot's channel using
+// the bot's session. Because the session is only created in Run(), the notifier
+// resolves it lazily — messages sent before Run() are logged to stdout.
+func (b *Bot) Notifier() *Notifier {
+	return &Notifier{
+		channelID: b.cfg.ChannelID,
+		sendFunc: func(msg string) {
+			if b.session == nil || b.cfg.ChannelID == "" {
+				log.Println(msg)
+				return
+			}
+			if _, err := b.session.ChannelMessageSend(b.cfg.ChannelID, msg); err != nil {
+				log.Printf("discord send error: %v", err)
+			}
+		},
+	}
+}
+
 // Run connects to Discord, registers commands, and blocks until ctx is done.
 func (b *Bot) Run(ctx context.Context) error {
 	session, err := discordgo.New("Bot " + b.cfg.Token)

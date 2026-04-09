@@ -79,7 +79,7 @@ func New(configPath string, envPath string, templatesFS fs.FS) (*App, error) {
 			ChannelID: cfg.Discord.ChannelID,
 		}
 		a.discordBot = discord.New(dcfg, a.manager)
-		notifiers = append(notifiers, discord.NewNotifier(nil, dcfg.ChannelID))
+		notifiers = append(notifiers, a.discordBot.Notifier())
 	}
 
 	// Mattermost.
