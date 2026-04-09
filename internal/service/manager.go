@@ -131,7 +131,7 @@ func (m *Manager) backendForConfig(svc config.ServiceConfig) Backend {
 		if runtime.GOOS == "darwin" {
 			return NewLaunchctlBackend(svc.ServiceName)
 		}
-		return NewSystemctlBackend(svc.ServiceName, svc.UserService)
+		return NewSystemctlBackend(svc.ServiceName, svc.UserService, svc.Sudo)
 	}
 	// Fallback: no-op process backend
 	return NewProcessBackend(
@@ -490,7 +490,7 @@ func serviceConfigEqual(a, b config.ServiceConfig) bool {
 	if a.Name != b.Name || a.Dir != b.Dir || a.Branch != b.Branch || a.Repo != b.Repo {
 		return false
 	}
-	if a.ServiceName != b.ServiceName || a.UserService != b.UserService {
+	if a.ServiceName != b.ServiceName || a.UserService != b.UserService || a.Sudo != b.Sudo {
 		return false
 	}
 	if a.Process.Cmd != b.Process.Cmd {

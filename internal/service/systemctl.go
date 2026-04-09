@@ -11,17 +11,24 @@ import (
 type SystemctlBackend struct {
 	unit     string
 	userMode bool
+	sudo     bool
 }
 
 // NewSystemctlBackend returns a Backend that controls the given systemd unit.
-// If userMode is true, all commands include the --user flag.
-func NewSystemctlBackend(unit string, userMode bool) *SystemctlBackend {
-	return &SystemctlBackend{unit: unit, userMode: userMode}
+// If userMode is true, commands include the --user flag.
+// If sudo is true, commands are run via sudo (for system services managed by
+// a non-root user).
+func NewSystemctlBackend(unit string, userMode bool, sudo bool) *SystemctlBackend {
+	return &SystemctlBackend{unit: unit, userMode: userMode, sudo: sudo}
 }
 
 func (s *SystemctlBackend) systemctl(ctx context.Context, args ...string) *exec.Cmd {
 	if s.userMode {
 		args = append([]string{"--user"}, args...)
+	}
+	if s.sudo {
+		args = append([]string{"systemctl"}, args...)
+		return exec.CommandContext(ctx, "sudo", args...)
 	}
 	return exec.CommandContext(ctx, "systemctl", args...)
 }
@@ -68,7 +75,14 @@ func (s *SystemctlBackend) Logs(ctx context.Context, tail int) (string, error) {
 	if s.userMode {
 		args = append([]string{"--user"}, args...)
 	}
-	out, err := exec.CommandContext(ctx, "journalctl", args...).Output()
+	var cmd *exec.Cmd
+	if s.sudo {
+		args = append([]string{"journalctl"}, args...)
+		cmd = exec.CommandContext(ctx, "sudo", args...)
+	} else {
+		cmd = exec.CommandContext(ctx, "journalctl", args...)
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("journalctl: %w", err)
 	}
