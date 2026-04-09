@@ -11,13 +11,13 @@ import (
 	"time"
 )
 
-// ProcessBackend manages a service as a child process, merging mezzaops's
-// process adoption with matterops's graceful-shutdown approach.
+// ProcessBackend manages a service as a child process with process adoption
+// and graceful shutdown (SIGTERM then SIGKILL after timeout).
 type ProcessBackend struct {
 	name       string
 	dir        string
-	entrypoint []string // explicit argv (mezzaops style)
-	cmd        string   // sh -c wrapper (matterops style) -- used if entrypoint is empty
+	entrypoint []string // explicit argv
+	cmd        string   // sh -c wrapper -- used if entrypoint is empty
 	logDir     string
 	stateDir   string
 	adopt      bool // whether to attempt process adoption
