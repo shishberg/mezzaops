@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -112,7 +113,8 @@ func (m *Manager) newManagedService(svc config.ServiceConfig) *managedService {
 
 	// Try to adopt existing processes for ProcessBackend
 	if pb, ok := backend.(*ProcessBackend); ok && m.adopt {
-		pb.TryAdopt()
+		msg := pb.TryAdopt()
+		log.Printf("**%s**: %s", svc.Name, msg)
 	}
 
 	return ms
