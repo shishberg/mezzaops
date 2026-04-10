@@ -11,7 +11,7 @@ import (
 func newTestBackend(t *testing.T, entrypoint []string, cmd string) *ProcessBackend {
 	t.Helper()
 	logDir := t.TempDir()
-	return NewProcessBackend("test", t.TempDir(), entrypoint, cmd, logDir, false)
+	return NewProcessBackend("test", t.TempDir(), entrypoint, cmd, logDir)
 }
 
 func TestProcessBackend_StartAndStatus(t *testing.T) {
@@ -175,7 +175,8 @@ func TestProcessBackend_ShCmdFallback(t *testing.T) {
 
 func TestProcessBackend_TryAdoptDisabled(t *testing.T) {
 	logDir := t.TempDir()
-	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir, false)
+	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir)
+	b.adopt = false
 
 	msg := b.TryAdopt()
 	if !strings.Contains(msg, "adoption disabled") {
@@ -185,7 +186,8 @@ func TestProcessBackend_TryAdoptDisabled(t *testing.T) {
 
 func TestProcessBackend_TryAdoptNoRestoredState(t *testing.T) {
 	logDir := t.TempDir()
-	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir, true)
+	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir)
+	b.adopt = true
 
 	// No RestoreBackendState called, so restoredState is nil
 	msg := b.TryAdopt()
@@ -246,7 +248,8 @@ func TestProcessBackend_SaveBackendStateRoundTrip(t *testing.T) {
 
 func TestProcessBackend_RestoreBackendStateNewFormat(t *testing.T) {
 	logDir := t.TempDir()
-	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir, true)
+	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir)
+	b.adopt = true
 
 	// Simulate a new-format state file with backend sub-object
 	backendJSON := json.RawMessage(`{"pid":12345,"pgid":12345,"log_path":"/tmp/test.log","boot_time":1711000000,"create_time":1711000123000}`)
@@ -275,7 +278,8 @@ func TestProcessBackend_RestoreBackendStateNewFormat(t *testing.T) {
 
 func TestProcessBackend_RestoreBackendStateOldFormat(t *testing.T) {
 	logDir := t.TempDir()
-	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir, true)
+	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir)
+	b.adopt = true
 
 	// Simulate an old-format state file with pid/pgid at top level (no backend sub-object)
 	oldFormatJSON := json.RawMessage(`{"status":"running","pid":54321,"pgid":54321,"log_path":"/tmp/old.log","boot_time":1711000000,"create_time":1711000123000}`)
@@ -296,7 +300,8 @@ func TestProcessBackend_RestoreBackendStateOldFormat(t *testing.T) {
 
 func TestProcessBackend_TryAdoptStopped(t *testing.T) {
 	logDir := t.TempDir()
-	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir, true)
+	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir)
+	b.adopt = true
 
 	// Restore a "stopped" state -- TryAdopt should respect that
 	b.restoredState = &processBackendState{}
@@ -310,7 +315,8 @@ func TestProcessBackend_TryAdoptStopped(t *testing.T) {
 
 func TestProcessBackend_TryAdoptStalePID(t *testing.T) {
 	logDir := t.TempDir()
-	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir, true)
+	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir)
+	b.adopt = true
 
 	// Restore state with a PID that doesn't exist
 	b.restoredState = &processBackendState{

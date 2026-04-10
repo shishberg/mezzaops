@@ -15,8 +15,6 @@ func TestLoadConfig_AllSections(t *testing.T) {
 services_dir: "/opt/services"
 log_dir: "/var/log/mezzaops"
 state_dir: "/var/state"
-process:
-  adopt: false
 discord:
   guild_id: "123"
   channel_id: "456"
@@ -37,8 +35,6 @@ dashboard:
 	assert.Equal(t, "/opt/services", cfg.ServicesDir)
 	assert.Equal(t, "/var/log/mezzaops", cfg.LogDir)
 	assert.Equal(t, "/var/state", cfg.StateDir)
-	assert.False(t, cfg.Process.Adopt)
-
 	require.NotNil(t, cfg.Discord)
 	assert.Equal(t, "123", cfg.Discord.GuildID)
 	assert.Equal(t, "456", cfg.Discord.ChannelID)
@@ -84,7 +80,6 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	assert.Equal(t, "./services", cfg.ServicesDir)
 	assert.Equal(t, "./logs", cfg.LogDir)
 	assert.Equal(t, "./state", cfg.StateDir)
-	assert.True(t, cfg.Process.Adopt)
 }
 
 func TestLoadEnv_FromFile(t *testing.T) {

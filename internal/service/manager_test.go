@@ -19,7 +19,6 @@ func testConfig(t *testing.T) *config.Config {
 	return &config.Config{
 		LogDir:   t.TempDir(),
 		StateDir: t.TempDir(),
-		Process:  config.ProcessConfig{Adopt: false},
 	}
 }
 
@@ -835,7 +834,6 @@ func TestManager_DeployStateSurvivesRestart(t *testing.T) {
 	cfg := &config.Config{
 		LogDir:   logDir,
 		StateDir: stateDir,
-		Process:  config.ProcessConfig{Adopt: false},
 	}
 	svc := config.ServiceConfig{
 		Name:       "testsvc",
@@ -882,7 +880,6 @@ func TestManager_DeployStateSurvivesRestart(t *testing.T) {
 	cfg2 := &config.Config{
 		LogDir:   logDir,
 		StateDir: stateDir,
-		Process:  config.ProcessConfig{Adopt: false},
 	}
 	m2, err := NewManager(cfg2, []config.ServiceConfig{svc}, NopNotifier{})
 	if err != nil {
@@ -914,7 +911,6 @@ func TestManager_OldFormatMigration(t *testing.T) {
 	cfg := &config.Config{
 		LogDir:   logDir,
 		StateDir: stateDir,
-		Process:  config.ProcessConfig{Adopt: true},
 	}
 	svc := config.ServiceConfig{
 		Name:       "testsvc",

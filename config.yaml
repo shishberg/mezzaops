@@ -2,9 +2,6 @@ services_dir: "./services"
 log_dir: "./logs"
 state_dir: "./state"
 
-process:
-  adopt: true
-
 # Uncomment and configure the frontends you want to use:
 
 # discord:

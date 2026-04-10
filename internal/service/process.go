@@ -46,14 +46,13 @@ type ProcessBackend struct {
 }
 
 // NewProcessBackend creates a new ProcessBackend.
-func NewProcessBackend(name, dir string, entrypoint []string, cmd string, logDir string, adopt bool) *ProcessBackend {
+func NewProcessBackend(name, dir string, entrypoint []string, cmd string, logDir string) *ProcessBackend {
 	return &ProcessBackend{
 		name:       name,
 		dir:        dir,
 		entrypoint: entrypoint,
 		cmd:        cmd,
 		logDir:     logDir,
-		adopt:      adopt,
 	}
 }
 

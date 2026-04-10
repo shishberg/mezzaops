@@ -11,11 +11,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ProcessConfig controls process supervisor behaviour.
-type ProcessConfig struct {
-	Adopt bool `yaml:"adopt"`
-}
-
 // DiscordConfig holds Discord bot connection settings.
 type DiscordConfig struct {
 	GuildID   string `yaml:"guild_id"`
@@ -43,7 +38,6 @@ type Config struct {
 	ServicesDir string            `yaml:"services_dir"`
 	LogDir      string            `yaml:"log_dir"`
 	StateDir    string            `yaml:"state_dir"`
-	Process     ProcessConfig     `yaml:"process"`
 	Discord     *DiscordConfig    `yaml:"discord"`
 	Mattermost  *MattermostConfig `yaml:"mattermost"`
 	Webhook     *WebhookConfig    `yaml:"webhook"`
@@ -69,6 +63,16 @@ type ServiceConfig struct {
 	Sudo                bool                 `yaml:"sudo"`
 	RequireConfirmation bool                 `yaml:"require_confirmation"`
 	SelfDeploy          bool                 `yaml:"self_deploy"`
+	Adopt               *bool                `yaml:"adopt"`
+}
+
+// ShouldAdopt returns whether this service should be adopted on startup.
+// Defaults to true if not explicitly set.
+func (s *ServiceConfig) ShouldAdopt() bool {
+	if s.Adopt != nil {
+		return *s.Adopt
+	}
+	return true
 }
 
 // Env holds secrets loaded from environment variables or a .env file.
@@ -89,7 +93,6 @@ func LoadConfig(path string) (*Config, error) {
 		ServicesDir: "./services",
 		LogDir:      "./logs",
 		StateDir:    "./state",
-		Process:     ProcessConfig{Adopt: true},
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {

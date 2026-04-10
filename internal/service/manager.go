@@ -62,7 +62,6 @@ type Manager struct {
 	// Config for creating new services
 	logDir   string
 	stateDir string
-	adopt    bool
 
 	// For reload
 	servicesDir string
@@ -88,7 +87,6 @@ func NewManager(cfg *config.Config, services []config.ServiceConfig, notifier No
 		cancel:      cancel,
 		logDir:      cfg.LogDir,
 		stateDir:    cfg.StateDir,
-		adopt:       cfg.Process.Adopt,
 		servicesDir: cfg.ServicesDir,
 		shutdownCh:  make(chan struct{}),
 	}
@@ -126,11 +124,16 @@ func (m *Manager) newManagedService(svc config.ServiceConfig) *managedService {
 		backend.RestoreBackendState(raw)
 	}
 
-	// Try process adoption if enabled
-	if m.adopt {
-		if pb, ok := backend.(*ProcessBackend); ok {
-			msg := pb.TryAdopt()
-			log.Printf("**%s**: %s", svc.Name, msg)
+	// On startup: adopt existing state or restart
+	adopt := svc.ShouldAdopt()
+	if pb, ok := backend.(*ProcessBackend); ok {
+		pb.adopt = adopt
+		msg := pb.TryAdopt()
+		log.Printf("**%s**: %s", svc.Name, msg)
+	} else if !adopt {
+		log.Printf("**%s**: restarting (adopt: false)", svc.Name)
+		if err := backend.Restart(context.Background()); err != nil {
+			log.Printf("**%s**: restart failed: %v", svc.Name, err)
 		}
 	}
 
@@ -143,7 +146,7 @@ func (m *Manager) backendForConfig(svc config.ServiceConfig) Backend {
 		return NewProcessBackend(
 			svc.Name, svc.Dir,
 			svc.Entrypoint, svc.Process.Cmd,
-			m.logDir, m.adopt,
+			m.logDir,
 		)
 	}
 	if svc.ServiceName != "" {
@@ -156,7 +159,7 @@ func (m *Manager) backendForConfig(svc config.ServiceConfig) Backend {
 	return NewProcessBackend(
 		svc.Name, svc.Dir,
 		nil, "echo 'no backend configured'",
-		m.logDir, false,
+		m.logDir,
 	)
 }
 
