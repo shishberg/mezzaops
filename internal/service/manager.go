@@ -267,10 +267,6 @@ func (m *Manager) executeDeploy(ms *managedService) {
 	name := ms.config.Name
 	steps := ms.config.Deploy
 
-	if len(steps) == 0 {
-		return
-	}
-
 	ms.stateMu.Lock()
 	ms.state.Status = "deploying"
 	ms.state.LastDeploy = time.Now()

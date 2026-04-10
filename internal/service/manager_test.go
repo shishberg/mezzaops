@@ -675,7 +675,7 @@ func TestManager_DeployNoSteps(t *testing.T) {
 		Name:       "testsvc",
 		Dir:        dir,
 		Entrypoint: []string{"sleep", "3600"},
-		// No deploy steps
+		// No deploy steps — should vacuously succeed and restart
 	}
 
 	m, err := NewManager(cfg, []config.ServiceConfig{svc}, rec)
@@ -684,15 +684,32 @@ func TestManager_DeployNoSteps(t *testing.T) {
 	}
 	defer m.Stop()
 
+	// Start the service first so restart works
+	m.Do("testsvc", "start")
+
 	if err := m.RequestDeploy("testsvc"); err != nil {
 		t.Fatal(err)
 	}
 
-	// Wait a bit - deploy should be a no-op
-	time.Sleep(200 * time.Millisecond)
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for deploy")
+		default:
+		}
+		states := m.GetAllStates()
+		if states["testsvc"].Status != "deploying" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 
-	if len(rec.getDeployStarted()) != 0 {
-		t.Fatal("should not get DeployStarted when no deploy steps configured")
+	if len(rec.getDeployStarted()) == 0 {
+		t.Fatal("expected DeployStarted notification")
+	}
+	if len(rec.getDeploySucceeded()) == 0 {
+		t.Fatal("expected DeploySucceeded notification")
 	}
 }
 
