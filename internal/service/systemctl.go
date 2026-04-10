@@ -24,10 +24,20 @@ func NewSystemctlBackend(unit string, userMode bool, sudo bool) *SystemctlBacken
 }
 
 func (s *SystemctlBackend) systemctl(ctx context.Context, args ...string) *exec.Cmd {
+	return s.systemctlCmd(ctx, true, args...)
+}
+
+// systemctlNoSudo builds a systemctl command that never uses sudo.
+// Used for read-only commands (is-active) that don't require root.
+func (s *SystemctlBackend) systemctlNoSudo(ctx context.Context, args ...string) *exec.Cmd {
+	return s.systemctlCmd(ctx, false, args...)
+}
+
+func (s *SystemctlBackend) systemctlCmd(ctx context.Context, useSudo bool, args ...string) *exec.Cmd {
 	if s.userMode {
 		args = append([]string{"--user"}, args...)
 	}
-	if s.sudo {
+	if useSudo && s.sudo {
 		args = append([]string{"systemctl"}, args...)
 		return exec.CommandContext(ctx, "sudo", args...)
 	}
@@ -51,7 +61,7 @@ func (s *SystemctlBackend) Restart(ctx context.Context) error {
 
 // Status returns "running", "stopped", or "failed" based on systemctl is-active.
 func (s *SystemctlBackend) Status(ctx context.Context) (string, error) {
-	out, err := s.systemctl(ctx, "is-active", s.unit).Output()
+	out, err := s.systemctlNoSudo(ctx, "is-active", s.unit).Output()
 	state := strings.TrimSpace(string(out))
 
 	if err != nil {
@@ -76,13 +86,9 @@ func (s *SystemctlBackend) Logs(ctx context.Context, tail int) (string, error) {
 	if s.userMode {
 		args = append([]string{"--user"}, args...)
 	}
-	var cmd *exec.Cmd
-	if s.sudo {
-		args = append([]string{"journalctl"}, args...)
-		cmd = exec.CommandContext(ctx, "sudo", args...)
-	} else {
-		cmd = exec.CommandContext(ctx, "journalctl", args...)
-	}
+	// journalctl doesn't need sudo — the user can read journal logs
+	// if they are in the systemd-journal group (default on most distros).
+	cmd := exec.CommandContext(ctx, "journalctl", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("journalctl: %w", err)
