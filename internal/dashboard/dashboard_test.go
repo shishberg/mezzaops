@@ -16,7 +16,7 @@ import (
 )
 
 type mockStateProvider struct {
-	states map[string]service.ServiceState
+	states  map[string]service.ServiceState
 	configs map[string]config.ServiceConfig
 	logs    map[string]string
 }
