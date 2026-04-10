@@ -48,8 +48,14 @@ func main() {
 
 	if *interactive {
 		// Run the app (servers, bots) in the background; CLI in the foreground.
-		go a.Run(ctx)
-		cli.Run(ctx, a.Manager())
+		go func() {
+			if err := a.Run(ctx); err != nil {
+				log.Printf("app error: %v", err)
+			}
+		}()
+		if err := cli.Run(ctx, a.Manager()); err != nil {
+			log.Printf("cli error: %v", err)
+		}
 		a.Shutdown()
 		return
 	}
