@@ -9,12 +9,13 @@ import (
 
 // State represents the persisted state of a managed service.
 type State struct {
-	Status     string          `json:"status"`
-	LastDeploy time.Time       `json:"last_deploy,omitempty"`
-	LastResult string          `json:"last_result,omitempty"`
-	LastOutput string          `json:"last_output,omitempty"`
-	FailedStep string          `json:"failed_step,omitempty"`
-	Backend    json.RawMessage `json:"backend,omitempty"`
+	Status      string          `json:"status"`
+	LastDeploy  time.Time       `json:"last_deploy,omitempty"`
+	LastRestart time.Time       `json:"last_restart,omitempty"`
+	LastResult  string          `json:"last_result,omitempty"`
+	LastOutput  string          `json:"last_output,omitempty"`
+	FailedStep  string          `json:"failed_step,omitempty"`
+	Backend     json.RawMessage `json:"backend,omitempty"`
 }
 
 func statePath(dir, name string) string {

@@ -127,6 +127,7 @@
         <th>Service</th>
         <th>Status</th>
         <th>Last Deploy</th>
+        <th>Last Restart</th>
         <th>Result</th>
         <th>Details</th>
       </tr>
@@ -142,6 +143,13 @@
           <td>
             {{if not $state.LastDeploy.IsZero}}
               <span class="ts">{{$state.LastDeploy.Format "2006-01-02 15:04:05 UTC"}}</span>
+            {{else}}
+              <span class="ts">—</span>
+            {{end}}
+          </td>
+          <td>
+            {{if not $state.LastRestart.IsZero}}
+              <span class="ts">{{$state.LastRestart.Format "2006-01-02 15:04:05 UTC"}}</span>
             {{else}}
               <span class="ts">—</span>
             {{end}}

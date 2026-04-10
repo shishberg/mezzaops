@@ -28,11 +28,12 @@ type syncOp struct {
 
 // ServiceState holds the current state of a managed service.
 type ServiceState struct {
-	Status     string    `json:"status"`
-	LastDeploy time.Time `json:"last_deploy,omitempty"`
-	LastResult string    `json:"last_result,omitempty"`
-	LastOutput string    `json:"last_output,omitempty"`
-	FailedStep string    `json:"failed_step,omitempty"`
+	Status      string    `json:"status"`
+	LastDeploy  time.Time `json:"last_deploy,omitempty"`
+	LastRestart time.Time `json:"last_restart,omitempty"`
+	LastResult  string    `json:"last_result,omitempty"`
+	LastOutput  string    `json:"last_output,omitempty"`
+	FailedStep  string    `json:"failed_step,omitempty"`
 }
 
 // managedService wraps a backend with its config, event loop, and deploy queue.
@@ -118,6 +119,7 @@ func (m *Manager) newManagedService(svc config.ServiceConfig) *managedService {
 	s, raw, err := LoadState(m.stateDir, svc.Name)
 	if err == nil {
 		ms.state.LastDeploy = s.LastDeploy
+		ms.state.LastRestart = s.LastRestart
 		ms.state.LastResult = s.LastResult
 		ms.state.LastOutput = s.LastOutput
 		ms.state.FailedStep = s.FailedStep
@@ -134,6 +136,8 @@ func (m *Manager) newManagedService(svc config.ServiceConfig) *managedService {
 		log.Printf("**%s**: restarting (adopt: false)", svc.Name)
 		if err := backend.Restart(context.Background()); err != nil {
 			log.Printf("**%s**: restart failed: %v", svc.Name, err)
+		} else {
+			ms.state.LastRestart = time.Now()
 		}
 	}
 
@@ -240,6 +244,9 @@ func (m *Manager) handleOp(ms *managedService, op string) string {
 		if err := ms.backend.Restart(ctx); err != nil {
 			return fmt.Sprintf("restart failed: %v", err)
 		}
+		ms.stateMu.Lock()
+		ms.state.LastRestart = time.Now()
+		ms.stateMu.Unlock()
 		m.notifyEvent(ms.config.Name, "restarted")
 		return "restarted"
 
@@ -355,6 +362,7 @@ func (m *Manager) executeDeploy(ms *managedService) {
 	ms.state.LastResult = "success"
 	ms.state.LastOutput = result.Output
 	ms.state.FailedStep = ""
+	ms.state.LastRestart = time.Now()
 	ms.stateMu.Unlock()
 
 	m.saveServiceState(ms)

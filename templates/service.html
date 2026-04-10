@@ -135,6 +135,14 @@
           <span class="ts">&mdash;</span>
         {{end}}
       </dd>
+      <dt>Last Restart</dt>
+      <dd>
+        {{if not .State.LastRestart.IsZero}}
+          <span class="ts">{{.State.LastRestart.Format "2006-01-02 15:04:05 UTC"}}</span>
+        {{else}}
+          <span class="ts">&mdash;</span>
+        {{end}}
+      </dd>
       <dt>Result</dt>
       <dd>{{if .State.LastResult}}{{.State.LastResult}}{{else}}&mdash;{{end}}</dd>
     </dl>
