@@ -49,6 +49,11 @@ func ConfigFields(cfg config.ServiceConfig) []ConfigField {
 				continue
 			}
 			fields = append(fields, ConfigField{Key: tag, Value: "true"})
+		case reflect.Ptr:
+			if fv.IsNil() {
+				continue
+			}
+			fields = append(fields, ConfigField{Key: tag, Value: fmt.Sprintf("%v", fv.Elem().Interface())})
 		case reflect.Slice:
 			if fv.Len() == 0 {
 				continue
