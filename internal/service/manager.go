@@ -749,6 +749,12 @@ func (m *Manager) SignalReady() {
 	close(m.readyCh)
 }
 
+// NotifyWebhook forwards webhook details to the notifier, for a service that
+// matched an incoming webhook.
+func (m *Manager) NotifyWebhook(name string, info WebhookInfo) {
+	m.notifier.WebhookReceived(name, info)
+}
+
 // cleanOrphans removes state files for services not in the current config and
 // kills their processes if still alive.
 func (m *Manager) cleanOrphans() {

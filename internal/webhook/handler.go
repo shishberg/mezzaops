@@ -11,9 +11,27 @@ import (
 	"strings"
 )
 
+// PushEvent is the relevant subset of a GitHub push webhook payload.
+type PushEvent struct {
+	Repo       string // e.g. "org/repo"
+	Branch     string // e.g. "main"
+	Compare    string // URL to the GitHub compare page
+	Pusher     string // username of the pusher
+	HeadCommit HeadCommit
+}
+
+// HeadCommit captures the head commit details from a push webhook.
+type HeadCommit struct {
+	ID        string // full SHA
+	Message   string // commit message (may be multiline)
+	URL       string // commit URL
+	Author    string // author name
+	Timestamp string // timestamp as received (keep as string for simplicity)
+}
+
 // DeployTrigger is called when a valid push event is received.
 type DeployTrigger interface {
-	HandlePush(repo string, branch string)
+	HandlePush(event PushEvent)
 }
 
 // Handler handles incoming GitHub webhook requests.
@@ -41,8 +59,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	event := r.Header.Get("X-GitHub-Event")
-	if event != "push" {
+	eventType := r.Header.Get("X-GitHub-Event")
+	if eventType != "push" {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -63,9 +81,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var payload struct {
 		Ref        string `json:"ref"`
+		Compare    string `json:"compare"`
 		Repository struct {
 			FullName string `json:"full_name"`
 		} `json:"repository"`
+		Pusher struct {
+			Name string `json:"name"`
+		} `json:"pusher"`
+		HeadCommit *struct {
+			ID        string `json:"id"`
+			Message   string `json:"message"`
+			URL       string `json:"url"`
+			Timestamp string `json:"timestamp"`
+			Author    struct {
+				Name string `json:"name"`
+			} `json:"author"`
+		} `json:"head_commit"`
 	}
 	if err := json.Unmarshal(jsonBody, &payload); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -79,7 +110,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	branch := strings.TrimPrefix(payload.Ref, "refs/heads/")
-	h.trigger.HandlePush(payload.Repository.FullName, branch)
+	event := PushEvent{
+		Repo:    payload.Repository.FullName,
+		Branch:  branch,
+		Compare: payload.Compare,
+		Pusher:  payload.Pusher.Name,
+	}
+	if payload.HeadCommit != nil {
+		event.HeadCommit = HeadCommit{
+			ID:        payload.HeadCommit.ID,
+			Message:   payload.HeadCommit.Message,
+			URL:       payload.HeadCommit.URL,
+			Author:    payload.HeadCommit.Author.Name,
+			Timestamp: payload.HeadCommit.Timestamp,
+		}
+	}
+	h.trigger.HandlePush(event)
 	w.WriteHeader(http.StatusOK)
 }
 

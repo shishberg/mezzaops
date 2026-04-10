@@ -40,3 +40,9 @@ func (n *Notifier) DeployFailed(name, step, output string) {
 	msg := fmt.Sprintf("Deploy of `%s` failed at step `%s`.\n```\n%s\n```", name, step, output)
 	n.bot.PostMessage(context.Background(), msg)
 }
+
+// WebhookReceived posts a notification describing an incoming webhook that
+// matched the named service.
+func (n *Notifier) WebhookReceived(name string, info service.WebhookInfo) {
+	n.bot.PostMessage(context.Background(), info.FormatMessage(fmt.Sprintf("`%s`", name)))
+}

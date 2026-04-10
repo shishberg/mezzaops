@@ -1029,6 +1029,85 @@ func TestNotifier_DeployFailed(t *testing.T) {
 	assert.Contains(t, posts[0].Message, "error output")
 }
 
+func TestNotifier_WebhookReceived_Full(t *testing.T) {
+	rest := &mockRestClient{}
+	bot := &Bot{
+		rest:      rest,
+		channelID: "channel-123",
+	}
+
+	n := NewNotifier(bot)
+	n.WebhookReceived("myapp", service.WebhookInfo{
+		Repo:      "acme/myapp",
+		Branch:    "main",
+		Compare:   "https://github.com/acme/myapp/compare/abc...def",
+		Pusher:    "alice",
+		CommitID:  "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		CommitMsg: "feat: add a thing\n\nmore details here",
+		CommitURL: "https://github.com/acme/myapp/commit/deadbeef",
+		Author:    "Alice Author",
+		Timestamp: "2026-04-10T12:34:56Z",
+	})
+
+	posts := rest.getPosts()
+	require.Len(t, posts, 1)
+	msg := posts[0].Message
+	assert.Contains(t, msg, "myapp")
+	assert.Contains(t, msg, "acme/myapp")
+	assert.Contains(t, msg, "main")
+	assert.Contains(t, msg, "deadbee")
+	assert.Contains(t, msg, "https://github.com/acme/myapp/commit/deadbeef")
+	assert.Contains(t, msg, "feat: add a thing")
+	assert.NotContains(t, msg, "more details here")
+	assert.Contains(t, msg, "Alice Author")
+	assert.Contains(t, msg, "https://github.com/acme/myapp/compare/abc...def")
+}
+
+func TestNotifier_WebhookReceived_NoHeadCommit(t *testing.T) {
+	rest := &mockRestClient{}
+	bot := &Bot{
+		rest:      rest,
+		channelID: "channel-123",
+	}
+
+	n := NewNotifier(bot)
+	n.WebhookReceived("myapp", service.WebhookInfo{
+		Repo:   "acme/myapp",
+		Branch: "main",
+		Pusher: "alice",
+	})
+
+	posts := rest.getPosts()
+	require.Len(t, posts, 1)
+	msg := posts[0].Message
+	assert.Contains(t, msg, "myapp")
+	assert.Contains(t, msg, "main")
+	assert.Contains(t, msg, "alice")
+}
+
+func TestNotifier_WebhookReceived_LongCommitMsg(t *testing.T) {
+	rest := &mockRestClient{}
+	bot := &Bot{
+		rest:      rest,
+		channelID: "channel-123",
+	}
+
+	n := NewNotifier(bot)
+	long := strings.Repeat("x", 400)
+	n.WebhookReceived("myapp", service.WebhookInfo{
+		Repo:      "acme/myapp",
+		Branch:    "main",
+		CommitID:  "deadbeef",
+		CommitMsg: long,
+	})
+
+	posts := rest.getPosts()
+	require.Len(t, posts, 1)
+	msg := posts[0].Message
+	assert.Contains(t, msg, "...")
+	assert.NotContains(t, msg, long)
+}
+
 // --- Status overview format test ---
 
 func TestStatusOverview_Format(t *testing.T) {

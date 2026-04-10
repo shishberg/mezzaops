@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/shishberg/mezzaops/internal/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -360,6 +361,68 @@ func TestNotifier_DeployFailed(t *testing.T) {
 	n.DeployFailed("web", "build", "exit code 1\nsome error")
 	expected := "Deploy of **web** failed at step `build`.\n```\nexit code 1\nsome error\n```"
 	assert.Equal(t, expected, sent)
+}
+
+func TestNotifier_WebhookReceived_Full(t *testing.T) {
+	var sent string
+	n := &Notifier{
+		sendFunc: func(msg string) { sent = msg },
+	}
+	n.WebhookReceived("api", service.WebhookInfo{
+		Repo:      "acme/myapp",
+		Branch:    "main",
+		Compare:   "https://github.com/acme/myapp/compare/abc...def",
+		Pusher:    "alice",
+		CommitID:  "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		CommitMsg: "feat: add a thing\n\nmore details here",
+		CommitURL: "https://github.com/acme/myapp/commit/deadbeef",
+		Author:    "Alice Author",
+		Timestamp: "2026-04-10T12:34:56Z",
+	})
+	assert.Contains(t, sent, "api")
+	assert.Contains(t, sent, "acme/myapp")
+	assert.Contains(t, sent, "main")
+	assert.Contains(t, sent, "deadbee") // short sha
+	assert.Contains(t, sent, "https://github.com/acme/myapp/commit/deadbeef")
+	assert.Contains(t, sent, "feat: add a thing")
+	assert.NotContains(t, sent, "more details here", "should only show first line of commit msg")
+	assert.Contains(t, sent, "Alice Author")
+	assert.Contains(t, sent, "https://github.com/acme/myapp/compare/abc...def")
+}
+
+func TestNotifier_WebhookReceived_NoHeadCommit(t *testing.T) {
+	var sent string
+	n := &Notifier{
+		sendFunc: func(msg string) { sent = msg },
+	}
+	n.WebhookReceived("api", service.WebhookInfo{
+		Repo:   "acme/myapp",
+		Branch: "main",
+		Pusher: "alice",
+	})
+	assert.Contains(t, sent, "api")
+	assert.Contains(t, sent, "main")
+	assert.Contains(t, sent, "alice")
+}
+
+func TestNotifier_WebhookReceived_LongCommitMsg(t *testing.T) {
+	var sent string
+	n := &Notifier{
+		sendFunc: func(msg string) { sent = msg },
+	}
+	long := ""
+	for i := 0; i < 400; i++ {
+		long += "x"
+	}
+	n.WebhookReceived("api", service.WebhookInfo{
+		Repo:      "acme/myapp",
+		Branch:    "main",
+		CommitID:  "deadbeef",
+		CommitMsg: long,
+	})
+	assert.Contains(t, sent, "...")
+	// Must not include the full 400 x's
+	assert.NotContains(t, sent, long)
 }
 
 func TestNotifier_FallbackToLog(t *testing.T) {

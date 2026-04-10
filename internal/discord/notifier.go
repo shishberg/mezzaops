@@ -5,6 +5,7 @@ import (
 	"log"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/shishberg/mezzaops/internal/service"
 )
 
 // Notifier implements service.Notifier by posting messages to a Discord channel.
@@ -45,6 +46,12 @@ func (n *Notifier) DeploySucceeded(name, output string) {
 func (n *Notifier) DeployFailed(name, step, output string) {
 	msg := fmt.Sprintf("Deploy of **%s** failed at step `%s`.\n```\n%s\n```", name, step, output)
 	n.send(msg)
+}
+
+// WebhookReceived posts a notification describing an incoming webhook that
+// matched the named service.
+func (n *Notifier) WebhookReceived(name string, info service.WebhookInfo) {
+	n.send(info.FormatMessage(fmt.Sprintf("**%s**", name)))
 }
 
 func (n *Notifier) send(msg string) {

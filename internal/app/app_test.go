@@ -8,6 +8,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/shishberg/mezzaops/internal/webhook"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -142,7 +143,7 @@ func TestHandlePush_MatchingService(t *testing.T) {
 	defer a.manager.Stop()
 
 	// HandlePush with matching repo/branch should trigger deploy
-	a.HandlePush("org/testrepo", "main")
+	a.HandlePush(webhook.PushEvent{Repo: "org/testrepo", Branch: "main"})
 
 	// Give the async deploy a moment to be queued
 	time.Sleep(50 * time.Millisecond)
@@ -186,7 +187,7 @@ state_dir: ` + filepath.Join(dir, "state") + `
 	defer a.manager.Stop()
 
 	// HandlePush with require_confirmation should add pending, not deploy
-	a.HandlePush("org/confirmrepo", "main")
+	a.HandlePush(webhook.PushEvent{Repo: "org/confirmrepo", Branch: "main"})
 
 	// Check that confirmation is pending
 	assert.True(t, a.confirmations.IsPending("confirmsvc"))
@@ -226,7 +227,7 @@ state_dir: ` + filepath.Join(dir, "state") + `
 	defer a.manager.Stop()
 
 	// Add a pending confirmation via HandlePush
-	a.HandlePush("org/confirmrepo", "main")
+	a.HandlePush(webhook.PushEvent{Repo: "org/confirmrepo", Branch: "main"})
 	assert.True(t, a.confirmations.IsPending("confirmsvc"))
 
 	// Confirm it

@@ -26,12 +26,14 @@ type mockDeployTrigger struct {
 	called     bool
 	calledRepo string
 	calledRef  string
+	lastEvent  webhook.PushEvent
 }
 
-func (m *mockDeployTrigger) HandlePush(repo string, branch string) {
+func (m *mockDeployTrigger) HandlePush(event webhook.PushEvent) {
 	m.called = true
-	m.calledRepo = repo
-	m.calledRef = branch
+	m.calledRepo = event.Repo
+	m.calledRef = event.Branch
+	m.lastEvent = event
 }
 
 func TestWebhook_ValidPush(t *testing.T) {
@@ -238,6 +240,84 @@ func TestWebhook_FormURLEncoded_MissingPayloadField(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 	assert.False(t, trigger.called)
+}
+
+func TestWebhook_ExtractsHeadCommit(t *testing.T) {
+	const secret = "test-secret"
+	trigger := &mockDeployTrigger{}
+	handler := webhook.NewHandler(secret, trigger)
+
+	payload := map[string]interface{}{
+		"ref":     "refs/heads/main",
+		"compare": "https://github.com/acme/myapp/compare/abc...def",
+		"repository": map[string]interface{}{
+			"full_name": "acme/myapp",
+		},
+		"pusher": map[string]interface{}{
+			"name": "alice",
+		},
+		"head_commit": map[string]interface{}{
+			"id":        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+			"message":   "feat: add a thing\n\nmore details",
+			"url":       "https://github.com/acme/myapp/commit/deadbeef",
+			"timestamp": "2026-04-10T12:34:56Z",
+			"author": map[string]interface{}{
+				"name": "Alice Author",
+			},
+		},
+	}
+	body, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/github", strings.NewReader(string(body)))
+	req.Header.Set("X-GitHub-Event", "push")
+	req.Header.Set("X-Hub-Signature-256", signPayload(secret, body))
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.True(t, trigger.called)
+	ev := trigger.lastEvent
+	assert.Equal(t, "acme/myapp", ev.Repo)
+	assert.Equal(t, "main", ev.Branch)
+	assert.Equal(t, "https://github.com/acme/myapp/compare/abc...def", ev.Compare)
+	assert.Equal(t, "alice", ev.Pusher)
+	assert.Equal(t, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ev.HeadCommit.ID)
+	assert.Equal(t, "feat: add a thing\n\nmore details", ev.HeadCommit.Message)
+	assert.Equal(t, "https://github.com/acme/myapp/commit/deadbeef", ev.HeadCommit.URL)
+	assert.Equal(t, "Alice Author", ev.HeadCommit.Author)
+	assert.Equal(t, "2026-04-10T12:34:56Z", ev.HeadCommit.Timestamp)
+}
+
+func TestWebhook_NilHeadCommit(t *testing.T) {
+	const secret = "test-secret"
+	trigger := &mockDeployTrigger{}
+	handler := webhook.NewHandler(secret, trigger)
+
+	payload := map[string]interface{}{
+		"ref": "refs/heads/main",
+		"repository": map[string]interface{}{
+			"full_name": "acme/myapp",
+		},
+		"head_commit": nil,
+	}
+	body, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/github", strings.NewReader(string(body)))
+	req.Header.Set("X-GitHub-Event", "push")
+	req.Header.Set("X-Hub-Signature-256", signPayload(secret, body))
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.True(t, trigger.called)
+	ev := trigger.lastEvent
+	assert.Equal(t, "acme/myapp", ev.Repo)
+	assert.Equal(t, "main", ev.Branch)
+	assert.Equal(t, webhook.HeadCommit{}, ev.HeadCommit)
 }
 
 func TestWebhook_ExtractsRepoBranch(t *testing.T) {

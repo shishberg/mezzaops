@@ -1107,6 +1107,41 @@ func TestManager_SelfDeploy_Failure(t *testing.T) {
 	}
 }
 
+func TestManager_NotifyWebhook(t *testing.T) {
+	cfg := testConfig(t)
+	rec := &recordingNotifier{}
+
+	m, err := NewManager(cfg, nil, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	info := WebhookInfo{
+		Repo:      "acme/myapp",
+		Branch:    "main",
+		Compare:   "https://example/compare",
+		Pusher:    "alice",
+		CommitID:  "deadbeef",
+		CommitMsg: "fix things",
+		CommitURL: "https://example/commit",
+		Author:    "Alice",
+		Timestamp: "2026-04-10T00:00:00Z",
+	}
+	m.NotifyWebhook("svc", info)
+
+	got := rec.getWebhookReceived()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 webhook call, got %d", len(got))
+	}
+	if got[0].name != "svc" {
+		t.Fatalf("name: got %q", got[0].name)
+	}
+	if got[0].info != info {
+		t.Fatalf("info: got %+v", got[0].info)
+	}
+}
+
 func TestManager_ServiceLoopWithContext(t *testing.T) {
 	cfg := testConfig(t)
 	dir := t.TempDir()

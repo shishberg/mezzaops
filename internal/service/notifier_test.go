@@ -12,6 +12,12 @@ type recordingNotifier struct {
 	deployStarted   []string
 	deploySucceeded []notifierCall
 	deployFailed    []notifierCall
+	webhookReceived []webhookCall
+}
+
+type webhookCall struct {
+	name string
+	info WebhookInfo
 }
 
 type notifierCall struct {
@@ -40,6 +46,12 @@ func (r *recordingNotifier) DeployFailed(name, step, output string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.deployFailed = append(r.deployFailed, notifierCall{name: name, a: step, b: output})
+}
+
+func (r *recordingNotifier) WebhookReceived(name string, info WebhookInfo) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.webhookReceived = append(r.webhookReceived, webhookCall{name: name, info: info})
 }
 
 // Thread-safe accessors for reading from test goroutines.
@@ -73,6 +85,14 @@ func (r *recordingNotifier) getDeployFailed() []notifierCall {
 	defer r.mu.Unlock()
 	cp := make([]notifierCall, len(r.deployFailed))
 	copy(cp, r.deployFailed)
+	return cp
+}
+
+func (r *recordingNotifier) getWebhookReceived() []webhookCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cp := make([]webhookCall, len(r.webhookReceived))
+	copy(cp, r.webhookReceived)
 	return cp
 }
 
@@ -143,6 +163,35 @@ func TestMultiNotifierEmpty(t *testing.T) {
 	multi.DeployStarted("svc")
 	multi.DeploySucceeded("svc", "out")
 	multi.DeployFailed("svc", "step", "err")
+	multi.WebhookReceived("svc", WebhookInfo{})
+}
+
+func TestMultiNotifierWebhookReceived(t *testing.T) {
+	r1 := &recordingNotifier{}
+	r2 := &recordingNotifier{}
+	multi := MultiNotifier{r1, r2}
+
+	info := WebhookInfo{
+		Repo:      "acme/myapp",
+		Branch:    "main",
+		Compare:   "https://example/compare",
+		Pusher:    "alice",
+		CommitID:  "deadbeef",
+		CommitMsg: "fix things",
+		CommitURL: "https://example/commit",
+		Author:    "Alice",
+		Timestamp: "2026-04-10T00:00:00Z",
+	}
+	multi.WebhookReceived("svc", info)
+
+	got1 := r1.getWebhookReceived()
+	if len(got1) != 1 || got1[0].name != "svc" || got1[0].info != info {
+		t.Fatalf("r1 got %+v", got1)
+	}
+	got2 := r2.getWebhookReceived()
+	if len(got2) != 1 || got2[0].name != "svc" || got2[0].info != info {
+		t.Fatalf("r2 got %+v", got2)
+	}
 }
 
 func TestNopNotifier(t *testing.T) {
@@ -152,4 +201,5 @@ func TestNopNotifier(t *testing.T) {
 	n.DeployStarted("svc")
 	n.DeploySucceeded("svc", "out")
 	n.DeployFailed("svc", "step", "err")
+	n.WebhookReceived("svc", WebhookInfo{})
 }

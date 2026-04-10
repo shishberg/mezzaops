@@ -217,19 +217,32 @@ func (a *App) Shutdown() {
 }
 
 // HandlePush implements webhook.DeployTrigger.
-func (a *App) HandlePush(repo, branch string) {
-	svcName, ok := a.manager.FindServiceByRepo(repo, branch)
+func (a *App) HandlePush(event webhook.PushEvent) {
+	svcName, ok := a.manager.FindServiceByRepo(event.Repo, event.Branch)
 	if !ok {
-		log.Printf("app: no service found for repo=%s branch=%s", repo, branch)
+		log.Printf("app: no service found for repo=%s branch=%s", event.Repo, event.Branch)
 		return
 	}
 
+	// Notify frontends that a webhook matched a service.
+	a.manager.NotifyWebhook(svcName, service.WebhookInfo{
+		Repo:      event.Repo,
+		Branch:    event.Branch,
+		Compare:   event.Compare,
+		Pusher:    event.Pusher,
+		CommitID:  event.HeadCommit.ID,
+		CommitMsg: event.HeadCommit.Message,
+		CommitURL: event.HeadCommit.URL,
+		Author:    event.HeadCommit.Author,
+		Timestamp: event.HeadCommit.Timestamp,
+	})
+
 	svcCfg, _ := a.manager.GetServiceConfig(svcName)
 	if svcCfg.RequireConfirmation {
-		a.confirmations.AddPending(svcName, branch)
+		a.confirmations.AddPending(svcName, event.Branch)
 		if a.mmBot != nil {
 			msg := fmt.Sprintf("Deploy queued for **%s** (repo: %s, branch: %s). "+
-				"Reply `@mezzaops confirm %s` to proceed.", svcName, repo, branch, svcName)
+				"Reply `@mezzaops confirm %s` to proceed.", svcName, event.Repo, event.Branch, svcName)
 			a.mmBot.PostMessage(context.Background(), msg)
 		}
 		return
