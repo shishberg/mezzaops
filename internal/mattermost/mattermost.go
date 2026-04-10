@@ -20,22 +20,15 @@ type Command struct {
 	Service string
 }
 
-// ParseCommand extracts a Command from a message that starts with @mezzaops.
-// Returns nil if the message is not a valid command.
+// ParseCommand extracts a Command from a message directed at the bot.
+// The first word (the @mention) is skipped. Returns nil if there is no command.
 func ParseCommand(message string) *Command {
 	fields := strings.Fields(message)
-	if len(fields) == 0 {
-		return nil
-	}
-
-	if !strings.EqualFold(fields[0], "@mezzaops") {
-		return nil
-	}
-
 	if len(fields) < 2 {
 		return nil
 	}
 
+	// Skip the @mention
 	cmd := &Command{
 		Action: fields[1],
 	}

@@ -36,7 +36,7 @@ func TestParseCommand(t *testing.T) {
 		{"start-all command", "@mezzaops start-all", &Command{Action: "start-all"}},
 		{"stop-all command", "@mezzaops stop-all", &Command{Action: "stop-all"}},
 		{"with extra whitespace", "  @mezzaops   deploy   myapp  ", &Command{Action: "deploy", Service: "myapp"}},
-		{"not a command", "hello world", nil},
+		{"single word", "hello", nil},
 		{"empty after mention", "@mezzaops", nil},
 		{"unknown command", "@mezzaops foobar", &Command{Action: "foobar"}},
 		{"case insensitive mention", "@MezzaOps deploy myapp", &Command{Action: "deploy", Service: "myapp"}},
