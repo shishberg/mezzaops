@@ -160,6 +160,64 @@ func TestDashboard_ServiceDetail(t *testing.T) {
 	assert.Contains(t, body, "badge-running")
 	assert.Contains(t, body, "server started on :8080")
 	assert.Contains(t, body, "All services")
+	assert.Contains(t, body, "branch")
+	assert.Contains(t, body, "main")
+	assert.Contains(t, body, "repo")
+	assert.Contains(t, body, "github.com/org/myapp")
+	assert.Contains(t, body, "dir")
+	assert.Contains(t, body, "/opt/myapp")
+}
+
+func TestConfigFields(t *testing.T) {
+	cfg := config.ServiceConfig{
+		Name:       "myapp",
+		Dir:        "/opt/myapp",
+		Branch:     "main",
+		Repo:       "github.com/org/myapp",
+		Entrypoint: []string{"go", "run", "."},
+		SelfDeploy: true,
+	}
+
+	fields := dashboard.ConfigFields(cfg)
+
+	// Build a map for easy lookup.
+	m := make(map[string]string)
+	for _, f := range fields {
+		m[f.Key] = f.Value
+	}
+
+	// Present fields.
+	assert.Equal(t, "main", m["branch"])
+	assert.Equal(t, "github.com/org/myapp", m["repo"])
+	assert.Equal(t, "/opt/myapp", m["dir"])
+	assert.Equal(t, "go, run, .", m["entrypoint"])
+	assert.Equal(t, "true", m["self_deploy"])
+
+	// Zero-value fields must not be included.
+	for _, f := range fields {
+		assert.NotEqual(t, "service_name", f.Key, "zero-value service_name should be skipped")
+		assert.NotEqual(t, "deploy", f.Key, "zero-value deploy should be skipped")
+		assert.NotEqual(t, "user_service", f.Key, "zero-value user_service should be skipped")
+		assert.NotEqual(t, "sudo", f.Key, "zero-value sudo should be skipped")
+		assert.NotEqual(t, "require_confirmation", f.Key, "zero-value require_confirmation should be skipped")
+	}
+
+	// Verify declaration order: branch, repo, dir come first.
+	keys := make([]string, len(fields))
+	for i, f := range fields {
+		keys[i] = f.Key
+	}
+	assert.Equal(t, "branch", keys[0])
+	assert.Equal(t, "repo", keys[1])
+	assert.Equal(t, "dir", keys[2])
+	assert.Equal(t, "entrypoint", keys[3])
+	assert.Equal(t, "self_deploy", keys[4])
+}
+
+func TestConfigFields_Empty(t *testing.T) {
+	cfg := config.ServiceConfig{}
+	fields := dashboard.ConfigFields(cfg)
+	assert.Empty(t, fields)
 }
 
 func TestDashboard_ServiceDetail_NotFound(t *testing.T) {

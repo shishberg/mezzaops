@@ -113,11 +113,15 @@
 
   <div class="section">
     <h2>Service Info</h2>
+    {{if .ConfigFields}}
     <dl class="info-grid">
-      {{if .Config.Dir}}<dt>Directory</dt><dd>{{.Config.Dir}}</dd>{{end}}
-      {{if .Config.Repo}}<dt>Repository</dt><dd>{{.Config.Repo}}</dd>{{end}}
-      {{if .Config.Branch}}<dt>Branch</dt><dd>{{.Config.Branch}}</dd>{{end}}
+      {{range .ConfigFields}}
+      <dt>{{.Key}}</dt><dd>{{.Value}}</dd>
+      {{end}}
     </dl>
+    {{else}}
+    <p class="ts">No configuration.</p>
+    {{end}}
   </div>
 
   <div class="section">
