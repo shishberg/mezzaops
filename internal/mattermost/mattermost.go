@@ -122,6 +122,7 @@ type Bot struct {
 	channelID string
 	rest      restClient
 	connectWS wsConnectFunc
+	readyCh   chan struct{} // closed when the bot is connected and ready
 }
 
 // New creates a new Bot from the given Config and ServiceManager.
@@ -133,6 +134,7 @@ func New(cfg Config, manager ServiceManager) *Bot {
 		cfg:     cfg,
 		manager: manager,
 		rest:    client,
+		readyCh: make(chan struct{}),
 		connectWS: func(url, token string) (wsClient, error) {
 			wsURL := strings.Replace(url, "https://", "wss://", 1)
 			wsURL = strings.Replace(wsURL, "http://", "ws://", 1)
@@ -161,7 +163,14 @@ func (b *Bot) Run(ctx context.Context) error {
 		return fmt.Errorf("resolving channel: %w", err)
 	}
 
+	close(b.readyCh)
 	return b.listenWebSocket(ctx)
+}
+
+// Ready returns a channel that is closed when the bot has connected
+// and is ready to send messages.
+func (b *Bot) Ready() <-chan struct{} {
+	return b.readyCh
 }
 
 // PostMessage sends a message to the configured Mattermost channel.

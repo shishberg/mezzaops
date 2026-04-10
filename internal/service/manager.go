@@ -68,6 +68,9 @@ type Manager struct {
 	// For reload
 	servicesDir string
 
+	// readyCh is closed when frontends are connected and it's safe to send notifications.
+	readyCh chan struct{}
+
 	// shutdownCh is closed when a self-deploy succeeds, signalling the app to exit.
 	shutdownCh chan struct{}
 }
@@ -90,6 +93,7 @@ func NewManager(cfg *config.Config, services []config.ServiceConfig, notifier No
 		logDir:      cfg.LogDir,
 		stateDir:    cfg.StateDir,
 		servicesDir: cfg.ServicesDir,
+		readyCh:     make(chan struct{}),
 		shutdownCh:  make(chan struct{}),
 	}
 
@@ -174,8 +178,14 @@ func (m *Manager) startServiceLoop(ms *managedService) {
 func (m *Manager) serviceLoop(ms *managedService) {
 	defer m.wg.Done()
 
-	// Restart on startup if adopt: false (non-process backends)
+	// Restart on startup if adopt: false (non-process backends).
+	// Wait for frontends to be ready so notifications can be delivered.
 	if ms.restartOnStartup {
+		select {
+		case <-m.readyCh:
+		case <-m.ctx.Done():
+			return
+		}
 		log.Printf("**%s**: restarting (adopt: false)", ms.config.Name)
 		result := m.handleOp(ms, "restart")
 		log.Printf("**%s**: %s", ms.config.Name, result)
@@ -731,6 +741,12 @@ func (m *Manager) Stop() {
 // start to avoid races (the notifier is used from service loop goroutines).
 func (m *Manager) SetNotifier(n Notifier) {
 	m.notifier = n
+}
+
+// SignalReady indicates that frontends are connected and notifications can be sent.
+// Service loops waiting on restartOnStartup will proceed after this is called.
+func (m *Manager) SignalReady() {
+	close(m.readyCh)
 }
 
 // cleanOrphans removes state files for services not in the current config and

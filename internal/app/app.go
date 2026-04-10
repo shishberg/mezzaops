@@ -176,6 +176,18 @@ func (a *App) Run(ctx context.Context) error {
 		}()
 	}
 
+	// Wait for frontends to be ready before signalling the manager.
+	go func() {
+		if a.mmBot != nil {
+			select {
+			case <-a.mmBot.Ready():
+			case <-ctx.Done():
+				return
+			}
+		}
+		a.manager.SignalReady()
+	}()
+
 	<-ctx.Done()
 	return nil
 }
