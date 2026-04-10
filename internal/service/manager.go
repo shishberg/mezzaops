@@ -112,12 +112,18 @@ func (m *Manager) newManagedService(svc config.ServiceConfig) *managedService {
 		deployCh: make(chan struct{}, 1),
 	}
 
-	// Try to restore backend state (including process adoption for ProcessBackend)
+	// Always try to load persisted state (deploy info, backend state)
+	s, raw, err := LoadState(m.stateDir, svc.Name)
+	if err == nil {
+		ms.state.LastDeploy = s.LastDeploy
+		ms.state.LastResult = s.LastResult
+		ms.state.LastOutput = s.LastOutput
+		ms.state.FailedStep = s.FailedStep
+		backend.RestoreBackendState(raw)
+	}
+
+	// Try process adoption if enabled
 	if m.adopt {
-		_, raw, err := LoadState(m.stateDir, svc.Name)
-		if err == nil {
-			backend.RestoreBackendState(raw)
-		}
 		if pb, ok := backend.(*ProcessBackend); ok {
 			msg := pb.TryAdopt()
 			log.Printf("**%s**: %s", svc.Name, msg)
@@ -133,7 +139,7 @@ func (m *Manager) backendForConfig(svc config.ServiceConfig) Backend {
 		return NewProcessBackend(
 			svc.Name, svc.Dir,
 			svc.Entrypoint, svc.Process.Cmd,
-			m.logDir, m.stateDir, m.adopt,
+			m.logDir, m.adopt,
 		)
 	}
 	if svc.ServiceName != "" {
@@ -146,7 +152,7 @@ func (m *Manager) backendForConfig(svc config.ServiceConfig) Backend {
 	return NewProcessBackend(
 		svc.Name, svc.Dir,
 		nil, "echo 'no backend configured'",
-		m.logDir, m.stateDir, false,
+		m.logDir, false,
 	)
 }
 
@@ -173,6 +179,11 @@ func (m *Manager) serviceLoop(ms *managedService) {
 			result := m.handleOp(ms, op.op)
 			op.result <- result
 
+			// Persist state after start/stop/restart
+			if op.op == "start" || op.op == "stop" || op.op == "restart" {
+				m.saveServiceState(ms)
+			}
+
 			// Refresh exit channel after start/restart (new process, new done chan)
 			if pb, ok := ms.backend.(*ProcessBackend); ok {
 				exitCh = pb.WaitForExit()
@@ -189,6 +200,7 @@ func (m *Manager) serviceLoop(ms *managedService) {
 		case <-exitCh:
 			// Process exited unexpectedly
 			m.notifyEvent(ms.config.Name, "exited")
+			m.saveServiceState(ms)
 			// Reset the exit channel: get a fresh one (will be closed immediately
 			// since process is dead, so set to nil to avoid busy-looping)
 			exitCh = nil
@@ -297,6 +309,7 @@ func (m *Manager) executeDeploy(ms *managedService) {
 		ms.state.FailedStep = failedStep
 		ms.stateMu.Unlock()
 
+		m.saveServiceState(ms)
 		m.notifier.DeployFailed(name, failedStep, output)
 		return
 	}
@@ -310,6 +323,7 @@ func (m *Manager) executeDeploy(ms *managedService) {
 		ms.state.FailedStep = "restart"
 		ms.stateMu.Unlock()
 
+		m.saveServiceState(ms)
 		m.notifier.DeployFailed(name, "restart", result.Output)
 		return
 	}
@@ -321,8 +335,35 @@ func (m *Manager) executeDeploy(ms *managedService) {
 	ms.state.FailedStep = ""
 	ms.stateMu.Unlock()
 
+	m.saveServiceState(ms)
 	m.notifier.DeploySucceeded(name, result.Output)
 	m.notifyEvent(name, "restarted")
+}
+
+// saveServiceState persists the current state of a managed service to disk.
+func (m *Manager) saveServiceState(ms *managedService) {
+	if m.stateDir == "" {
+		return
+	}
+	ms.stateMu.Lock()
+	state := State{
+		Status:     ms.state.Status,
+		LastDeploy: ms.state.LastDeploy,
+		LastResult: ms.state.LastResult,
+		LastOutput: ms.state.LastOutput,
+		FailedStep: ms.state.FailedStep,
+		Backend:    ms.backend.SaveBackendState(),
+	}
+	ms.stateMu.Unlock()
+
+	// If status is not a special deploy state, query the backend for live status
+	if state.Status != "deploying" && state.Status != "failed" {
+		if status, err := ms.backend.Status(m.ctx); err == nil {
+			state.Status = status
+		}
+	}
+
+	_ = SaveState(m.stateDir, ms.config.Name, state)
 }
 
 // notifyEvent calls the notifier and onChange callback.

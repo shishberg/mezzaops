@@ -797,6 +797,146 @@ func TestManager_ConcurrentOps(t *testing.T) {
 	}
 }
 
+func TestManager_StateSavedAfterStart(t *testing.T) {
+	cfg := testConfig(t)
+	dir := t.TempDir()
+	svc := sleepService("testsvc", dir)
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	m.Do("testsvc", "start")
+
+	// Give the service loop time to persist state after the op completes
+	time.Sleep(200 * time.Millisecond)
+
+	// State file should exist with backend data
+	s, _, err := LoadState(cfg.StateDir, "testsvc")
+	if err != nil {
+		t.Fatalf("state file should exist after start: %v", err)
+	}
+	if s.Status != "running" {
+		t.Fatalf("state status: got %q, want running", s.Status)
+	}
+	if s.Backend == nil {
+		t.Fatal("state backend should be non-nil after start")
+	}
+}
+
+func TestManager_DeployStateSurvivesRestart(t *testing.T) {
+	stateDir := t.TempDir()
+	logDir := t.TempDir()
+	dir := t.TempDir()
+	rec := &recordingNotifier{}
+
+	cfg := &config.Config{
+		LogDir:   logDir,
+		StateDir: stateDir,
+		Process:  config.ProcessConfig{Adopt: false},
+	}
+	svc := config.ServiceConfig{
+		Name:       "testsvc",
+		Dir:        dir,
+		Entrypoint: []string{"sleep", "3600"},
+		Deploy:     []string{"echo deploying"},
+	}
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start and deploy
+	m.Do("testsvc", "start")
+	if err := m.RequestDeploy("testsvc"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for deploy to complete
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for deploy")
+		default:
+		}
+		states := m.GetAllStates()
+		if states["testsvc"].Status != "deploying" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Verify deploy succeeded
+	states := m.GetAllStates()
+	if states["testsvc"].LastResult != "success" {
+		t.Fatalf("deploy result: got %q, want success", states["testsvc"].LastResult)
+	}
+
+	m.Stop()
+
+	// Create a NEW manager with the same stateDir (simulating restart)
+	cfg2 := &config.Config{
+		LogDir:   logDir,
+		StateDir: stateDir,
+		Process:  config.ProcessConfig{Adopt: false},
+	}
+	m2, err := NewManager(cfg2, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m2.Stop()
+
+	// Verify the new manager loaded the persisted deploy info
+	states2 := m2.GetAllStates()
+	if states2["testsvc"].LastResult != "success" {
+		t.Fatalf("after restart, LastResult: got %q, want success", states2["testsvc"].LastResult)
+	}
+	if states2["testsvc"].LastDeploy.IsZero() {
+		t.Fatal("after restart, LastDeploy should be non-zero")
+	}
+}
+
+func TestManager_OldFormatMigration(t *testing.T) {
+	stateDir := t.TempDir()
+	logDir := t.TempDir()
+	dir := t.TempDir()
+
+	// Write an old-format state file (pid/pgid at top level, no backend sub-object)
+	oldState := `{"status":"running","pid":99999999,"pgid":99999999,"log_path":"/tmp/old.log","boot_time":1711000000,"create_time":1711000123000}`
+	if err := os.WriteFile(filepath.Join(stateDir, "testsvc.json"), []byte(oldState), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		LogDir:   logDir,
+		StateDir: stateDir,
+		Process:  config.ProcessConfig{Adopt: true},
+	}
+	svc := config.ServiceConfig{
+		Name:       "testsvc",
+		Dir:        dir,
+		Entrypoint: []string{"sleep", "3600"},
+	}
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	// The manager should have loaded the old-format state and the ProcessBackend
+	// should have migrated it via RestoreBackendState. The PID 99999999 is dead,
+	// so adoption should have reported "stale pid". The service should be functional.
+	result := m.Do("testsvc", "status")
+	if !strings.Contains(result, "stopped") {
+		t.Fatalf("expected stopped (stale pid), got %q", result)
+	}
+}
+
 func TestManager_ServiceLoopWithContext(t *testing.T) {
 	cfg := testConfig(t)
 	dir := t.TempDir()

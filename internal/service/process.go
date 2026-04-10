@@ -32,7 +32,6 @@ type ProcessBackend struct {
 	entrypoint []string // explicit argv
 	cmd        string   // sh -c wrapper -- used if entrypoint is empty
 	logDir     string
-	stateDir   string
 	adopt      bool // whether to attempt process adoption
 
 	mu      sync.Mutex
@@ -47,14 +46,13 @@ type ProcessBackend struct {
 }
 
 // NewProcessBackend creates a new ProcessBackend.
-func NewProcessBackend(name, dir string, entrypoint []string, cmd string, logDir, stateDir string, adopt bool) *ProcessBackend {
+func NewProcessBackend(name, dir string, entrypoint []string, cmd string, logDir string, adopt bool) *ProcessBackend {
 	return &ProcessBackend{
 		name:       name,
 		dir:        dir,
 		entrypoint: entrypoint,
 		cmd:        cmd,
 		logDir:     logDir,
-		stateDir:   stateDir,
 		adopt:      adopt,
 	}
 }
@@ -110,9 +108,6 @@ func (p *ProcessBackend) Start(ctx context.Context) error {
 	_, _ = fmt.Fprintf(logFile, "=== Started at %s (pid %d) ===\n", time.Now().Format(time.RFC3339), pid)
 	_ = logFile.Close()
 
-	// Save running state with process identity in backend sub-object
-	_ = SaveState(p.stateDir, p.name, State{Status: "running", Backend: p.saveBackendStateLocked()})
-
 	// Clean up old log files (keep last 5)
 	CleanupOldLogs(p.logDir, p.name, 5)
 
@@ -136,9 +131,6 @@ func (p *ProcessBackend) Stop(ctx context.Context) error {
 		p.mu.Unlock()
 		return nil
 	}
-
-	// Save stopped state so adoption knows intent
-	_ = SaveState(p.stateDir, p.name, State{Status: "stopped"})
 
 	pgid := p.pgid
 	done := p.done
@@ -215,11 +207,6 @@ func (p *ProcessBackend) SaveBackendState() json.RawMessage {
 	p.mu.Unlock()
 
 	return saveBackendStateFromFields(pid, pgid, logPath)
-}
-
-// saveBackendStateLocked is like SaveBackendState but assumes mu is already held.
-func (p *ProcessBackend) saveBackendStateLocked() json.RawMessage {
-	return saveBackendStateFromFields(p.pid, p.pgid, p.logPath)
 }
 
 func saveBackendStateFromFields(pid, pgid int, logPath string) json.RawMessage {
