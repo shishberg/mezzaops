@@ -4,19 +4,17 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-
-	"github.com/shirou/gopsutil/v3/host"
-	"github.com/shirou/gopsutil/v3/process"
+	"time"
 )
 
-// State represents the persisted state of a managed process.
+// State represents the persisted state of a managed service.
 type State struct {
-	Status     string `json:"status"`
-	PID        int    `json:"pid,omitempty"`
-	PGID       int    `json:"pgid,omitempty"`
-	LogPath    string `json:"log_path,omitempty"`
-	BootTime   int64  `json:"boot_time,omitempty"`
-	CreateTime int64  `json:"create_time,omitempty"`
+	Status     string          `json:"status"`
+	LastDeploy time.Time       `json:"last_deploy,omitempty"`
+	LastResult string          `json:"last_result,omitempty"`
+	LastOutput string          `json:"last_output,omitempty"`
+	FailedStep string          `json:"failed_step,omitempty"`
+	Backend    json.RawMessage `json:"backend,omitempty"`
 }
 
 func statePath(dir, name string) string {
@@ -38,39 +36,20 @@ func SaveState(dir, name string, s State) error {
 }
 
 // LoadState reads the state from a JSON file.
-func LoadState(dir, name string) (State, error) {
+// Returns the parsed State, the raw JSON bytes (for backend migration), and any error.
+func LoadState(dir, name string) (State, json.RawMessage, error) {
 	data, err := os.ReadFile(statePath(dir, name))
 	if err != nil {
-		return State{}, err
+		return State{}, nil, err
 	}
 	var s State
 	if err := json.Unmarshal(data, &s); err != nil {
-		return State{}, err
+		return State{}, nil, err
 	}
-	return s, nil
+	return s, json.RawMessage(data), nil
 }
 
 // RemoveState deletes the state file.
 func RemoveState(dir, name string) {
 	_ = os.Remove(statePath(dir, name))
-}
-
-// RunningState creates a State for a running process, capturing boot time
-// and process create time for identity verification on re-adoption.
-func RunningState(pid int, logPath string) State {
-	s := State{
-		Status:  "running",
-		PID:     pid,
-		PGID:    pid,
-		LogPath: logPath,
-	}
-	if bootTime, err := host.BootTime(); err == nil {
-		s.BootTime = int64(bootTime)
-	}
-	if proc, err := process.NewProcess(int32(pid)); err == nil {
-		if ct, err := proc.CreateTime(); err == nil {
-			s.CreateTime = ct
-		}
-	}
-	return s
 }

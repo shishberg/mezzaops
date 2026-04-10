@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -88,3 +89,9 @@ func (s *SystemctlBackend) Logs(ctx context.Context, tail int) (string, error) {
 	}
 	return string(out), nil
 }
+
+// SaveBackendState returns nil (systemctl manages its own state).
+func (s *SystemctlBackend) SaveBackendState() json.RawMessage { return nil }
+
+// RestoreBackendState is a no-op for systemctl.
+func (s *SystemctlBackend) RestoreBackendState(json.RawMessage) {}

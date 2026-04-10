@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,7 +10,19 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/shirou/gopsutil/v3/host"
+	"github.com/shirou/gopsutil/v3/process"
 )
+
+// processBackendState holds the backend-specific state for a ProcessBackend.
+type processBackendState struct {
+	PID        int    `json:"pid,omitempty"`
+	PGID       int    `json:"pgid,omitempty"`
+	LogPath    string `json:"log_path,omitempty"`
+	BootTime   int64  `json:"boot_time,omitempty"`
+	CreateTime int64  `json:"create_time,omitempty"`
+}
 
 // ProcessBackend manages a service as a child process with process adoption
 // and graceful shutdown (SIGTERM then SIGKILL after timeout).
@@ -28,6 +41,9 @@ type ProcessBackend struct {
 	logPath string
 	process *exec.Cmd
 	done    chan struct{} // closed when process exits
+
+	restoredState  *processBackendState // set by RestoreBackendState
+	restoredStatus string               // status from the state file
 }
 
 // NewProcessBackend creates a new ProcessBackend.
@@ -94,8 +110,8 @@ func (p *ProcessBackend) Start(ctx context.Context) error {
 	_, _ = fmt.Fprintf(logFile, "=== Started at %s (pid %d) ===\n", time.Now().Format(time.RFC3339), pid)
 	_ = logFile.Close()
 
-	// Save running state with process identity
-	_ = SaveState(p.stateDir, p.name, RunningState(pid, p.logPath))
+	// Save running state with process identity in backend sub-object
+	_ = SaveState(p.stateDir, p.name, State{Status: "running", Backend: p.saveBackendStateLocked()})
 
 	// Clean up old log files (keep last 5)
 	CleanupOldLogs(p.logDir, p.name, 5)
@@ -189,47 +205,126 @@ func (p *ProcessBackend) Logs(ctx context.Context, tail int) (string, error) {
 	return TailLogFile(logPath, tail), nil
 }
 
+// SaveBackendState returns the backend-specific state as JSON.
+// Returns nil if the process is not running.
+func (p *ProcessBackend) SaveBackendState() json.RawMessage {
+	p.mu.Lock()
+	pid := p.pid
+	pgid := p.pgid
+	logPath := p.logPath
+	p.mu.Unlock()
+
+	return saveBackendStateFromFields(pid, pgid, logPath)
+}
+
+// saveBackendStateLocked is like SaveBackendState but assumes mu is already held.
+func (p *ProcessBackend) saveBackendStateLocked() json.RawMessage {
+	return saveBackendStateFromFields(p.pid, p.pgid, p.logPath)
+}
+
+func saveBackendStateFromFields(pid, pgid int, logPath string) json.RawMessage {
+	if pid == 0 {
+		return nil
+	}
+
+	ps := processBackendState{
+		PID:     pid,
+		PGID:    pgid,
+		LogPath: logPath,
+	}
+	if bootTime, err := host.BootTime(); err == nil {
+		ps.BootTime = int64(bootTime)
+	}
+	if proc, err := process.NewProcess(int32(pid)); err == nil {
+		if ct, err := proc.CreateTime(); err == nil {
+			ps.CreateTime = ct
+		}
+	}
+
+	data, err := json.Marshal(ps)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+// RestoreBackendState restores the backend-specific state from the full state
+// file JSON. It handles both the new format (with a "backend" sub-object) and
+// the old format (with pid/pgid/etc at the top level) for migration.
+func (p *ProcessBackend) RestoreBackendState(fullStateJSON json.RawMessage) {
+	if fullStateJSON == nil {
+		return
+	}
+
+	// Try new format: extract the "backend" sub-object
+	var wrapper struct {
+		Status  string          `json:"status"`
+		Backend json.RawMessage `json:"backend"`
+	}
+	if err := json.Unmarshal(fullStateJSON, &wrapper); err != nil {
+		return
+	}
+
+	p.restoredStatus = wrapper.Status
+
+	var ps processBackendState
+	if len(wrapper.Backend) > 0 {
+		// New format: unmarshal from backend sub-object
+		if err := json.Unmarshal(wrapper.Backend, &ps); err != nil {
+			return
+		}
+	} else {
+		// Old format: pid/pgid/etc at top level (migration path)
+		if err := json.Unmarshal(fullStateJSON, &ps); err != nil {
+			return
+		}
+	}
+
+	p.restoredState = &ps
+}
+
 // TryAdopt attempts to re-adopt a process from a previous session using
-// the saved state file. Returns a string describing what happened.
+// the restored state. Returns a string describing what happened.
 func (p *ProcessBackend) TryAdopt() string {
 	if !p.adopt {
 		return "adoption disabled"
 	}
 
-	s, err := LoadState(p.stateDir, p.name)
-	if err != nil {
-		return "no state file, starting fresh"
+	if p.restoredState == nil {
+		return "no state to adopt"
 	}
 
+	ps := *p.restoredState
+
 	// Desired state is stopped -- respect it
-	if s.Status == "stopped" {
+	if p.restoredStatus == "stopped" {
 		return "stopped (preserved from previous session)"
 	}
 
 	// PID is dead -- process crashed while we were down
-	if !IsAlive(s.PID) {
-		return fmt.Sprintf("stale pid %d (process dead)", s.PID)
+	if !IsAlive(ps.PID) {
+		return fmt.Sprintf("stale pid %d (process dead)", ps.PID)
 	}
 
 	// PID is alive but belongs to a different process (reboot or PID reuse)
-	if !VerifyProcess(s) {
-		return fmt.Sprintf("pid %d reused by different process", s.PID)
+	if !VerifyProcess(ps) {
+		return fmt.Sprintf("pid %d reused by different process", ps.PID)
 	}
 
 	// PID is alive and verified -- adopt it
 	p.mu.Lock()
-	p.pid = s.PID
-	p.pgid = s.PGID
-	p.logPath = s.LogPath
+	p.pid = ps.PID
+	p.pgid = ps.PGID
+	p.logPath = ps.LogPath
 
 	done := make(chan struct{})
 	p.done = done
 	p.mu.Unlock()
 
 	// Poll since we can't cmd.Wait() on a process we didn't spawn
-	go p.pollAlive(s.PID, done)
+	go p.pollAlive(ps.PID, done)
 
-	return fmt.Sprintf("adopted (pid %d)", s.PID)
+	return fmt.Sprintf("adopted (pid %d)", ps.PID)
 }
 
 // IsRunning returns whether the process is currently running (thread-safe).

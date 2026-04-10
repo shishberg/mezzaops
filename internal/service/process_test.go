@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -186,14 +187,15 @@ func TestProcessBackend_TryAdoptDisabled(t *testing.T) {
 	}
 }
 
-func TestProcessBackend_TryAdoptNoStateFile(t *testing.T) {
+func TestProcessBackend_TryAdoptNoRestoredState(t *testing.T) {
 	logDir := t.TempDir()
 	stateDir := t.TempDir()
 	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir, stateDir, true)
 
+	// No RestoreBackendState called, so restoredState is nil
 	msg := b.TryAdopt()
-	if !strings.Contains(msg, "no state file") {
-		t.Fatalf("TryAdopt with no state: got %q", msg)
+	if !strings.Contains(msg, "no state to adopt") {
+		t.Fatalf("TryAdopt with no restored state: got %q", msg)
 	}
 }
 
@@ -213,6 +215,26 @@ func TestProcessBackend_StateFileCreatedOnStart(t *testing.T) {
 	if _, err := os.Stat(statePath); os.IsNotExist(err) {
 		t.Fatal("state file should exist after start")
 	}
+
+	// Verify state file has new format with backend sub-object
+	s, _, err := LoadState(stateDir, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Status != "running" {
+		t.Fatalf("state status: got %q, want running", s.Status)
+	}
+	if s.Backend == nil {
+		t.Fatal("state backend should be non-nil after start")
+	}
+
+	var bs processBackendState
+	if err := json.Unmarshal(s.Backend, &bs); err != nil {
+		t.Fatal(err)
+	}
+	if bs.PID == 0 {
+		t.Fatal("backend PID should be nonzero")
+	}
 }
 
 func TestProcessBackend_WaitForExit(t *testing.T) {
@@ -229,5 +251,123 @@ func TestProcessBackend_WaitForExit(t *testing.T) {
 		// Process exited
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for process exit")
+	}
+}
+
+func TestProcessBackend_SaveBackendStateRoundTrip(t *testing.T) {
+	b := newTestBackend(t, []string{"sleep", "3600"}, "")
+	ctx := context.Background()
+
+	// Before start, SaveBackendState should return nil
+	raw := b.SaveBackendState()
+	if raw != nil {
+		t.Fatalf("SaveBackendState before start should return nil, got %s", string(raw))
+	}
+
+	if err := b.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Stop(context.Background()) })
+
+	// After start, SaveBackendState should return valid JSON with PID
+	raw = b.SaveBackendState()
+	if raw == nil {
+		t.Fatal("SaveBackendState after start should return non-nil")
+	}
+
+	var bs processBackendState
+	if err := json.Unmarshal(raw, &bs); err != nil {
+		t.Fatalf("SaveBackendState returned invalid JSON: %v", err)
+	}
+	if bs.PID == 0 {
+		t.Fatal("PID should be nonzero")
+	}
+	if bs.PGID == 0 {
+		t.Fatal("PGID should be nonzero")
+	}
+}
+
+func TestProcessBackend_RestoreBackendStateNewFormat(t *testing.T) {
+	logDir := t.TempDir()
+	stateDir := t.TempDir()
+	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir, stateDir, true)
+
+	// Simulate a new-format state file with backend sub-object
+	backendJSON := json.RawMessage(`{"pid":12345,"pgid":12345,"log_path":"/tmp/test.log","boot_time":1711000000,"create_time":1711000123000}`)
+	fullState := State{
+		Status:  "running",
+		Backend: backendJSON,
+	}
+	fullJSON, _ := json.Marshal(fullState)
+
+	b.RestoreBackendState(json.RawMessage(fullJSON))
+
+	// Verify restoredState was set
+	if b.restoredState == nil {
+		t.Fatal("restoredState should be non-nil after RestoreBackendState")
+	}
+	if b.restoredState.PID != 12345 {
+		t.Fatalf("restoredState.PID: got %d, want 12345", b.restoredState.PID)
+	}
+	if b.restoredState.PGID != 12345 {
+		t.Fatalf("restoredState.PGID: got %d, want 12345", b.restoredState.PGID)
+	}
+	if b.restoredState.LogPath != "/tmp/test.log" {
+		t.Fatalf("restoredState.LogPath: got %q", b.restoredState.LogPath)
+	}
+}
+
+func TestProcessBackend_RestoreBackendStateOldFormat(t *testing.T) {
+	logDir := t.TempDir()
+	stateDir := t.TempDir()
+	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir, stateDir, true)
+
+	// Simulate an old-format state file with pid/pgid at top level (no backend sub-object)
+	oldFormatJSON := json.RawMessage(`{"status":"running","pid":54321,"pgid":54321,"log_path":"/tmp/old.log","boot_time":1711000000,"create_time":1711000123000}`)
+
+	b.RestoreBackendState(oldFormatJSON)
+
+	// Verify restoredState was set via migration path
+	if b.restoredState == nil {
+		t.Fatal("restoredState should be non-nil after RestoreBackendState (old format)")
+	}
+	if b.restoredState.PID != 54321 {
+		t.Fatalf("restoredState.PID: got %d, want 54321", b.restoredState.PID)
+	}
+	if b.restoredState.LogPath != "/tmp/old.log" {
+		t.Fatalf("restoredState.LogPath: got %q", b.restoredState.LogPath)
+	}
+}
+
+func TestProcessBackend_TryAdoptStopped(t *testing.T) {
+	logDir := t.TempDir()
+	stateDir := t.TempDir()
+	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir, stateDir, true)
+
+	// Restore a "stopped" state -- TryAdopt should respect that
+	b.restoredState = &processBackendState{}
+	b.restoredStatus = "stopped"
+
+	msg := b.TryAdopt()
+	if !strings.Contains(msg, "stopped") {
+		t.Fatalf("TryAdopt with stopped state: got %q", msg)
+	}
+}
+
+func TestProcessBackend_TryAdoptStalePID(t *testing.T) {
+	logDir := t.TempDir()
+	stateDir := t.TempDir()
+	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir, stateDir, true)
+
+	// Restore state with a PID that doesn't exist
+	b.restoredState = &processBackendState{
+		PID:  99999999,
+		PGID: 99999999,
+	}
+	b.restoredStatus = "running"
+
+	msg := b.TryAdopt()
+	if !strings.Contains(msg, "stale pid") {
+		t.Fatalf("TryAdopt with dead PID: got %q", msg)
 	}
 }

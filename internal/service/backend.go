@@ -1,6 +1,9 @@
 package service
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // Backend manages the lifecycle of a service.
 type Backend interface {
@@ -9,4 +12,6 @@ type Backend interface {
 	Restart(ctx context.Context) error
 	Status(ctx context.Context) (string, error)
 	Logs(ctx context.Context, tail int) (string, error)
+	SaveBackendState() json.RawMessage
+	RestoreBackendState(fullStateJSON json.RawMessage)
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -69,3 +70,9 @@ func (b *LaunchctlBackend) Logs(ctx context.Context, tail int) (string, error) {
 	}
 	return strings.Join(lines, "\n"), nil
 }
+
+// SaveBackendState returns nil (launchctl manages its own state).
+func (b *LaunchctlBackend) SaveBackendState() json.RawMessage { return nil }
+
+// RestoreBackendState is a no-op for launchctl.
+func (b *LaunchctlBackend) RestoreBackendState(json.RawMessage) {}

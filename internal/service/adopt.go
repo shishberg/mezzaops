@@ -19,20 +19,20 @@ func IsAlive(pid int) bool {
 // If both identity fields are zero (e.g. gopsutil failed during start),
 // returns true as graceful degradation -- we accept the PID rather than
 // incorrectly restarting a process we can't identify.
-func VerifyProcess(s State) bool {
-	if s.BootTime != 0 {
+func VerifyProcess(ps processBackendState) bool {
+	if ps.BootTime != 0 {
 		bootTime, err := host.BootTime()
-		if err == nil && int64(bootTime) != s.BootTime {
+		if err == nil && int64(bootTime) != ps.BootTime {
 			return false
 		}
 	}
-	if s.CreateTime != 0 {
-		p, err := process.NewProcess(int32(s.PID))
+	if ps.CreateTime != 0 {
+		p, err := process.NewProcess(int32(ps.PID))
 		if err != nil {
 			return false
 		}
 		createTime, err := p.CreateTime()
-		if err == nil && createTime != s.CreateTime {
+		if err == nil && createTime != ps.CreateTime {
 			return false
 		}
 	}

@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -111,10 +112,16 @@ func (m *Manager) newManagedService(svc config.ServiceConfig) *managedService {
 		deployCh: make(chan struct{}, 1),
 	}
 
-	// Try to adopt existing processes for ProcessBackend
-	if pb, ok := backend.(*ProcessBackend); ok && m.adopt {
-		msg := pb.TryAdopt()
-		log.Printf("**%s**: %s", svc.Name, msg)
+	// Try to restore backend state (including process adoption for ProcessBackend)
+	if m.adopt {
+		_, raw, err := LoadState(m.stateDir, svc.Name)
+		if err == nil {
+			backend.RestoreBackendState(raw)
+		}
+		if pb, ok := backend.(*ProcessBackend); ok {
+			msg := pb.TryAdopt()
+			log.Printf("**%s**: %s", svc.Name, msg)
+		}
 	}
 
 	return ms
@@ -647,13 +654,23 @@ func (m *Manager) cleanOrphans() {
 			continue
 		}
 		// Orphan state file -- kill the process if it's still alive
-		s, err := LoadState(m.stateDir, name)
+		_, raw, err := LoadState(m.stateDir, name)
 		if err != nil {
 			_ = os.Remove(path)
 			continue
 		}
-		if s.PID != 0 && IsAlive(s.PID) && VerifyProcess(s) {
-			_ = syscall.Kill(-s.PGID, syscall.SIGKILL)
+		// Extract process info from backend sub-object or top-level (old format)
+		var ps processBackendState
+		var wrapper struct {
+			Backend json.RawMessage `json:"backend"`
+		}
+		if err := json.Unmarshal(raw, &wrapper); err == nil && len(wrapper.Backend) > 0 {
+			_ = json.Unmarshal(wrapper.Backend, &ps)
+		} else {
+			_ = json.Unmarshal(raw, &ps)
+		}
+		if ps.PID != 0 && IsAlive(ps.PID) && VerifyProcess(ps) {
+			_ = syscall.Kill(-ps.PGID, syscall.SIGKILL)
 		}
 		RemoveState(m.stateDir, name)
 	}
