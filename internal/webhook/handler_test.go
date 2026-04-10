@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -157,6 +158,85 @@ func TestWebhook_MissingSignature(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusForbidden, rr.Code)
+	assert.False(t, trigger.called)
+}
+
+func TestWebhook_FormURLEncoded(t *testing.T) {
+	const secret = "test-secret"
+	trigger := &mockDeployTrigger{}
+	handler := webhook.NewHandler(secret, trigger)
+
+	payload := map[string]interface{}{
+		"ref": "refs/heads/main",
+		"repository": map[string]interface{}{
+			"full_name": "acme/myapp",
+		},
+	}
+	jsonBody, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	formBody := "payload=" + url.QueryEscape(string(jsonBody))
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/github", strings.NewReader(formBody))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-GitHub-Event", "push")
+	req.Header.Set("X-Hub-Signature-256", signPayload(secret, []byte(formBody)))
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.True(t, trigger.called)
+	assert.Equal(t, "acme/myapp", trigger.calledRepo)
+	assert.Equal(t, "main", trigger.calledRef)
+}
+
+func TestWebhook_FormURLEncoded_WithCharset(t *testing.T) {
+	const secret = "test-secret"
+	trigger := &mockDeployTrigger{}
+	handler := webhook.NewHandler(secret, trigger)
+
+	payload := map[string]interface{}{
+		"ref": "refs/heads/main",
+		"repository": map[string]interface{}{
+			"full_name": "acme/myapp",
+		},
+	}
+	jsonBody, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	formBody := "payload=" + url.QueryEscape(string(jsonBody))
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/github", strings.NewReader(formBody))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
+	req.Header.Set("X-GitHub-Event", "push")
+	req.Header.Set("X-Hub-Signature-256", signPayload(secret, []byte(formBody)))
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.True(t, trigger.called)
+	assert.Equal(t, "acme/myapp", trigger.calledRepo)
+	assert.Equal(t, "main", trigger.calledRef)
+}
+
+func TestWebhook_FormURLEncoded_MissingPayloadField(t *testing.T) {
+	const secret = "test-secret"
+	trigger := &mockDeployTrigger{}
+	handler := webhook.NewHandler(secret, trigger)
+
+	formBody := "other=value"
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/github", strings.NewReader(formBody))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-GitHub-Event", "push")
+	req.Header.Set("X-Hub-Signature-256", signPayload(secret, []byte(formBody)))
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
 	assert.False(t, trigger.called)
 }
 

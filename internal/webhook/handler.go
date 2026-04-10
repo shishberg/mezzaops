@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -46,13 +47,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	jsonBody := body
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+		form, err := url.ParseQuery(string(body))
+		if err != nil {
+			http.Error(w, "malformed form body", http.StatusBadRequest)
+			return
+		}
+		if form.Get("payload") == "" {
+			http.Error(w, "missing payload field", http.StatusBadRequest)
+			return
+		}
+		jsonBody = []byte(form.Get("payload"))
+	}
+
 	var payload struct {
 		Ref        string `json:"ref"`
 		Repository struct {
 			FullName string `json:"full_name"`
 		} `json:"repository"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if err := json.Unmarshal(jsonBody, &payload); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
