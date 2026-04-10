@@ -937,6 +937,57 @@ func TestManager_OldFormatMigration(t *testing.T) {
 	}
 }
 
+func TestManager_GetServiceState(t *testing.T) {
+	cfg := testConfig(t)
+	dir := t.TempDir()
+	svc := sleepService("testsvc", dir)
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	// Should find existing service
+	state, ok := m.GetServiceState("testsvc")
+	if !ok {
+		t.Fatal("expected to find state for testsvc")
+	}
+	if state.Status == "" {
+		t.Fatal("expected non-empty status")
+	}
+
+	// Should not find nonexistent service
+	_, ok = m.GetServiceState("nonexistent")
+	if ok {
+		t.Fatal("expected not found for nonexistent")
+	}
+}
+
+func TestManager_GetServiceLogs(t *testing.T) {
+	cfg := testConfig(t)
+	dir := t.TempDir()
+	svc := config.ServiceConfig{
+		Name:       "testsvc",
+		Dir:        dir,
+		Entrypoint: []string{"sh", "-c", "echo hello && sleep 3600"},
+	}
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	m.Do("testsvc", "start")
+	time.Sleep(200 * time.Millisecond)
+
+	logs := m.GetServiceLogs("testsvc")
+	if !strings.Contains(logs, "hello") {
+		t.Fatalf("logs should contain 'hello', got %q", logs)
+	}
+}
+
 func TestManager_ServiceLoopWithContext(t *testing.T) {
 	cfg := testConfig(t)
 	dir := t.TempDir()

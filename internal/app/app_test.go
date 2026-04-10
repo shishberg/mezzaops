@@ -13,6 +13,7 @@ import (
 )
 
 const minimalTemplate = `<!DOCTYPE html><html><body>{{range $name, $state := .}}{{$name}}{{end}}</body></html>`
+const minimalServiceTemplate = `<!DOCTYPE html><html><body>{{.Name}}</body></html>`
 
 func writeTestConfig(t *testing.T, dir string) string {
 	t.Helper()
@@ -75,7 +76,8 @@ func TestNew_DashboardOnly(t *testing.T) {
 	envPath := filepath.Join(dir, ".env")
 
 	tmplFS := fstest.MapFS{
-		"index.html": &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"index.html":   &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"service.html": &fstest.MapFile{Data: []byte(minimalServiceTemplate)},
 	}
 
 	a, err := app_New(cfgPath, envPath, tmplFS)
@@ -105,7 +107,8 @@ func TestNew_NoFrontends(t *testing.T) {
 	envPath := filepath.Join(dir, ".env")
 
 	tmplFS := fstest.MapFS{
-		"index.html": &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"index.html":   &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"service.html": &fstest.MapFile{Data: []byte(minimalServiceTemplate)},
 	}
 
 	a, err := app_New(cfgPath, envPath, tmplFS)
@@ -130,7 +133,8 @@ func TestHandlePush_MatchingService(t *testing.T) {
 	envPath := filepath.Join(dir, ".env")
 
 	tmplFS := fstest.MapFS{
-		"index.html": &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"index.html":   &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"service.html": &fstest.MapFile{Data: []byte(minimalServiceTemplate)},
 	}
 
 	a, err := app_New(cfgPath, envPath, tmplFS)
@@ -173,7 +177,8 @@ state_dir: ` + filepath.Join(dir, "state") + `
 	require.NoError(t, os.WriteFile(envPath, []byte(""), 0o644))
 
 	tmplFS := fstest.MapFS{
-		"index.html": &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"index.html":   &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"service.html": &fstest.MapFile{Data: []byte(minimalServiceTemplate)},
 	}
 
 	a, err := app_New(cfgPath, envPath, tmplFS)
@@ -212,7 +217,8 @@ state_dir: ` + filepath.Join(dir, "state") + `
 	require.NoError(t, os.WriteFile(envPath, []byte(""), 0o644))
 
 	tmplFS := fstest.MapFS{
-		"index.html": &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"index.html":   &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"service.html": &fstest.MapFile{Data: []byte(minimalServiceTemplate)},
 	}
 
 	a, err := app_New(cfgPath, envPath, tmplFS)
@@ -237,7 +243,8 @@ func TestConfirm_WithoutPending(t *testing.T) {
 	envPath := filepath.Join(dir, ".env")
 
 	tmplFS := fstest.MapFS{
-		"index.html": &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"index.html":   &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"service.html": &fstest.MapFile{Data: []byte(minimalServiceTemplate)},
 	}
 
 	a, err := app_New(cfgPath, envPath, tmplFS)
@@ -255,7 +262,8 @@ func TestShutdown(t *testing.T) {
 	envPath := filepath.Join(dir, ".env")
 
 	tmplFS := fstest.MapFS{
-		"index.html": &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"index.html":   &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"service.html": &fstest.MapFile{Data: []byte(minimalServiceTemplate)},
 	}
 
 	a, err := app_New(cfgPath, envPath, tmplFS)
@@ -290,7 +298,8 @@ func TestManager_Accessor(t *testing.T) {
 	envPath := filepath.Join(dir, ".env")
 
 	tmplFS := fstest.MapFS{
-		"index.html": &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"index.html":   &fstest.MapFile{Data: []byte(minimalTemplate)},
+		"service.html": &fstest.MapFile{Data: []byte(minimalServiceTemplate)},
 	}
 
 	a, err := app_New(cfgPath, envPath, tmplFS)

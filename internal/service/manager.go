@@ -650,6 +650,22 @@ func (m *Manager) FindServiceByRepo(repo, branch string) (string, bool) {
 	return "", false
 }
 
+// GetServiceState returns the current state for a single named service.
+func (m *Manager) GetServiceState(name string) (ServiceState, bool) {
+	m.mu.Lock()
+	ms, ok := m.services[name]
+	m.mu.Unlock()
+	if !ok {
+		return ServiceState{}, false
+	}
+	return m.liveState(ms), true
+}
+
+// GetServiceLogs returns the recent logs for a named service.
+func (m *Manager) GetServiceLogs(name string) string {
+	return m.Do(name, "logs")
+}
+
 // GetServiceConfig returns the config for a named service.
 func (m *Manager) GetServiceConfig(name string) (config.ServiceConfig, bool) {
 	m.mu.Lock()
