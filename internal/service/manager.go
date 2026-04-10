@@ -38,10 +38,11 @@ type ServiceState struct {
 
 // managedService wraps a backend with its config, event loop, and deploy queue.
 type managedService struct {
-	config   config.ServiceConfig
-	backend  Backend
-	opCh     chan syncOp   // synchronous ops: start/stop/restart/status/logs/pull
-	deployCh chan struct{} // async deploy trigger (capacity 1, latest-wins)
+	config           config.ServiceConfig
+	backend          Backend
+	opCh             chan syncOp   // synchronous ops: start/stop/restart/status/logs/pull
+	deployCh         chan struct{} // async deploy trigger (capacity 1, latest-wins)
+	restartOnStartup bool          // adopt: false triggers a restart when the loop starts
 
 	// state is only accessed from the service loop goroutine (no lock needed).
 	state ServiceState
@@ -126,19 +127,14 @@ func (m *Manager) newManagedService(svc config.ServiceConfig) *managedService {
 		backend.RestoreBackendState(raw)
 	}
 
-	// On startup: adopt existing state or restart
+	// On startup: adopt existing state or mark for restart
 	adopt := svc.ShouldAdopt()
 	if pb, ok := backend.(*ProcessBackend); ok {
 		pb.adopt = adopt
 		msg := pb.TryAdopt()
 		log.Printf("**%s**: %s", svc.Name, msg)
 	} else if !adopt {
-		log.Printf("**%s**: restarting (adopt: false)", svc.Name)
-		if err := backend.Restart(context.Background()); err != nil {
-			log.Printf("**%s**: restart failed: %v", svc.Name, err)
-		} else {
-			ms.state.LastRestart = time.Now()
-		}
+		ms.restartOnStartup = true
 	}
 
 	return ms
@@ -177,6 +173,14 @@ func (m *Manager) startServiceLoop(ms *managedService) {
 // serialized through this goroutine.
 func (m *Manager) serviceLoop(ms *managedService) {
 	defer m.wg.Done()
+
+	// Restart on startup if adopt: false (non-process backends)
+	if ms.restartOnStartup {
+		log.Printf("**%s**: restarting (adopt: false)", ms.config.Name)
+		result := m.handleOp(ms, "restart")
+		log.Printf("**%s**: %s", ms.config.Name, result)
+		m.saveServiceState(ms)
+	}
 
 	// Get the process exit channel if this is a ProcessBackend
 	var exitCh <-chan struct{}
