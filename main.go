@@ -40,8 +40,12 @@ func main() {
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sc
-		log.Println("Shutting down...")
+		select {
+		case <-sc:
+			log.Println("Shutting down...")
+		case <-a.Manager().ShutdownCh():
+			log.Println("Self-deploy complete, shutting down...")
+		}
 		a.Shutdown()
 		cancel()
 	}()

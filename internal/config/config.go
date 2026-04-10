@@ -68,6 +68,7 @@ type ServiceConfig struct {
 	UserService         bool                 `yaml:"user_service"`
 	Sudo                bool                 `yaml:"sudo"`
 	RequireConfirmation bool                 `yaml:"require_confirmation"`
+	SelfDeploy          bool                 `yaml:"self_deploy"`
 }
 
 // Env holds secrets loaded from environment variables or a .env file.

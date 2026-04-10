@@ -66,6 +66,9 @@ type Manager struct {
 
 	// For reload
 	servicesDir string
+
+	// shutdownCh is closed when a self-deploy succeeds, signalling the app to exit.
+	shutdownCh chan struct{}
 }
 
 // NewManager creates a Manager for the given service configs.
@@ -87,6 +90,7 @@ func NewManager(cfg *config.Config, services []config.ServiceConfig, notifier No
 		stateDir:    cfg.StateDir,
 		adopt:       cfg.Process.Adopt,
 		servicesDir: cfg.ServicesDir,
+		shutdownCh:  make(chan struct{}),
 	}
 
 	for _, svc := range services {
@@ -311,6 +315,21 @@ func (m *Manager) executeDeploy(ms *managedService) {
 
 		m.saveServiceState(ms)
 		m.notifier.DeployFailed(name, failedStep, output)
+		return
+	}
+
+	// Self-deploy: skip restart, save state, notify, then signal shutdown
+	if ms.config.SelfDeploy {
+		ms.stateMu.Lock()
+		ms.state.Status = "running"
+		ms.state.LastResult = "success"
+		ms.state.LastOutput = result.Output
+		ms.state.FailedStep = ""
+		ms.stateMu.Unlock()
+
+		m.saveServiceState(ms)
+		m.notifier.DeploySucceeded(name, result.Output)
+		close(m.shutdownCh)
 		return
 	}
 
@@ -558,7 +577,10 @@ func serviceConfigEqual(a, b config.ServiceConfig) bool {
 			return false
 		}
 	}
-	return a.RequireConfirmation == b.RequireConfirmation
+	if a.RequireConfirmation != b.RequireConfirmation {
+		return false
+	}
+	return a.SelfDeploy == b.SelfDeploy
 }
 
 // ServiceNames returns a sorted list of all service names.
@@ -676,6 +698,12 @@ func (m *Manager) GetServiceConfig(name string) (config.ServiceConfig, bool) {
 		return config.ServiceConfig{}, false
 	}
 	return ms.config, true
+}
+
+// ShutdownCh returns a channel that is closed when a self-deploy succeeds,
+// signalling the application to shut down gracefully.
+func (m *Manager) ShutdownCh() <-chan struct{} {
+	return m.shutdownCh
 }
 
 // Stop cancels the manager context and waits for all service loops to exit.

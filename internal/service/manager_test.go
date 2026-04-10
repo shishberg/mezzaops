@@ -988,6 +988,129 @@ func TestManager_GetServiceLogs(t *testing.T) {
 	}
 }
 
+func TestManager_SelfDeploy(t *testing.T) {
+	cfg := testConfig(t)
+	dir := t.TempDir()
+	rec := &recordingNotifier{}
+
+	svc := config.ServiceConfig{
+		Name:       "selfsvc",
+		Dir:        dir,
+		Entrypoint: []string{"sleep", "3600"},
+		Deploy:     []string{"echo deploying"},
+		SelfDeploy: true,
+	}
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	// Start the service first
+	m.Do("selfsvc", "start")
+
+	// Record the status before deploy — should be running
+	states := m.GetAllStates()
+	if states["selfsvc"].Status != "running" {
+		t.Fatalf("status before deploy: got %q, want running", states["selfsvc"].Status)
+	}
+
+	if err := m.RequestDeploy("selfsvc"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for shutdown signal (self-deploy success should close ShutdownCh)
+	select {
+	case <-m.ShutdownCh():
+		// good — shutdown was signalled
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for ShutdownCh to be closed")
+	}
+
+	// DeploySucceeded should have been called
+	if len(rec.getDeploySucceeded()) == 0 {
+		t.Fatal("expected DeploySucceeded notification")
+	}
+
+	// State should be persisted with LastResult: "success"
+	s, _, err := LoadState(cfg.StateDir, "selfsvc")
+	if err != nil {
+		t.Fatalf("loading state: %v", err)
+	}
+	if s.LastResult != "success" {
+		t.Fatalf("state LastResult: got %q, want success", s.LastResult)
+	}
+
+	// The backend should NOT have been restarted — the service should still
+	// be running with the same process from the initial start.
+	states = m.GetAllStates()
+	if states["selfsvc"].Status != "running" {
+		t.Fatalf("status after self-deploy: got %q, want running", states["selfsvc"].Status)
+	}
+}
+
+func TestManager_SelfDeploy_Failure(t *testing.T) {
+	cfg := testConfig(t)
+	dir := t.TempDir()
+	rec := &recordingNotifier{}
+
+	svc := config.ServiceConfig{
+		Name:       "selfsvc",
+		Dir:        dir,
+		Entrypoint: []string{"sleep", "3600"},
+		Deploy:     []string{"false"}, // will fail
+		SelfDeploy: true,
+	}
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	if err := m.RequestDeploy("selfsvc"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for deploy to complete by polling state
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for deploy")
+		default:
+		}
+		states := m.GetAllStates()
+		if states["selfsvc"].Status != "deploying" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// ShutdownCh should NOT be closed
+	select {
+	case <-m.ShutdownCh():
+		t.Fatal("ShutdownCh should not be closed on deploy failure")
+	default:
+		// good — not closed
+	}
+
+	// DeployFailed should have been called
+	if len(rec.getDeployFailed()) == 0 {
+		t.Fatal("expected DeployFailed notification")
+	}
+
+	// State should show LastResult: "failed"
+	s, _, err := LoadState(cfg.StateDir, "selfsvc")
+	if err != nil {
+		t.Fatalf("loading state: %v", err)
+	}
+	if s.LastResult != "failed" {
+		t.Fatalf("state LastResult: got %q, want failed", s.LastResult)
+	}
+}
+
 func TestManager_ServiceLoopWithContext(t *testing.T) {
 	cfg := testConfig(t)
 	dir := t.TempDir()
