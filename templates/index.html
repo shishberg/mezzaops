@@ -116,9 +116,36 @@
       padding: 2rem;
       color: #888;
     }
+
+    .autoreload-toggle {
+      position: fixed;
+      top: 1rem;
+      right: 1rem;
+      padding: 0.4em 0.8em;
+      border: 1px solid #d1d5db;
+      border-radius: 4px;
+      background: #fff;
+      color: #555;
+      cursor: pointer;
+      font: inherit;
+      font-size: 0.75rem;
+      z-index: 100;
+    }
+
+    .autoreload-toggle:hover { background: #f3f4f6; }
+
+    .autoreload-toggle.on {
+      background: #d1fae5;
+      color: #065f46;
+      border-color: #86efac;
+    }
+
+    .autoreload-toggle.on:hover { background: #a7f3d0; }
   </style>
 </head>
 <body>
+  <button id="autoreload-toggle" class="autoreload-toggle" type="button" onclick="toggleAutoReload()">Auto-reload: Off</button>
+
   <h1>MezzaOps</h1>
 
   <table>
@@ -188,7 +215,46 @@
       btn.textContent = open ? 'Hide output' : 'Show output';
     }
 
-    setTimeout(function() { location.reload(); }, 10000);
+    var AUTORELOAD_KEY = 'mezzaops-autoreload';
+    var AUTORELOAD_INTERVAL_MS = 10000;
+    var autoReloadTimer = null;
+
+    function isAutoReloadOn() {
+      try { return localStorage.getItem(AUTORELOAD_KEY) === 'on'; }
+      catch (e) { return false; }
+    }
+
+    function setAutoReload(on) {
+      try { localStorage.setItem(AUTORELOAD_KEY, on ? 'on' : 'off'); }
+      catch (e) {}
+    }
+
+    function updateAutoReloadUI() {
+      var btn = document.getElementById('autoreload-toggle');
+      if (!btn) return;
+      var on = isAutoReloadOn();
+      btn.textContent = 'Auto-reload: ' + (on ? 'On' : 'Off');
+      btn.classList.toggle('on', on);
+    }
+
+    function scheduleAutoReload() {
+      if (autoReloadTimer !== null) {
+        clearTimeout(autoReloadTimer);
+        autoReloadTimer = null;
+      }
+      if (isAutoReloadOn()) {
+        autoReloadTimer = setTimeout(function() { location.reload(); }, AUTORELOAD_INTERVAL_MS);
+      }
+    }
+
+    function toggleAutoReload() {
+      setAutoReload(!isAutoReloadOn());
+      updateAutoReloadUI();
+      scheduleAutoReload();
+    }
+
+    updateAutoReloadUI();
+    scheduleAutoReload();
   </script>
 </body>
 </html>

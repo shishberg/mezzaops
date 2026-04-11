@@ -279,3 +279,69 @@ func TestDashboard_ServiceNameLinks(t *testing.T) {
 	body := rr.Body.String()
 	assert.Contains(t, body, `href="/service/myapp"`)
 }
+
+// assertAutoReloadToggle verifies that a rendered dashboard page has an
+// auto-reload toggle that is off by default, persists via localStorage, and
+// does not fire location.reload() unconditionally on page load.
+func assertAutoReloadToggle(t *testing.T, body string) {
+	t.Helper()
+
+	// Toggle button must be present with a stable id for the script.
+	assert.Contains(t, body, `id="autoreload-toggle"`,
+		"page must include the auto-reload toggle button")
+
+	// The initial rendered label must reflect the "off" default — users
+	// should see "Off" on first load, before any JS runs.
+	assert.Contains(t, body, "Auto-reload: Off",
+		"toggle must render as Off by default")
+
+	// Persistence: the script must read/write localStorage so the setting
+	// survives a reload (required so that turning the toggle on stays on
+	// across the auto-reload it triggers).
+	assert.Contains(t, body, "localStorage",
+		"auto-reload state must be persisted in localStorage")
+
+	// The old unconditional reload must be gone. Any reload must be gated
+	// on the toggle state; we assert the raw unconditional call is absent.
+	assert.NotContains(t, body, "setTimeout(function() { location.reload(); }, 10000)",
+		"page must not unconditionally schedule a reload")
+}
+
+func TestDashboard_IndexAutoReloadToggle(t *testing.T) {
+	provider := &mockStateProvider{
+		states: map[string]service.ServiceState{
+			"myapp": {Status: "running"},
+		},
+	}
+
+	d, err := dashboard.New(provider, os.DirFS("../../templates"))
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	d.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assertAutoReloadToggle(t, rr.Body.String())
+}
+
+func TestDashboard_ServiceDetailAutoReloadToggle(t *testing.T) {
+	provider := &mockStateProvider{
+		states: map[string]service.ServiceState{
+			"myapp": {Status: "running"},
+		},
+		configs: map[string]config.ServiceConfig{
+			"myapp": {Name: "myapp", Dir: "/opt/myapp"},
+		},
+	}
+
+	d, err := dashboard.New(provider, os.DirFS("../../templates"))
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodGet, "/service/myapp", nil)
+	rr := httptest.NewRecorder()
+	d.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assertAutoReloadToggle(t, rr.Body.String())
+}
