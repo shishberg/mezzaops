@@ -1029,6 +1029,55 @@ func TestNotifier_DeployFailed(t *testing.T) {
 	assert.Contains(t, posts[0].Message, "error output")
 }
 
+func TestNotifier_DeployFailed_LargeOutputTruncated(t *testing.T) {
+	rest := &mockRestClient{}
+	bot := &Bot{
+		rest:      rest,
+		channelID: "channel-123",
+	}
+
+	// Build ~50 KB of "x\n" as the failing step output, plus a distinctive
+	// tail that must survive truncation (since real failures put the error
+	// at the end of the combined log).
+	const tailMarker = "===FINAL_ERROR_MARKER_AT_TAIL==="
+	var b strings.Builder
+	for i := 0; i < 25000; i++ {
+		b.WriteString("x\n")
+	}
+	b.WriteString(tailMarker)
+	output := b.String()
+
+	n := NewNotifier(bot)
+	n.DeployFailed("slurp", "go test -short ./...", output)
+
+	posts := rest.getPosts()
+	require.Len(t, posts, 1)
+	msg := posts[0].Message
+
+	// The whole posted message (service name, step, code fence, marker, body)
+	// must fit in Mattermost's server-side cap.
+	runes := len([]rune(msg))
+	assert.LessOrEqual(t, runes, model.PostMessageMaxRunesV2,
+		"posted message exceeds Mattermost rune limit: %d > %d", runes, model.PostMessageMaxRunesV2)
+
+	// Truncation marker must be present and the tail of the original
+	// output must still be in the message.
+	assert.Contains(t, msg, "truncated")
+	assert.Contains(t, msg, tailMarker)
+
+	// Code fence should remain intact (opening and closing).
+	assert.Contains(t, msg, "```\n")
+	assert.True(t, strings.HasSuffix(msg, "\n```"),
+		"message should end with closing code fence; got tail %q", msg[max(0, len(msg)-30):])
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func TestNotifier_WebhookReceived_Full(t *testing.T) {
 	rest := &mockRestClient{}
 	bot := &Bot{

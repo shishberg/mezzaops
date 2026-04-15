@@ -42,10 +42,21 @@ func (n *Notifier) DeploySucceeded(name, output string) {
 	n.send(fmt.Sprintf("Deploy of **%s** succeeded.", name))
 }
 
+// discordMessageRuneLimit is the maximum size of a single Discord message.
+// See https://discord.com/developers/docs/resources/channel#create-message --
+// the `content` field is capped at 2000 characters. The discordgo SDK
+// (v0.27.0) does not expose this as a named constant.
+const discordMessageRuneLimit = 2000
+
 // DeployFailed posts a deploy-failed message with the failed step and output.
+// The output is truncated from the head (keeping the tail, where errors tend
+// to be) so the whole message fits within Discord's 2000-character limit.
 func (n *Notifier) DeployFailed(name, step, output string) {
-	msg := fmt.Sprintf("Deploy of **%s** failed at step `%s`.\n```\n%s\n```", name, step, output)
-	n.send(msg)
+	const format = "Deploy of **%s** failed at step `%s`.\n```\n%s\n```"
+	scaffolding := fmt.Sprintf(format, name, step, "")
+	budget := discordMessageRuneLimit - len([]rune(scaffolding))
+	truncated := service.TruncateTailToRuneBudget(output, budget)
+	n.send(fmt.Sprintf(format, name, step, truncated))
 }
 
 // WebhookReceived posts a notification describing an incoming webhook that

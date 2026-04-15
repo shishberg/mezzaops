@@ -363,6 +363,42 @@ func TestNotifier_DeployFailed(t *testing.T) {
 	assert.Equal(t, expected, sent)
 }
 
+func TestNotifier_DeployFailed_LargeOutputTruncated(t *testing.T) {
+	var sent string
+	n := &Notifier{
+		sendFunc: func(msg string) { sent = msg },
+	}
+
+	const tailMarker = "===FINAL_ERROR_MARKER_AT_TAIL==="
+	// Build ~50 KB of "x\n" plus a distinctive tail that must survive.
+	buf := make([]byte, 0, 50001+len(tailMarker))
+	for i := 0; i < 25000; i++ {
+		buf = append(buf, 'x', '\n')
+	}
+	buf = append(buf, tailMarker...)
+	output := string(buf)
+
+	n.DeployFailed("slurp", "go test -short ./...", output)
+
+	// Whole sent message must fit under Discord's 2000-char message limit.
+	runes := len([]rune(sent))
+	assert.LessOrEqual(t, runes, discordMessageRuneLimit,
+		"sent message exceeds Discord rune limit: %d > %d", runes, discordMessageRuneLimit)
+
+	// Truncation marker present and the tail of the original output survives.
+	assert.Contains(t, sent, "truncated")
+	assert.Contains(t, sent, tailMarker)
+
+	// Code fence intact.
+	assert.Contains(t, sent, "```\n")
+	tail := sent
+	if len(tail) > 30 {
+		tail = tail[len(tail)-30:]
+	}
+	assert.True(t, len(sent) >= 4 && sent[len(sent)-4:] == "\n```",
+		"message should end with closing code fence; got tail %q", tail)
+}
+
 func TestNotifier_WebhookReceived_Full(t *testing.T) {
 	var sent string
 	n := &Notifier{

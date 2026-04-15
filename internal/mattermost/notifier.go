@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/shishberg/mezzaops/internal/service"
 )
 
@@ -36,9 +37,14 @@ func (n *Notifier) DeploySucceeded(name, output string) {
 }
 
 // DeployFailed posts a deploy-failed notification with the failed step and output.
+// The output is truncated from the head (keeping the tail, where errors tend to
+// be) so the whole message fits within Mattermost's server-side rune limit.
 func (n *Notifier) DeployFailed(name, step, output string) {
-	msg := fmt.Sprintf("Deploy of `%s` failed at step `%s`.\n```\n%s\n```", name, step, output)
-	n.bot.PostMessage(context.Background(), msg)
+	const format = "Deploy of `%s` failed at step `%s`.\n```\n%s\n```"
+	scaffolding := fmt.Sprintf(format, name, step, "")
+	budget := model.PostMessageMaxRunesV2 - len([]rune(scaffolding))
+	truncated := service.TruncateTailToRuneBudget(output, budget)
+	n.bot.PostMessage(context.Background(), fmt.Sprintf(format, name, step, truncated))
 }
 
 // WebhookReceived posts a notification describing an incoming webhook that
