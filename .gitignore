@@ -4,3 +4,4 @@ token.txt
 .env
 logs/
 state/
+.playwright-mcp/
