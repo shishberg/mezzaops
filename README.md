@@ -115,6 +115,19 @@ Mattermost and Matrix additionally support `confirm` (for services with `require
 
 When `process.adopt: true` (the default), MezzaOps re-adopts child processes that survive a restart. It verifies process identity via boot time and process creation time to detect PID reuse. Set `process.adopt: false` in dev to get a clean slate each time.
 
+## Building
+
+The Matrix bot's E2EE crypto helper has two olm backends:
+
+- **`-tags goolm`** (what the Makefile uses) — pure Go, no system dependency.
+- **default** — cgo wrapper around `libolm`, which needs the `libolm` C
+  headers at build time: `apt install libolm-dev` on Debian/Ubuntu,
+  `dnf install libolm-devel` on RHEL/Fedora, `brew install libolm` on macOS.
+
+If you build with a plain `go build` (e.g. in a deploy step) on a host
+without libolm, either install libolm or add `-tags goolm` to the build
+command.
+
 ## Development
 
 ```sh
