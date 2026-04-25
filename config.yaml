@@ -12,6 +12,12 @@ state_dir: "./state"
 #   url: "http://localhost:8065"
 #   channel: "myteam/town-square"
 
+# matrix:
+#   homeserver: "https://matrix.example.org"
+#   room: "!abc:matrix.example.org"     # room ID or "#alias:server"
+#   command_prefix: "!mezzaops"          # optional; default "!mezzaops"
+#   crypto_db: ""                        # optional; default "<state_dir>/matrix-crypto.db"
+
 # webhook:
 #   port: 8080
 

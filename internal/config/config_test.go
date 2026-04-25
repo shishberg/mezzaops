@@ -21,6 +21,11 @@ discord:
 mattermost:
   url: "http://mm:8065"
   channel: "team/chan"
+matrix:
+  homeserver: "https://matrix.example.org"
+  room: "!abc:matrix.example.org"
+  command_prefix: "!ops"
+  crypto_db: "/var/state/matrix.db"
 webhook:
   port: 9090
 dashboard:
@@ -42,6 +47,12 @@ dashboard:
 	require.NotNil(t, cfg.Mattermost)
 	assert.Equal(t, "http://mm:8065", cfg.Mattermost.URL)
 	assert.Equal(t, "team/chan", cfg.Mattermost.Channel)
+
+	require.NotNil(t, cfg.Matrix)
+	assert.Equal(t, "https://matrix.example.org", cfg.Matrix.Homeserver)
+	assert.Equal(t, "!abc:matrix.example.org", cfg.Matrix.Room)
+	assert.Equal(t, "!ops", cfg.Matrix.CommandPrefix)
+	assert.Equal(t, "/var/state/matrix.db", cfg.Matrix.CryptoDB)
 
 	require.NotNil(t, cfg.Webhook)
 	assert.Equal(t, 9090, cfg.Webhook.Port)
@@ -65,6 +76,7 @@ discord:
 	require.NotNil(t, cfg.Discord)
 	assert.Equal(t, "abc", cfg.Discord.GuildID)
 	assert.Nil(t, cfg.Mattermost)
+	assert.Nil(t, cfg.Matrix)
 	assert.Nil(t, cfg.Webhook)
 	assert.Nil(t, cfg.Dashboard)
 }
@@ -86,6 +98,10 @@ func TestLoadEnv_FromFile(t *testing.T) {
 	content := `DISCORD_TOKEN=disc-tok
 MATTERMOST_TOKEN=mm-tok
 GITHUB_WEBHOOK_SECRET=secret123
+MATRIX_USER_ID=@bot:matrix.example.org
+MATRIX_DEVICE_ID=DEV01
+MATRIX_ACCESS_TOKEN=syt_abc
+MATRIX_PICKLE_KEY=pickle-pass
 `
 	path := filepath.Join(t.TempDir(), ".env")
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
@@ -96,12 +112,20 @@ GITHUB_WEBHOOK_SECRET=secret123
 	assert.Equal(t, "disc-tok", env.DiscordToken)
 	assert.Equal(t, "mm-tok", env.MattermostToken)
 	assert.Equal(t, "secret123", env.WebhookSecret)
+	assert.Equal(t, "@bot:matrix.example.org", env.MatrixUserID)
+	assert.Equal(t, "DEV01", env.MatrixDeviceID)
+	assert.Equal(t, "syt_abc", env.MatrixAccessToken)
+	assert.Equal(t, "pickle-pass", env.MatrixPickleKey)
 }
 
 func TestLoadEnv_FallbackToEnvironment(t *testing.T) {
 	t.Setenv("DISCORD_TOKEN", "env-disc")
 	t.Setenv("MATTERMOST_TOKEN", "env-mm")
 	t.Setenv("GITHUB_WEBHOOK_SECRET", "env-secret")
+	t.Setenv("MATRIX_USER_ID", "@env:example.org")
+	t.Setenv("MATRIX_DEVICE_ID", "ENVDEV")
+	t.Setenv("MATRIX_ACCESS_TOKEN", "env-token")
+	t.Setenv("MATRIX_PICKLE_KEY", "env-pickle")
 
 	env, err := config.LoadEnv("")
 	require.NoError(t, err)
@@ -109,6 +133,10 @@ func TestLoadEnv_FallbackToEnvironment(t *testing.T) {
 	assert.Equal(t, "env-disc", env.DiscordToken)
 	assert.Equal(t, "env-mm", env.MattermostToken)
 	assert.Equal(t, "env-secret", env.WebhookSecret)
+	assert.Equal(t, "@env:example.org", env.MatrixUserID)
+	assert.Equal(t, "ENVDEV", env.MatrixDeviceID)
+	assert.Equal(t, "env-token", env.MatrixAccessToken)
+	assert.Equal(t, "env-pickle", env.MatrixPickleKey)
 }
 
 func TestLoadEnv_FallbackWhenFileMissing(t *testing.T) {

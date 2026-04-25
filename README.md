@@ -37,6 +37,12 @@ mattermost:
   url: "http://mm.example.com:8065"
   channel: "team/ops"
 
+matrix:
+  homeserver: "https://matrix.example.org"
+  room: "!abc:matrix.example.org"      # room ID or "#alias:server"
+  command_prefix: "!mezzaops"
+  crypto_db: ""                         # default: "<state_dir>/matrix-crypto.db"
+
 webhook:
   port: 8080
 
@@ -67,7 +73,16 @@ require_confirmation: false
 DISCORD_TOKEN=
 MATTERMOST_TOKEN=
 GITHUB_WEBHOOK_SECRET=
+MATRIX_USER_ID=
+MATRIX_DEVICE_ID=
+MATRIX_ACCESS_TOKEN=
+MATRIX_PICKLE_KEY=
 ```
+
+The Matrix bot stores end-to-end-encryption keys in a SQLite database at
+`<state_dir>/matrix-crypto.db` (override with `matrix.crypto_db`). The pickle
+key encrypts that store; rotating it forces the bot to re-establish device
+identity and re-share room keys.
 
 ## Frontends
 
@@ -75,6 +90,7 @@ GITHUB_WEBHOOK_SECRET=
 |---|---|---|
 | **Discord** | `/ops start <svc>` slash commands | Full ops + deploy + presence status |
 | **Mattermost** | `@mezzaops start <svc>` mentions | Full ops + deploy + confirm |
+| **Matrix** | `!mezzaops start <svc>` (configurable prefix) in one configured room | Full ops + deploy + confirm; supports E2EE rooms |
 | **Webhook** | `POST /webhook/github` push events | Auto-deploy on push |
 | **Dashboard** | `GET /` and `GET /api/status` | Read-only status table |
 | **CLI** | `mezzaops -i` | Interactive REPL for local testing |
@@ -93,7 +109,7 @@ Backend is selected per-service based on config fields:
 
 All frontends support: `start`, `stop`, `restart`, `status`, `logs`, `pull`, `deploy`, `reload`, `start-all`, `stop-all`.
 
-Mattermost additionally supports `confirm` (for services with `require_confirmation: true`).
+Mattermost and Matrix additionally support `confirm` (for services with `require_confirmation: true`).
 
 ## Process adoption
 

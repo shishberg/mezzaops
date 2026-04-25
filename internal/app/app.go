@@ -13,6 +13,7 @@ import (
 	"github.com/shishberg/mezzaops/internal/config"
 	"github.com/shishberg/mezzaops/internal/dashboard"
 	"github.com/shishberg/mezzaops/internal/discord"
+	"github.com/shishberg/mezzaops/internal/matrix"
 	"github.com/shishberg/mezzaops/internal/mattermost"
 	"github.com/shishberg/mezzaops/internal/service"
 	"github.com/shishberg/mezzaops/internal/webhook"
@@ -26,6 +27,7 @@ type App struct {
 	confirmations *service.ConfirmationTracker
 	discordBot    *discord.Bot
 	mmBot         *mattermost.Bot
+	matrixBot     *matrix.Bot
 	webhookSrv    *http.Server
 	dashboardSrv  *http.Server
 	cancel        context.CancelFunc
@@ -92,6 +94,26 @@ func New(configPath string, envPath string, templatesFS fs.FS) (*App, error) {
 		a.mmBot = mattermost.New(mcfg, a.manager)
 		a.mmBot.SetConfirmHandler(a)
 		notifiers = append(notifiers, mattermost.NewNotifier(a.mmBot))
+	}
+
+	// Matrix. All four secrets are required; partial config is silently
+	// skipped to match the Discord/Mattermost behaviour.
+	if cfg.Matrix != nil &&
+		env.MatrixUserID != "" && env.MatrixDeviceID != "" &&
+		env.MatrixAccessToken != "" && env.MatrixPickleKey != "" {
+		mxcfg := matrix.Config{
+			Homeserver:    cfg.Matrix.Homeserver,
+			Room:          cfg.Matrix.Room,
+			CommandPrefix: cfg.Matrix.CommandPrefix,
+			CryptoDB:      cfg.Matrix.CryptoDB,
+			UserID:        env.MatrixUserID,
+			DeviceID:      env.MatrixDeviceID,
+			AccessToken:   env.MatrixAccessToken,
+			PickleKey:     env.MatrixPickleKey,
+		}
+		a.matrixBot = matrix.New(mxcfg, cfg.StateDir, a.manager)
+		a.matrixBot.SetConfirmHandler(a)
+		notifiers = append(notifiers, matrix.NewNotifier(a.matrixBot))
 	}
 
 	// Set the real notifier on the manager.
@@ -176,11 +198,26 @@ func (a *App) Run(ctx context.Context) error {
 		}()
 	}
 
+	if a.matrixBot != nil {
+		go func() {
+			if err := a.matrixBot.Run(ctx); err != nil {
+				log.Printf("matrix bot error: %v", err)
+			}
+		}()
+	}
+
 	// Wait for frontends to be ready before signalling the manager.
 	go func() {
 		if a.mmBot != nil {
 			select {
 			case <-a.mmBot.Ready():
+			case <-ctx.Done():
+				return
+			}
+		}
+		if a.matrixBot != nil {
+			select {
+			case <-a.matrixBot.Ready():
 			case <-ctx.Done():
 				return
 			}
@@ -244,6 +281,12 @@ func (a *App) HandlePush(event webhook.PushEvent) {
 			msg := fmt.Sprintf("Deploy queued for **%s** (repo: %s, branch: %s). "+
 				"Reply `@mezzaops confirm %s` to proceed.", svcName, event.Repo, event.Branch, svcName)
 			a.mmBot.PostMessage(context.Background(), msg)
+		}
+		if a.matrixBot != nil {
+			msg := fmt.Sprintf("Deploy queued for **%s** (repo: %s, branch: %s). "+
+				"Reply `%s confirm %s` to proceed.",
+				svcName, event.Repo, event.Branch, a.matrixBot.CommandPrefix(), svcName)
+			a.matrixBot.PostMessage(context.Background(), msg)
 		}
 		return
 	}

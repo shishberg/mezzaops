@@ -23,6 +23,15 @@ type MattermostConfig struct {
 	Channel string `yaml:"channel"`
 }
 
+// MatrixConfig holds Matrix bot connection settings. Secrets (user/device ID,
+// access token, pickle key) live in Env, not here.
+type MatrixConfig struct {
+	Homeserver    string `yaml:"homeserver"`
+	Room          string `yaml:"room"`
+	CommandPrefix string `yaml:"command_prefix"`
+	CryptoDB      string `yaml:"crypto_db"`
+}
+
 // WebhookConfig holds GitHub webhook listener settings.
 type WebhookConfig struct {
 	Port int `yaml:"port"`
@@ -40,6 +49,7 @@ type Config struct {
 	StateDir    string            `yaml:"state_dir"`
 	Discord     *DiscordConfig    `yaml:"discord"`
 	Mattermost  *MattermostConfig `yaml:"mattermost"`
+	Matrix      *MatrixConfig     `yaml:"matrix"`
 	Webhook     *WebhookConfig    `yaml:"webhook"`
 	Dashboard   *DashboardConfig  `yaml:"dashboard"`
 }
@@ -77,9 +87,13 @@ func (s *ServiceConfig) ShouldAdopt() bool {
 
 // Env holds secrets loaded from environment variables or a .env file.
 type Env struct {
-	DiscordToken    string
-	MattermostToken string
-	WebhookSecret   string
+	DiscordToken      string
+	MattermostToken   string
+	WebhookSecret     string
+	MatrixUserID      string
+	MatrixDeviceID    string
+	MatrixAccessToken string
+	MatrixPickleKey   string
 }
 
 // LoadConfig reads a YAML config file and applies defaults.
@@ -109,9 +123,13 @@ func LoadEnv(path string) (*Env, error) {
 		vars, err := godotenv.Read(path)
 		if err == nil {
 			return &Env{
-				DiscordToken:    vars["DISCORD_TOKEN"],
-				MattermostToken: vars["MATTERMOST_TOKEN"],
-				WebhookSecret:   vars["GITHUB_WEBHOOK_SECRET"],
+				DiscordToken:      vars["DISCORD_TOKEN"],
+				MattermostToken:   vars["MATTERMOST_TOKEN"],
+				WebhookSecret:     vars["GITHUB_WEBHOOK_SECRET"],
+				MatrixUserID:      vars["MATRIX_USER_ID"],
+				MatrixDeviceID:    vars["MATRIX_DEVICE_ID"],
+				MatrixAccessToken: vars["MATRIX_ACCESS_TOKEN"],
+				MatrixPickleKey:   vars["MATRIX_PICKLE_KEY"],
 			}, nil
 		}
 		// Only fall through to os.Getenv if the file simply doesn't exist.
@@ -122,9 +140,13 @@ func LoadEnv(path string) (*Env, error) {
 	}
 
 	return &Env{
-		DiscordToken:    os.Getenv("DISCORD_TOKEN"),
-		MattermostToken: os.Getenv("MATTERMOST_TOKEN"),
-		WebhookSecret:   os.Getenv("GITHUB_WEBHOOK_SECRET"),
+		DiscordToken:      os.Getenv("DISCORD_TOKEN"),
+		MattermostToken:   os.Getenv("MATTERMOST_TOKEN"),
+		WebhookSecret:     os.Getenv("GITHUB_WEBHOOK_SECRET"),
+		MatrixUserID:      os.Getenv("MATRIX_USER_ID"),
+		MatrixDeviceID:    os.Getenv("MATRIX_DEVICE_ID"),
+		MatrixAccessToken: os.Getenv("MATRIX_ACCESS_TOKEN"),
+		MatrixPickleKey:   os.Getenv("MATRIX_PICKLE_KEY"),
 	}, nil
 }
 
