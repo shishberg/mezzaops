@@ -62,7 +62,7 @@ manager is signalled ready.
 
 ```yaml
 matrix:
-  homeserver: "https://matrix.example.org"   # required
+  homeserver: "https://matrix.example.org"   # required; full URL, or a bare server name resolved via .well-known/matrix/client
   room: "!abc:matrix.example.org"            # room ID or "#alias:server"
   command_prefix: "!mezzaops"                # optional; default "!mezzaops"
   crypto_db: ""                              # optional; default "<state_dir>/matrix-crypto.db"
@@ -107,9 +107,16 @@ re-establish device identity and re-share keys.
 
 `matrix.New(cfg, manager)`:
 
-1. `client, _ := mautrix.NewClient(cfg.Homeserver, "", "")`
-2. Set `client.UserID`, `client.DeviceID`, `client.AccessToken` from env.
-3. Assign `client.Log` — a `zerolog.Logger` writing to `os.Stderr` at
+1. **Resolve homeserver URL.** If `cfg.Homeserver` already has a scheme
+   (`https://` or `http://`) it is used as-is. Otherwise it is treated as
+   a Matrix server name and resolved via `mautrix.DiscoverClientAPI`,
+   which fetches `/.well-known/matrix/client`. If the server returns 404
+   (no `.well-known` published) or an empty `base_url`, the bot falls
+   back to `https://<serverName>`. Discovery errors are stored and
+   surface from `Run` like a malformed URL.
+2. `client, _ := mautrix.NewClient(<resolved URL>, "", "")`
+3. Set `client.UserID`, `client.DeviceID`, `client.AccessToken` from env.
+4. Assign `client.Log` — a `zerolog.Logger` writing to `os.Stderr` at
    info level, so mautrix's internal logs land alongside the standard
    library `log` output the rest of mezzaops uses.
 

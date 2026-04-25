@@ -38,7 +38,7 @@ mattermost:
   channel: "team/ops"
 
 matrix:
-  homeserver: "https://matrix.example.org"
+  homeserver: "https://matrix.example.org"   # full URL, or a bare server name (e.g. "example.org") resolved via .well-known/matrix/client
   room: "!abc:matrix.example.org"      # room ID or "#alias:server"
   command_prefix: "!mezzaops"
   crypto_db: ""                         # default: "<state_dir>/matrix-crypto.db"

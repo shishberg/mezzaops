@@ -118,12 +118,55 @@ type Bot struct {
 	readyCh      chan struct{}
 }
 
-// New constructs a Bot. It does no I/O — the real connection, alias
-// resolution, and crypto bootstrap happen in Run. stateDir is used to derive
-// the default crypto database path when cfg.CryptoDB is empty.
+// discoverFunc resolves a Matrix server name to its client-server API
+// well-known document. It mirrors mautrix.DiscoverClientAPI but drops the
+// context parameter so tests can inject a fake without managing one.
+type discoverFunc func(serverName string) (*mautrix.ClientWellKnown, error)
+
+// discoverClientAPI is the package-level default used by resolveHomeserverURL.
+// Tests override it; the variable is read once per New call from a single
+// goroutine, so tests must not call t.Parallel while mutating it.
+var discoverClientAPI discoverFunc = func(serverName string) (*mautrix.ClientWellKnown, error) {
+	return mautrix.DiscoverClientAPI(context.Background(), serverName)
+}
+
+// resolveHomeserverURL turns a homeserver config value into the client-server
+// API URL. A value with a scheme (https:// or http://) is returned unchanged.
+// A bare server name is resolved via /.well-known/matrix/client per the
+// Matrix client-server spec:
+//   - mautrix returns (nil, nil) for a 404 — FAIL_PROMPT in spec terms — and
+//     we fall back to https://<serverName>.
+//   - mautrix returns a non-nil error for transport/JSON failures, which we
+//     propagate.
+//   - A 200 with an empty base_url is FAIL_ERROR per spec; we surface it as
+//     an error so an operator misconfiguration doesn't silently route the
+//     bot at the apex domain.
+func resolveHomeserverURL(homeserver string, discover discoverFunc) (string, error) {
+	if strings.Contains(homeserver, "://") {
+		return homeserver, nil
+	}
+	wk, err := discover(homeserver)
+	if err != nil {
+		return "", fmt.Errorf("discovering client API for %q: %w", homeserver, err)
+	}
+	if wk == nil {
+		return "https://" + homeserver, nil
+	}
+	if wk.Homeserver.BaseURL == "" {
+		return "", fmt.Errorf(".well-known for %q returned empty m.homeserver.base_url", homeserver)
+	}
+	return wk.Homeserver.BaseURL, nil
+}
+
+// New constructs a Bot. The real connection, alias resolution, and crypto
+// bootstrap happen in Run; the only I/O performed here is the optional
+// /.well-known/matrix/client lookup when cfg.Homeserver is a bare server
+// name. stateDir is used to derive the default crypto database path when
+// cfg.CryptoDB is empty.
 //
-// A malformed homeserver URL is recorded and surfaces from Run; matching the
-// Mattermost frontend, construction is cheap and cannot itself fail.
+// A malformed homeserver URL or a failed discovery is recorded and surfaces
+// from Run; matching the Mattermost frontend, construction itself does not
+// return an error.
 func New(cfg Config, stateDir string, manager ServiceManager) *Bot {
 	prefix := cfg.CommandPrefix
 	if prefix == "" {
@@ -139,7 +182,16 @@ func New(cfg Config, stateDir string, manager ServiceManager) *Bot {
 		readyCh:  make(chan struct{}),
 	}
 
-	client, err := mautrix.NewClient(cfg.Homeserver, id.UserID(cfg.UserID), cfg.AccessToken)
+	homeserverURL, err := resolveHomeserverURL(cfg.Homeserver, discoverClientAPI)
+	if err != nil {
+		bot.newClientErr = err
+		return bot
+	}
+	if homeserverURL != cfg.Homeserver {
+		log.Printf("matrix: homeserver %q resolved to %s", cfg.Homeserver, homeserverURL)
+	}
+
+	client, err := mautrix.NewClient(homeserverURL, id.UserID(cfg.UserID), cfg.AccessToken)
 	if err != nil {
 		bot.newClientErr = err
 		return bot

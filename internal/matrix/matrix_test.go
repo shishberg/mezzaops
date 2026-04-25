@@ -629,3 +629,97 @@ func TestNew_DefaultsCommandPrefix(t *testing.T) {
 	bot := New(Config{Homeserver: "https://example.org", UserID: "@bot:example.org"}, "/tmp", newMockServiceManager())
 	assert.Equal(t, "!mezzaops", bot.CommandPrefix())
 }
+
+// --- Homeserver resolution tests ---
+
+func TestResolveHomeserverURL_PassesThroughHTTPSURL(t *testing.T) {
+	called := false
+	discover := func(string) (*mautrix.ClientWellKnown, error) {
+		called = true
+		return nil, nil
+	}
+	got, err := resolveHomeserverURL("https://matrix.example.org", discover)
+	require.NoError(t, err)
+	assert.Equal(t, "https://matrix.example.org", got)
+	assert.False(t, called, "discover must not be called for full URL input")
+}
+
+func TestResolveHomeserverURL_PassesThroughHTTPURL(t *testing.T) {
+	called := false
+	discover := func(string) (*mautrix.ClientWellKnown, error) {
+		called = true
+		return nil, nil
+	}
+	got, err := resolveHomeserverURL("http://localhost:8008", discover)
+	require.NoError(t, err)
+	assert.Equal(t, "http://localhost:8008", got)
+	assert.False(t, called, "discover must not be called for full URL input")
+}
+
+func TestResolveHomeserverURL_ResolvesServerNameViaWellKnown(t *testing.T) {
+	var gotName string
+	discover := func(serverName string) (*mautrix.ClientWellKnown, error) {
+		gotName = serverName
+		return &mautrix.ClientWellKnown{
+			Homeserver: mautrix.HomeserverInfo{BaseURL: "https://matrix.example.org"},
+		}, nil
+	}
+	got, err := resolveHomeserverURL("example.org", discover)
+	require.NoError(t, err)
+	assert.Equal(t, "https://matrix.example.org", got)
+	assert.Equal(t, "example.org", gotName)
+}
+
+func TestResolveHomeserverURL_FallsBackWhenNoWellKnown(t *testing.T) {
+	// mautrix.DiscoverClientAPI returns (nil, nil) when the server's
+	// .well-known endpoint responds with 404 — i.e. no discovery info
+	// published. The helper must fall back to https://<serverName>.
+	discover := func(string) (*mautrix.ClientWellKnown, error) {
+		return nil, nil
+	}
+	got, err := resolveHomeserverURL("example.org", discover)
+	require.NoError(t, err)
+	assert.Equal(t, "https://example.org", got)
+}
+
+func TestResolveHomeserverURL_ErrorsWhenWellKnownEmptyBaseURL(t *testing.T) {
+	// A 200 with an empty m.homeserver.base_url is FAIL_ERROR in the Matrix
+	// client-server discovery spec, distinct from the 404 → FAIL_PROMPT
+	// fallback. Surface it instead of silently sending the bot to the apex.
+	discover := func(string) (*mautrix.ClientWellKnown, error) {
+		return &mautrix.ClientWellKnown{}, nil
+	}
+	_, err := resolveHomeserverURL("example.org", discover)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "example.org")
+	assert.Contains(t, err.Error(), "base_url")
+}
+
+func TestResolveHomeserverURL_PropagatesDiscoverError(t *testing.T) {
+	discoverErr := fmt.Errorf("network exploded")
+	discover := func(string) (*mautrix.ClientWellKnown, error) {
+		return nil, discoverErr
+	}
+	_, err := resolveHomeserverURL("example.org", discover)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, discoverErr)
+	assert.Contains(t, err.Error(), `"example.org"`)
+}
+
+func TestNew_ResolvesServerName(t *testing.T) {
+	prev := discoverClientAPI
+	discoverClientAPI = func(serverName string) (*mautrix.ClientWellKnown, error) {
+		assert.Equal(t, "example.org", serverName)
+		return &mautrix.ClientWellKnown{
+			Homeserver: mautrix.HomeserverInfo{BaseURL: "https://matrix.example.org"},
+		}, nil
+	}
+	t.Cleanup(func() { discoverClientAPI = prev })
+
+	bot := New(Config{Homeserver: "example.org", UserID: "@bot:example.org"}, "/tmp", newMockServiceManager())
+
+	require.NoError(t, bot.newClientErr)
+	require.NotNil(t, bot.realClient)
+	require.NotNil(t, bot.realClient.HomeserverURL)
+	assert.Equal(t, "https://matrix.example.org", bot.realClient.HomeserverURL.String())
+}
