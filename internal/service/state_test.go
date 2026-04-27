@@ -108,14 +108,14 @@ func TestLoadStateReturnsRawBytes(t *testing.T) {
 	}
 
 	// Verify raw contains the full JSON
-	var m map[string]interface{}
+	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
 		t.Fatal(err)
 	}
 	if m["status"] != "running" {
 		t.Fatalf("raw should contain status, got %v", m)
 	}
-	backend, ok := m["backend"].(map[string]interface{})
+	backend, ok := m["backend"].(map[string]any)
 	if !ok {
 		t.Fatal("raw should contain backend object")
 	}
