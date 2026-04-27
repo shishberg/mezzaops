@@ -2,6 +2,7 @@ package discord
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/bwmarrin/discordgo"
@@ -372,7 +373,7 @@ func TestNotifier_DeployFailed_LargeOutputTruncated(t *testing.T) {
 	const tailMarker = "===FINAL_ERROR_MARKER_AT_TAIL==="
 	// Build ~50 KB of "x\n" plus a distinctive tail that must survive.
 	buf := make([]byte, 0, 50001+len(tailMarker))
-	for i := 0; i < 25000; i++ {
+	for range 25000 {
 		buf = append(buf, 'x', '\n')
 	}
 	buf = append(buf, tailMarker...)
@@ -446,10 +447,7 @@ func TestNotifier_WebhookReceived_LongCommitMsg(t *testing.T) {
 	n := &Notifier{
 		sendFunc: func(msg string) { sent = msg },
 	}
-	long := ""
-	for i := 0; i < 400; i++ {
-		long += "x"
-	}
+	long := strings.Repeat("x", 400)
 	n.WebhookReceived("api", service.WebhookInfo{
 		Repo:      "acme/myapp",
 		Branch:    "main",
