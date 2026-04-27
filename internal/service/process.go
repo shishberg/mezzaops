@@ -323,16 +323,12 @@ func (p *ProcessBackend) IsRunning() bool {
 	return p.isRunning()
 }
 
-// WaitForExit returns a channel that is closed when the process exits.
+// WaitForExit returns a channel that is closed when the running process exits.
+// Returns nil if no process is running, which makes the channel effectively
+// disabled in a select (a nil channel blocks forever).
 func (p *ProcessBackend) WaitForExit() <-chan struct{} {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.done == nil {
-		// Return a closed channel if not running
-		ch := make(chan struct{})
-		close(ch)
-		return ch
-	}
 	return p.done
 }
 

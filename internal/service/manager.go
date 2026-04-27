@@ -80,6 +80,10 @@ func NewManager(cfg *config.Config, services []config.ServiceConfig, notifier No
 	if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
 		return nil, fmt.Errorf("create log dir: %w", err)
 	}
+	// TODO: take an exclusive flock or pidfile on cfg.StateDir here to prevent
+	// a second mezzaops instance from adopting/killing the same processes.
+	// We hit this in production: a stale binary kept running alongside the live
+	// one and killed adopted services out from under it.
 	if err := os.MkdirAll(cfg.StateDir, 0755); err != nil {
 		return nil, fmt.Errorf("create state dir: %w", err)
 	}

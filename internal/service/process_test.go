@@ -230,6 +230,35 @@ func TestProcessBackend_WaitForExit(t *testing.T) {
 	}
 }
 
+func TestProcessBackend_WaitForExit_BeforeStartDoesNotFire(t *testing.T) {
+	b := newTestBackend(t, []string{"sleep", "3600"}, "")
+
+	ch := b.WaitForExit()
+	select {
+	case <-ch:
+		t.Fatal("WaitForExit fired before Start was ever called")
+	case <-time.After(50 * time.Millisecond):
+		// expected: nothing fires
+	}
+}
+
+func TestProcessBackend_WaitForExit_AfterFailedStartDoesNotFire(t *testing.T) {
+	// No entrypoint and no cmd -> Start returns an error and never sets p.done.
+	b := NewProcessBackend("test", t.TempDir(), nil, "", t.TempDir())
+
+	if err := b.Start(context.Background()); err == nil {
+		t.Fatal("expected Start to fail when no entrypoint/cmd is configured")
+	}
+
+	ch := b.WaitForExit()
+	select {
+	case <-ch:
+		t.Fatal("WaitForExit fired after a failed Start")
+	case <-time.After(50 * time.Millisecond):
+		// expected: nothing fires
+	}
+}
+
 func TestProcessBackend_SaveBackendStateRoundTrip(t *testing.T) {
 	b := newTestBackend(t, []string{"sleep", "3600"}, "")
 	ctx := context.Background()
