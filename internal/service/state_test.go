@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -156,5 +157,35 @@ func TestStateWithDeployFields(t *testing.T) {
 	}
 	if got.FailedStep != "build" {
 		t.Fatalf("FailedStep: got %q", got.FailedStep)
+	}
+}
+
+func TestState_ZeroTimesAreOmittedFromJSON(t *testing.T) {
+	s := State{Status: "running"} // zero LastDeploy, zero LastRestart
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if strings.Contains(got, "last_deploy") {
+		t.Errorf("zero LastDeploy should be omitted, got: %s", got)
+	}
+	if strings.Contains(got, "last_restart") {
+		t.Errorf("zero LastRestart should be omitted, got: %s", got)
+	}
+}
+
+func TestServiceState_ZeroTimesAreOmittedFromJSON(t *testing.T) {
+	s := ServiceState{Status: "running"}
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if strings.Contains(got, "last_deploy") {
+		t.Errorf("zero LastDeploy should be omitted, got: %s", got)
+	}
+	if strings.Contains(got, "last_restart") {
+		t.Errorf("zero LastRestart should be omitted, got: %s", got)
 	}
 }

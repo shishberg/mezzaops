@@ -10,8 +10,8 @@ import (
 // State represents the persisted state of a managed service.
 type State struct {
 	Status      string          `json:"status"`
-	LastDeploy  time.Time       `json:"last_deploy,omitempty"`
-	LastRestart time.Time       `json:"last_restart,omitempty"`
+	LastDeploy  time.Time       `json:"last_deploy,omitzero"`
+	LastRestart time.Time       `json:"last_restart,omitzero"`
 	LastResult  string          `json:"last_result,omitempty"`
 	LastOutput  string          `json:"last_output,omitempty"`
 	FailedStep  string          `json:"failed_step,omitempty"`

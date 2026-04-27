@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,8 +30,8 @@ type syncOp struct {
 // ServiceState holds the current state of a managed service.
 type ServiceState struct {
 	Status      string    `json:"status"`
-	LastDeploy  time.Time `json:"last_deploy,omitempty"`
-	LastRestart time.Time `json:"last_restart,omitempty"`
+	LastDeploy  time.Time `json:"last_deploy,omitzero"`
+	LastRestart time.Time `json:"last_restart,omitzero"`
 	LastResult  string    `json:"last_result,omitempty"`
 	LastOutput  string    `json:"last_output,omitempty"`
 	FailedStep  string    `json:"failed_step,omitempty"`
@@ -655,9 +656,7 @@ func (m *Manager) SetOnChange(fn func(name, event string)) {
 func (m *Manager) GetAllStates() map[string]ServiceState {
 	m.mu.Lock()
 	services := make(map[string]*managedService, len(m.services))
-	for name, ms := range m.services {
-		services[name] = ms
-	}
+	maps.Copy(services, m.services)
 	m.mu.Unlock()
 
 	result := make(map[string]ServiceState, len(services))
