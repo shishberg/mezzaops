@@ -352,6 +352,7 @@ func (p *ProcessBackend) pollAlive(pid int, done chan struct{}) {
 			p.pid = 0
 			p.pgid = 0
 			p.process = nil
+			p.done = nil
 			p.mu.Unlock()
 			close(done)
 			return

@@ -237,7 +237,7 @@ func TestProcessBackend_WaitForExit_BeforeStartDoesNotFire(t *testing.T) {
 	select {
 	case <-ch:
 		t.Fatal("WaitForExit fired before Start was ever called")
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond):
 		// expected: nothing fires
 	}
 }
@@ -254,7 +254,7 @@ func TestProcessBackend_WaitForExit_AfterFailedStartDoesNotFire(t *testing.T) {
 	select {
 	case <-ch:
 		t.Fatal("WaitForExit fired after a failed Start")
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond):
 		// expected: nothing fires
 	}
 }
