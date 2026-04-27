@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +41,21 @@ func TestProcessBackend_StartAndStatus(t *testing.T) {
 	}
 
 	t.Cleanup(func() { _ = b.Stop(context.Background()) })
+}
+
+func TestProcessBackend_Start_CreatesMissingLogDir(t *testing.T) {
+	logDir := filepath.Join(t.TempDir(), "missing-subdir")
+	b := NewProcessBackend("test", t.TempDir(), []string{"true"}, "", logDir)
+	ctx := context.Background()
+
+	if err := b.Start(ctx); err != nil {
+		t.Fatalf("Start with missing log dir should succeed, got %v", err)
+	}
+	t.Cleanup(func() { _ = b.Stop(context.Background()) })
+
+	if _, err := os.Stat(logDir); err != nil {
+		t.Fatalf("log dir should exist after Start, got %v", err)
+	}
 }
 
 func TestProcessBackend_Stop(t *testing.T) {

@@ -80,6 +80,9 @@ func (p *ProcessBackend) Start(ctx context.Context) error {
 
 	// Create log file with temp name (we don't know PID yet)
 	tmpPath := filepath.Join(p.logDir, p.name+".starting.log")
+	if err := os.MkdirAll(p.logDir, 0755); err != nil {
+		return fmt.Errorf("creating log dir: %w", err)
+	}
 	logFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("creating log file: %w", err)
