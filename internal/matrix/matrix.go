@@ -1,8 +1,10 @@
 // Package matrix is a Matrix chat frontend for mezzaops, parallel to the
 // Mattermost and Discord frontends. It listens for command-prefixed messages
 // in one configured room, dispatches them to the service manager, and posts
-// notifications to the same room. End-to-end encryption is handled
-// transparently by mautrix's cryptohelper using an on-disk SQLite store.
+// notifications to the same room. The Matrix runtime — sync loop, crypto,
+// invite handling, dispatch — comes from github.com/shishberg/matrixbot;
+// this package adds mezzaops-specific glue (homeserver discovery, alias
+// resolution, command parsing, dispatch to the service manager).
 package matrix
 
 import (
@@ -15,11 +17,9 @@ import (
 	"strings"
 
 	"github.com/rs/zerolog"
+	"github.com/shishberg/matrixbot"
 	"github.com/shishberg/mezzaops/internal/service"
 	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/crypto/cryptohelper"
-	"maunium.net/go/mautrix/event"
-	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/id"
 )
 
@@ -84,12 +84,10 @@ type Config struct {
 	PickleKey   string
 }
 
-// matrixClient is the slice of *mautrix.Client used by the bot. The real
-// client satisfies it; tests pass a fake so they can exercise dispatch and
-// invite handling without a live homeserver.
-type matrixClient interface {
-	SendMessageEvent(ctx context.Context, roomID id.RoomID, eventType event.Type, contentJSON interface{}, extra ...mautrix.ReqSendEvent) (*mautrix.RespSendEvent, error)
-	JoinRoomByID(ctx context.Context, roomID id.RoomID) (*mautrix.RespJoinRoom, error)
+// aliasResolver is the slice of *mautrix.Client used to turn a #alias into a
+// !roomID. Defined as an interface so tests can supply a fake without a live
+// homeserver.
+type aliasResolver interface {
 	ResolveAlias(ctx context.Context, alias id.RoomAlias) (*mautrix.RespAliasResolve, error)
 }
 
@@ -99,23 +97,41 @@ var validCommands = []string{
 	"deploy", "confirm", "reload", "start-all", "stop-all",
 }
 
-// Bot is the Matrix frontend.
+// Bot is the Matrix frontend. It wraps a *matrixbot.Bot — the runtime that
+// owns the mautrix client, sync loop, crypto helper, and event dispatch — and
+// adds mezzaops-specific behaviour (alias resolution, command dispatch,
+// outbound post helper).
 type Bot struct {
-	cfg     Config
-	manager ServiceManager
-	confirm ConfirmHandler
+	cfg      Config
+	manager  ServiceManager
+	confirm  ConfirmHandler
+	stateDir string
 
-	// client is the abstracted slice we call: tests pass a fake. realClient
-	// is the same *mautrix.Client (when not under test); we keep the typed
-	// reference so we can set Crypto, register Sync handlers, and call
-	// SyncWithContext, which the abstraction deliberately does not expose.
-	client       matrixClient
-	realClient   *mautrix.Client
-	newClientErr error
-	stateDir     string
-	userID       id.UserID
-	roomID       id.RoomID
-	readyCh      chan struct{}
+	// resolvedHomeserver is the URL we hand to matrixbot.NewBot. Computed at
+	// construction time via /.well-known/matrix/client when cfg.Homeserver is
+	// a bare server name.
+	resolvedHomeserver string
+	// newErr captures any setup failure encountered in New (homeserver
+	// discovery). Surfaced from Run so the surface matches the Mattermost
+	// frontend, where construction never returns an error.
+	newErr error
+
+	// aliasClient resolves room aliases to room IDs before the bot starts.
+	// matrixbot doesn't do alias resolution, so we do it here. A standalone
+	// mautrix.Client is cheap to build for this single call. Tests inject a
+	// fake.
+	aliasClient aliasResolver
+
+	// roomID is the resolved !room ID, populated in Run by resolveRoom.
+	// Used by PostMessage to address outbound notifications.
+	roomID id.RoomID
+
+	// matrixBot is the underlying runtime. Constructed lazily in Run, since
+	// matrixbot.NewBot needs the resolved room ID for AutoJoinRooms and the
+	// route registration.
+	matrixBot *matrixbot.Bot
+
+	readyCh chan struct{}
 }
 
 // discoverFunc resolves a Matrix server name to its client-server API
@@ -158,8 +174,8 @@ func resolveHomeserverURL(homeserver string, discover discoverFunc) (string, err
 	return wk.Homeserver.BaseURL, nil
 }
 
-// New constructs a Bot. The real connection, alias resolution, and crypto
-// bootstrap happen in Run; the only I/O performed here is the optional
+// New constructs a Bot. The actual matrixbot runtime, alias resolution, and
+// crypto bootstrap happen in Run; the only I/O performed here is the optional
 // /.well-known/matrix/client lookup when cfg.Homeserver is a bare server
 // name. stateDir is used to derive the default crypto database path when
 // cfg.CryptoDB is empty.
@@ -178,30 +194,28 @@ func New(cfg Config, stateDir string, manager ServiceManager) *Bot {
 		cfg:      cfg,
 		manager:  manager,
 		stateDir: stateDir,
-		userID:   id.UserID(cfg.UserID),
 		readyCh:  make(chan struct{}),
 	}
 
 	homeserverURL, err := resolveHomeserverURL(cfg.Homeserver, discoverClientAPI)
 	if err != nil {
-		bot.newClientErr = err
+		bot.newErr = err
 		return bot
 	}
 	if homeserverURL != cfg.Homeserver {
 		log.Printf("matrix: homeserver %q resolved to %s", cfg.Homeserver, homeserverURL)
 	}
+	bot.resolvedHomeserver = homeserverURL
 
+	// Build a thin mautrix.Client for the alias-resolution call performed in
+	// Run. matrixbot owns the real client used for sync and sending; this one
+	// is only ever used for the single ResolveAlias roundtrip.
 	client, err := mautrix.NewClient(homeserverURL, id.UserID(cfg.UserID), cfg.AccessToken)
 	if err != nil {
-		bot.newClientErr = err
+		bot.newErr = err
 		return bot
 	}
-	client.DeviceID = id.DeviceID(cfg.DeviceID)
-	// Route mautrix's internal logs to stderr so they land alongside the
-	// standard library log output the rest of mezzaops uses.
-	client.Log = zerolog.New(os.Stderr).Level(zerolog.InfoLevel).With().Timestamp().Logger()
-	bot.client = client
-	bot.realClient = client
+	bot.aliasClient = client
 	return bot
 }
 
@@ -213,18 +227,19 @@ func (b *Bot) SetConfirmHandler(ch ConfirmHandler) { b.confirm = ch }
 // the bot will actually match.
 func (b *Bot) CommandPrefix() string { return b.cfg.CommandPrefix }
 
-// Ready closes once Run has resolved the room and finished the crypto
-// bootstrap, so callers know it is safe to call PostMessage.
+// Ready closes once Run has resolved the room and constructed the underlying
+// matrixbot runtime, so callers know it is safe to call PostMessage.
 func (b *Bot) Ready() <-chan struct{} { return b.readyCh }
 
-// Run resolves the configured room, initialises crypto, registers sync
-// handlers, and blocks on SyncWithContext until ctx is cancelled. mautrix
-// reconnects internally; an error here means the loop exited for good.
+// Run resolves the configured room, hands credentials to matrixbot, registers
+// the command route, and blocks on matrixbot.Bot.Run until ctx is cancelled.
+// matrixbot reconnects internally; an error here means the loop exited for
+// good.
 func (b *Bot) Run(ctx context.Context) error {
-	if b.newClientErr != nil {
-		return fmt.Errorf("matrix client: %w", b.newClientErr)
+	if b.newErr != nil {
+		return fmt.Errorf("matrix client: %w", b.newErr)
 	}
-	if b.realClient == nil {
+	if b.aliasClient == nil {
 		return fmt.Errorf("matrix client not initialised")
 	}
 
@@ -237,32 +252,32 @@ func (b *Bot) Run(ctx context.Context) error {
 		cryptoDB = filepath.Join(b.stateDir, "matrix-crypto.db")
 	}
 
-	helper, err := cryptohelper.NewCryptoHelper(b.realClient, []byte(b.cfg.PickleKey), cryptoDB)
-	if err != nil {
-		return fmt.Errorf("creating crypto helper: %w", err)
-	}
-	if err := helper.Init(ctx); err != nil {
-		return fmt.Errorf("initialising crypto helper: %w", err)
-	}
-	b.realClient.Crypto = helper
+	// Plumb the existing zerolog/stderr pattern into matrixbot so its mautrix
+	// client logs land alongside the rest of mezzaops's stderr output.
+	logger := zerolog.New(os.Stderr).Level(zerolog.InfoLevel).With().Timestamp().Logger()
 
-	syncer, ok := b.realClient.Syncer.(*mautrix.DefaultSyncer)
-	if !ok {
-		return fmt.Errorf("unexpected syncer type %T", b.realClient.Syncer)
+	mbBot, err := matrixbot.NewBot(matrixbot.BotConfig{
+		Homeserver:    b.resolvedHomeserver,
+		UserID:        id.UserID(b.cfg.UserID),
+		DeviceID:      id.DeviceID(b.cfg.DeviceID),
+		AccessToken:   b.cfg.AccessToken,
+		PickleKey:     b.cfg.PickleKey,
+		CryptoDB:      cryptoDB,
+		AutoJoinRooms: []id.RoomID{b.roomID},
+		Logger:        &logger,
+	})
+	if err != nil {
+		return fmt.Errorf("creating matrixbot: %w", err)
 	}
-	syncer.OnEventType(event.EventMessage, b.handleMessage)
-	syncer.OnEventType(event.StateMember, b.handleInvite)
+	mbBot.RouteIn(b.roomID,
+		matrixbot.CommandTrigger{Prefix: b.cfg.CommandPrefix, BotUserID: id.UserID(b.cfg.UserID)},
+		matrixbot.HandlerFunc(b.handleCommand),
+	)
+	b.matrixBot = mbBot
 
 	close(b.readyCh)
 
-	syncErr := b.realClient.SyncWithContext(ctx)
-	if cerr := helper.Close(); cerr != nil {
-		log.Printf("matrix: closing crypto helper: %v", cerr)
-	}
-	if ctx.Err() != nil {
-		return nil
-	}
-	return syncErr
+	return mbBot.Run(ctx)
 }
 
 // resolveRoom turns either a room ID (!) or a room alias (#) into the
@@ -274,7 +289,7 @@ func (b *Bot) resolveRoom(ctx context.Context) error {
 		b.roomID = id.RoomID(room)
 		return nil
 	case strings.HasPrefix(room, "#"):
-		resp, err := b.client.ResolveAlias(ctx, id.RoomAlias(room))
+		resp, err := b.aliasClient.ResolveAlias(ctx, id.RoomAlias(room))
 		if err != nil {
 			return fmt.Errorf("resolving alias %q: %w", room, err)
 		}
@@ -285,68 +300,37 @@ func (b *Bot) resolveRoom(ctx context.Context) error {
 	}
 }
 
-// PostMessage renders the markdown to HTML and sends it to the configured
-// room. mautrix transparently encrypts when client.Crypto is set and the room
-// is encrypted. Errors are logged, not returned, since notifier callers don't
-// have a place to surface them.
+// handleCommand is the matrixbot.Handler that wraps mezzaops's dispatchCommand.
+// CommandTrigger has already stripped the prefix and trimmed whitespace, so
+// req.Input is the action-and-optional-service tail (e.g. "deploy myapp").
+func (b *Bot) handleCommand(_ context.Context, req matrixbot.Request) (matrixbot.Response, error) {
+	fields := strings.Fields(req.Input)
+	if len(fields) == 0 {
+		return matrixbot.Response{}, nil
+	}
+	cmd := &Command{Action: fields[0]}
+	if len(fields) >= 2 {
+		cmd.Service = fields[1]
+	}
+	return matrixbot.Response{Reply: b.dispatchCommand(cmd)}, nil
+}
+
+// PostMessage sends markdown to the configured room via matrixbot.Bot.Send.
+// Errors are logged, not returned, since notifier callers don't have a place
+// to surface them.
 //
-// Drops the message if called before Run has completed setup: client is nil
-// when mautrix.NewClient failed in New, and roomID is unset until resolveRoom
-// runs. The bot is appended to the manager's notifier list during app.New, so
-// either condition is reachable before Run finishes (or at all, if it
-// errored).
+// Drops the message if called before Run has constructed the matrixbot
+// runtime: matrixBot is nil when New failed or Run hasn't reached the
+// post-construction point. The bot is appended to the manager's notifier list
+// during app.New, so either condition is reachable before Run completes (or
+// at all, if it errored).
 func (b *Bot) PostMessage(ctx context.Context, message string) {
-	if b.client == nil || b.roomID == "" {
+	if b.matrixBot == nil || b.roomID == "" {
 		log.Printf("matrix: PostMessage called before bot is ready, dropping message")
 		return
 	}
-	content := format.RenderMarkdown(message, true, false)
-	content.MsgType = event.MsgText
-	content.Body = message
-	content.Format = event.FormatHTML
-	if _, err := b.client.SendMessageEvent(ctx, b.roomID, event.EventMessage, content); err != nil {
+	if err := b.matrixBot.Send(ctx, b.roomID, message); err != nil {
 		log.Printf("matrix: send message: %v", err)
-	}
-}
-
-// handleMessage filters to the configured room, ignores our own messages,
-// parses the command, and posts the response back.
-func (b *Bot) handleMessage(ctx context.Context, evt *event.Event) {
-	if evt.RoomID != b.roomID {
-		return
-	}
-	if evt.Sender == b.userID {
-		return
-	}
-	mec, ok := evt.Content.Parsed.(*event.MessageEventContent)
-	if !ok || mec == nil {
-		return
-	}
-	cmd := ParseCommand(mec.Body, b.cfg.CommandPrefix)
-	if cmd == nil {
-		return
-	}
-	b.PostMessage(ctx, b.dispatchCommand(cmd))
-}
-
-// handleInvite auto-joins only when the invite is for our user and the
-// configured room. Invites to any other room are ignored.
-func (b *Bot) handleInvite(ctx context.Context, evt *event.Event) {
-	if evt.RoomID != b.roomID {
-		return
-	}
-	if evt.GetStateKey() != string(b.userID) {
-		return
-	}
-	mec, ok := evt.Content.Parsed.(*event.MemberEventContent)
-	if !ok || mec == nil {
-		return
-	}
-	if mec.Membership != event.MembershipInvite {
-		return
-	}
-	if _, err := b.client.JoinRoomByID(ctx, evt.RoomID); err != nil {
-		log.Printf("matrix: join room %s: %v", evt.RoomID, err)
 	}
 }
 

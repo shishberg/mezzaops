@@ -1,7 +1,9 @@
 package matrix
 
 import (
+	"context"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/shishberg/mezzaops/internal/service"
@@ -9,61 +11,71 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func notifierBot(t *testing.T) (*Bot, *fakeMatrixClient) {
-	t.Helper()
-	fake := newFakeMatrixClient()
-	bot := botForTest(t, fake, newMockServiceManager(), nil)
-	return bot, fake
+// fakeSender captures messages handed to PostMessage so notifier tests can
+// assert what the Notifier sends without standing up a Bot or mautrix client.
+type fakeSender struct {
+	mu       sync.Mutex
+	messages []string
+}
+
+func (f *fakeSender) PostMessage(_ context.Context, message string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.messages = append(f.messages, message)
+}
+
+func (f *fakeSender) sent() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.messages))
+	copy(out, f.messages)
+	return out
 }
 
 func TestNotifier_ServiceEvent(t *testing.T) {
-	bot, fake := notifierBot(t)
-	NewNotifier(bot).ServiceEvent("myapp", "started")
+	fake := &fakeSender{}
+	NewNotifier(fake).ServiceEvent("myapp", "started")
 
-	sends := fake.getSends()
-	require.Len(t, sends, 1)
-	body := messageBody(t, sends[0])
-	assert.Contains(t, body, "myapp")
-	assert.Contains(t, body, "started")
+	sent := fake.sent()
+	require.Len(t, sent, 1)
+	assert.Contains(t, sent[0], "myapp")
+	assert.Contains(t, sent[0], "started")
 }
 
 func TestNotifier_DeployStarted(t *testing.T) {
-	bot, fake := notifierBot(t)
-	NewNotifier(bot).DeployStarted("myapp")
+	fake := &fakeSender{}
+	NewNotifier(fake).DeployStarted("myapp")
 
-	sends := fake.getSends()
-	require.Len(t, sends, 1)
-	body := messageBody(t, sends[0])
-	assert.Contains(t, body, "Deploying")
-	assert.Contains(t, body, "myapp")
+	sent := fake.sent()
+	require.Len(t, sent, 1)
+	assert.Contains(t, sent[0], "Deploying")
+	assert.Contains(t, sent[0], "myapp")
 }
 
 func TestNotifier_DeploySucceeded(t *testing.T) {
-	bot, fake := notifierBot(t)
-	NewNotifier(bot).DeploySucceeded("myapp", "build output")
+	fake := &fakeSender{}
+	NewNotifier(fake).DeploySucceeded("myapp", "build output")
 
-	sends := fake.getSends()
-	require.Len(t, sends, 1)
-	body := messageBody(t, sends[0])
-	assert.Contains(t, body, "succeeded")
-	assert.Contains(t, body, "myapp")
+	sent := fake.sent()
+	require.Len(t, sent, 1)
+	assert.Contains(t, sent[0], "succeeded")
+	assert.Contains(t, sent[0], "myapp")
 }
 
 func TestNotifier_DeployFailed(t *testing.T) {
-	bot, fake := notifierBot(t)
-	NewNotifier(bot).DeployFailed("myapp", "build", "error output")
+	fake := &fakeSender{}
+	NewNotifier(fake).DeployFailed("myapp", "build", "error output")
 
-	sends := fake.getSends()
-	require.Len(t, sends, 1)
-	body := messageBody(t, sends[0])
-	assert.Contains(t, body, "failed")
-	assert.Contains(t, body, "myapp")
-	assert.Contains(t, body, "build")
-	assert.Contains(t, body, "error output")
+	sent := fake.sent()
+	require.Len(t, sent, 1)
+	assert.Contains(t, sent[0], "failed")
+	assert.Contains(t, sent[0], "myapp")
+	assert.Contains(t, sent[0], "build")
+	assert.Contains(t, sent[0], "error output")
 }
 
 func TestNotifier_DeployFailed_LargeOutputTruncated(t *testing.T) {
-	bot, fake := notifierBot(t)
+	fake := &fakeSender{}
 
 	// Build ~50 KB of "x\n", plus a distinctive tail that must survive
 	// truncation since real failures put the error at the end.
@@ -75,11 +87,11 @@ func TestNotifier_DeployFailed_LargeOutputTruncated(t *testing.T) {
 	b.WriteString(tailMarker)
 	output := b.String()
 
-	NewNotifier(bot).DeployFailed("slurp", "go test ./...", output)
+	NewNotifier(fake).DeployFailed("slurp", "go test ./...", output)
 
-	sends := fake.getSends()
-	require.Len(t, sends, 1)
-	body := messageBody(t, sends[0])
+	sent := fake.sent()
+	require.Len(t, sent, 1)
+	body := sent[0]
 
 	runes := len([]rune(body))
 	assert.LessOrEqual(t, runes, matrixMaxRunes,
@@ -101,8 +113,8 @@ func tailRunes(s string, n int) string {
 }
 
 func TestNotifier_WebhookReceived_Full(t *testing.T) {
-	bot, fake := notifierBot(t)
-	NewNotifier(bot).WebhookReceived("myapp", service.WebhookInfo{
+	fake := &fakeSender{}
+	NewNotifier(fake).WebhookReceived("myapp", service.WebhookInfo{
 		Repo:      "acme/myapp",
 		Branch:    "main",
 		Compare:   "https://github.com/acme/myapp/compare/abc...def",
@@ -114,9 +126,9 @@ func TestNotifier_WebhookReceived_Full(t *testing.T) {
 		Timestamp: "2026-04-10T12:34:56Z",
 	})
 
-	sends := fake.getSends()
-	require.Len(t, sends, 1)
-	body := messageBody(t, sends[0])
+	sent := fake.sent()
+	require.Len(t, sent, 1)
+	body := sent[0]
 	assert.Contains(t, body, "myapp")
 	assert.Contains(t, body, "acme/myapp")
 	assert.Contains(t, body, "main")
@@ -129,16 +141,16 @@ func TestNotifier_WebhookReceived_Full(t *testing.T) {
 }
 
 func TestNotifier_WebhookReceived_NoHeadCommit(t *testing.T) {
-	bot, fake := notifierBot(t)
-	NewNotifier(bot).WebhookReceived("myapp", service.WebhookInfo{
+	fake := &fakeSender{}
+	NewNotifier(fake).WebhookReceived("myapp", service.WebhookInfo{
 		Repo:   "acme/myapp",
 		Branch: "main",
 		Pusher: "alice",
 	})
 
-	sends := fake.getSends()
-	require.Len(t, sends, 1)
-	body := messageBody(t, sends[0])
+	sent := fake.sent()
+	require.Len(t, sent, 1)
+	body := sent[0]
 	assert.Contains(t, body, "myapp")
 	assert.Contains(t, body, "main")
 	assert.Contains(t, body, "alice")

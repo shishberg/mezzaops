@@ -8,11 +8,11 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/shishberg/matrixbot"
 	"github.com/shishberg/mezzaops/internal/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
 
@@ -56,7 +56,7 @@ func TestParseCommand_CustomPrefix(t *testing.T) {
 	assert.Equal(t, &Command{Action: "deploy", Service: "svc"}, got)
 }
 
-// --- Mocks for dispatch / handle tests ---
+// --- Mocks for dispatch tests ---
 
 type mockServiceManager struct {
 	mu          sync.Mutex
@@ -164,102 +164,16 @@ func (h *mockConfirmHandler) getLastService() string {
 	return h.lastService
 }
 
-// fakeMatrixClient captures method calls and returns canned responses.
-type fakeMatrixClient struct {
-	mu sync.Mutex
-
-	// Captured sends.
-	sends []sentMessage
-	// Captured joins.
-	joins []id.RoomID
-
-	// Optional canned outputs.
-	resolveAlias map[id.RoomAlias]id.RoomID
-	resolveErr   error
-	sendErr      error
-	joinErr      error
-}
-
-type sentMessage struct {
-	RoomID  id.RoomID
-	Type    event.Type
-	Content interface{}
-}
-
-func newFakeMatrixClient() *fakeMatrixClient {
-	return &fakeMatrixClient{
-		resolveAlias: make(map[id.RoomAlias]id.RoomID),
-	}
-}
-
-func (f *fakeMatrixClient) SendMessageEvent(_ context.Context, roomID id.RoomID, eventType event.Type, contentJSON interface{}, _ ...mautrix.ReqSendEvent) (*mautrix.RespSendEvent, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.sendErr != nil {
-		return nil, f.sendErr
-	}
-	f.sends = append(f.sends, sentMessage{RoomID: roomID, Type: eventType, Content: contentJSON})
-	return &mautrix.RespSendEvent{}, nil
-}
-
-func (f *fakeMatrixClient) JoinRoomByID(_ context.Context, roomID id.RoomID) (*mautrix.RespJoinRoom, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.joinErr != nil {
-		return nil, f.joinErr
-	}
-	f.joins = append(f.joins, roomID)
-	return &mautrix.RespJoinRoom{RoomID: roomID}, nil
-}
-
-func (f *fakeMatrixClient) ResolveAlias(_ context.Context, alias id.RoomAlias) (*mautrix.RespAliasResolve, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.resolveErr != nil {
-		return nil, f.resolveErr
-	}
-	if rid, ok := f.resolveAlias[alias]; ok {
-		return &mautrix.RespAliasResolve{RoomID: rid}, nil
-	}
-	return nil, fmt.Errorf("no canned response for alias %s", alias)
-}
-
-func (f *fakeMatrixClient) getSends() []sentMessage {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]sentMessage, len(f.sends))
-	copy(out, f.sends)
-	return out
-}
-
-func (f *fakeMatrixClient) getJoins() []id.RoomID {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]id.RoomID, len(f.joins))
-	copy(out, f.joins)
-	return out
-}
-
-func messageBody(t *testing.T, msg sentMessage) string {
-	t.Helper()
-	mec, ok := msg.Content.(event.MessageEventContent)
-	require.True(t, ok, "expected MessageEventContent, got %T", msg.Content)
-	return mec.Body
-}
-
-// botForTest returns a Bot wired to the fake client and given mocks.
-func botForTest(t *testing.T, fake *fakeMatrixClient, mgr ServiceManager, ch ConfirmHandler) *Bot {
-	t.Helper()
+// botForTest returns a Bot wired with the given mocks, ready for direct
+// dispatch / handleCommand calls without the matrixbot runtime.
+func botForTest(mgr ServiceManager, ch ConfirmHandler) *Bot {
 	return &Bot{
 		cfg: Config{
 			CommandPrefix: "!mezzaops",
 			UserID:        "@bot:example.org",
 		},
-		client:  fake,
 		manager: mgr,
 		confirm: ch,
-		userID:  "@bot:example.org",
-		roomID:  "!room:example.org",
 		readyCh: make(chan struct{}),
 	}
 }
@@ -268,7 +182,7 @@ func botForTest(t *testing.T, fake *fakeMatrixClient, mgr ServiceManager, ch Con
 
 func TestDispatch_StatusOverview(t *testing.T) {
 	mgr := newMockServiceManager()
-	bot := botForTest(t, newFakeMatrixClient(), mgr, nil)
+	bot := botForTest(mgr, nil)
 
 	resp := bot.dispatchCommand(&Command{Action: "status"})
 	assert.Contains(t, resp, "Service Status")
@@ -280,7 +194,7 @@ func TestDispatch_StatusOverview(t *testing.T) {
 func TestDispatch_StatusSingleService(t *testing.T) {
 	mgr := newMockServiceManager()
 	mgr.doResult = "running"
-	bot := botForTest(t, newFakeMatrixClient(), mgr, nil)
+	bot := botForTest(mgr, nil)
 
 	resp := bot.dispatchCommand(&Command{Action: "status", Service: "myapp"})
 	assert.Equal(t, "running", resp)
@@ -292,7 +206,7 @@ func TestDispatch_StartStopRestartLogsPull(t *testing.T) {
 	for _, op := range []string{"start", "stop", "restart", "logs", "pull"} {
 		t.Run(op, func(t *testing.T) {
 			mgr := newMockServiceManager()
-			bot := botForTest(t, newFakeMatrixClient(), mgr, nil)
+			bot := botForTest(mgr, nil)
 
 			resp := bot.dispatchCommand(&Command{Action: op, Service: "myapp"})
 			assert.Equal(t, "ok", resp)
@@ -304,7 +218,7 @@ func TestDispatch_StartStopRestartLogsPull(t *testing.T) {
 
 func TestDispatch_ActionCaseInsensitive(t *testing.T) {
 	mgr := newMockServiceManager()
-	bot := botForTest(t, newFakeMatrixClient(), mgr, nil)
+	bot := botForTest(mgr, nil)
 
 	bot.dispatchCommand(&Command{Action: "START", Service: "myapp"})
 	assert.Equal(t, "start", mgr.getLastOp())
@@ -312,7 +226,7 @@ func TestDispatch_ActionCaseInsensitive(t *testing.T) {
 
 func TestDispatch_Deploy(t *testing.T) {
 	mgr := newMockServiceManager()
-	bot := botForTest(t, newFakeMatrixClient(), mgr, nil)
+	bot := botForTest(mgr, nil)
 
 	resp := bot.dispatchCommand(&Command{Action: "deploy", Service: "myapp"})
 	assert.Contains(t, resp, "Deploy requested")
@@ -323,7 +237,7 @@ func TestDispatch_Deploy(t *testing.T) {
 func TestDispatch_DeployError(t *testing.T) {
 	mgr := newMockServiceManager()
 	mgr.deployErr = fmt.Errorf("service not found")
-	bot := botForTest(t, newFakeMatrixClient(), mgr, nil)
+	bot := botForTest(mgr, nil)
 
 	resp := bot.dispatchCommand(&Command{Action: "deploy", Service: "myapp"})
 	assert.Contains(t, resp, "Deploy error")
@@ -333,7 +247,7 @@ func TestDispatch_DeployError(t *testing.T) {
 func TestDispatch_Confirm(t *testing.T) {
 	mgr := newMockServiceManager()
 	ch := &mockConfirmHandler{result: true}
-	bot := botForTest(t, newFakeMatrixClient(), mgr, ch)
+	bot := botForTest(mgr, ch)
 
 	resp := bot.dispatchCommand(&Command{Action: "confirm", Service: "myapp"})
 	assert.Contains(t, resp, "Confirmed")
@@ -342,14 +256,14 @@ func TestDispatch_Confirm(t *testing.T) {
 
 func TestDispatch_ConfirmNoPending(t *testing.T) {
 	ch := &mockConfirmHandler{result: false}
-	bot := botForTest(t, newFakeMatrixClient(), newMockServiceManager(), ch)
+	bot := botForTest(newMockServiceManager(), ch)
 
 	resp := bot.dispatchCommand(&Command{Action: "confirm", Service: "myapp"})
 	assert.Contains(t, resp, "No pending")
 }
 
 func TestDispatch_ConfirmNoHandler(t *testing.T) {
-	bot := botForTest(t, newFakeMatrixClient(), newMockServiceManager(), nil)
+	bot := botForTest(newMockServiceManager(), nil)
 
 	resp := bot.dispatchCommand(&Command{Action: "confirm", Service: "myapp"})
 	assert.Contains(t, resp, "not configured")
@@ -357,7 +271,7 @@ func TestDispatch_ConfirmNoHandler(t *testing.T) {
 
 func TestDispatch_Reload(t *testing.T) {
 	mgr := newMockServiceManager()
-	bot := botForTest(t, newFakeMatrixClient(), mgr, nil)
+	bot := botForTest(mgr, nil)
 
 	resp := bot.dispatchCommand(&Command{Action: "reload"})
 	assert.Contains(t, resp, "reloaded")
@@ -367,7 +281,7 @@ func TestDispatch_Reload(t *testing.T) {
 func TestDispatch_ReloadError(t *testing.T) {
 	mgr := newMockServiceManager()
 	mgr.reloadErr = fmt.Errorf("bad config")
-	bot := botForTest(t, newFakeMatrixClient(), mgr, nil)
+	bot := botForTest(mgr, nil)
 
 	resp := bot.dispatchCommand(&Command{Action: "reload"})
 	assert.Contains(t, resp, "Reload error")
@@ -376,7 +290,7 @@ func TestDispatch_ReloadError(t *testing.T) {
 
 func TestDispatch_StartAll(t *testing.T) {
 	mgr := newMockServiceManager()
-	bot := botForTest(t, newFakeMatrixClient(), mgr, nil)
+	bot := botForTest(mgr, nil)
 
 	resp := bot.dispatchCommand(&Command{Action: "start-all"})
 	assert.Contains(t, resp, "starting")
@@ -385,7 +299,7 @@ func TestDispatch_StartAll(t *testing.T) {
 
 func TestDispatch_StopAll(t *testing.T) {
 	mgr := newMockServiceManager()
-	bot := botForTest(t, newFakeMatrixClient(), mgr, nil)
+	bot := botForTest(mgr, nil)
 
 	resp := bot.dispatchCommand(&Command{Action: "stop-all"})
 	assert.Contains(t, resp, "stopping")
@@ -393,13 +307,46 @@ func TestDispatch_StopAll(t *testing.T) {
 }
 
 func TestDispatch_Unknown(t *testing.T) {
-	bot := botForTest(t, newFakeMatrixClient(), newMockServiceManager(), nil)
+	bot := botForTest(newMockServiceManager(), nil)
 
 	resp := bot.dispatchCommand(&Command{Action: "foobar"})
 	assert.Contains(t, resp, "Unknown command")
 	assert.Contains(t, resp, "foobar")
 	assert.Contains(t, resp, "status")
 	assert.Contains(t, resp, "deploy")
+}
+
+// --- handleCommand tests (the matrixbot.Handler wrapper) ---
+
+func TestHandleCommand_DispatchesParsedInput(t *testing.T) {
+	mgr := newMockServiceManager()
+	bot := botForTest(mgr, nil)
+
+	resp, err := bot.handleCommand(context.Background(), matrixbot.Request{Input: "deploy myapp"})
+	require.NoError(t, err)
+	assert.Contains(t, resp.Reply, "Deploy requested")
+	assert.Equal(t, "deploy", mgr.getLastOp())
+	assert.Equal(t, "myapp", mgr.getLastService())
+}
+
+func TestHandleCommand_EmptyInputStaysQuiet(t *testing.T) {
+	mgr := newMockServiceManager()
+	bot := botForTest(mgr, nil)
+
+	resp, err := bot.handleCommand(context.Background(), matrixbot.Request{Input: ""})
+	require.NoError(t, err)
+	assert.Empty(t, resp.Reply, "empty input should produce no reply")
+	assert.Empty(t, mgr.getLastOp(), "empty input should not touch the manager")
+}
+
+func TestHandleCommand_ActionOnly(t *testing.T) {
+	mgr := newMockServiceManager()
+	bot := botForTest(mgr, nil)
+
+	resp, err := bot.handleCommand(context.Background(), matrixbot.Request{Input: "reload"})
+	require.NoError(t, err)
+	assert.Contains(t, resp.Reply, "reloaded")
+	assert.Equal(t, "reload", mgr.getLastOp())
 }
 
 // --- Status overview format tests ---
@@ -444,174 +391,7 @@ func TestStatusOverview_Sorted(t *testing.T) {
 	assert.Equal(t, sorted, svcLines)
 }
 
-// --- Invite handling tests ---
-
-func makeMemberEvent(roomID id.RoomID, sender id.UserID, target string, membership event.Membership) *event.Event {
-	stateKey := target
-	return &event.Event{
-		Type:     event.StateMember,
-		RoomID:   roomID,
-		Sender:   sender,
-		StateKey: &stateKey,
-		Content: event.Content{
-			Parsed: &event.MemberEventContent{Membership: membership},
-		},
-	}
-}
-
-func TestHandleInvite_JoinsConfiguredRoom(t *testing.T) {
-	fake := newFakeMatrixClient()
-	bot := botForTest(t, fake, newMockServiceManager(), nil)
-
-	evt := makeMemberEvent("!room:example.org", "@inviter:example.org", "@bot:example.org", event.MembershipInvite)
-	bot.handleInvite(context.Background(), evt)
-
-	joins := fake.getJoins()
-	require.Len(t, joins, 1)
-	assert.Equal(t, id.RoomID("!room:example.org"), joins[0])
-}
-
-func TestHandleInvite_IgnoresOtherRooms(t *testing.T) {
-	fake := newFakeMatrixClient()
-	bot := botForTest(t, fake, newMockServiceManager(), nil)
-
-	evt := makeMemberEvent("!other:example.org", "@inviter:example.org", "@bot:example.org", event.MembershipInvite)
-	bot.handleInvite(context.Background(), evt)
-
-	assert.Empty(t, fake.getJoins())
-}
-
-func TestHandleInvite_IgnoresOtherUsers(t *testing.T) {
-	fake := newFakeMatrixClient()
-	bot := botForTest(t, fake, newMockServiceManager(), nil)
-
-	evt := makeMemberEvent("!room:example.org", "@inviter:example.org", "@someone:example.org", event.MembershipInvite)
-	bot.handleInvite(context.Background(), evt)
-
-	assert.Empty(t, fake.getJoins())
-}
-
-func TestHandleInvite_IgnoresNonInviteMembership(t *testing.T) {
-	fake := newFakeMatrixClient()
-	bot := botForTest(t, fake, newMockServiceManager(), nil)
-
-	evt := makeMemberEvent("!room:example.org", "@inviter:example.org", "@bot:example.org", event.MembershipLeave)
-	bot.handleInvite(context.Background(), evt)
-
-	assert.Empty(t, fake.getJoins())
-}
-
-// --- Message handling tests ---
-
-func makeMessageEvent(roomID id.RoomID, sender id.UserID, body string) *event.Event {
-	return &event.Event{
-		Type:   event.EventMessage,
-		RoomID: roomID,
-		Sender: sender,
-		Content: event.Content{
-			Parsed: &event.MessageEventContent{
-				MsgType: event.MsgText,
-				Body:    body,
-			},
-		},
-	}
-}
-
-func TestHandleMessage_DispatchesCommand(t *testing.T) {
-	fake := newFakeMatrixClient()
-	mgr := newMockServiceManager()
-	bot := botForTest(t, fake, mgr, nil)
-
-	evt := makeMessageEvent("!room:example.org", "@user:example.org", "!mezzaops deploy myapp")
-	bot.handleMessage(context.Background(), evt)
-
-	assert.Equal(t, "deploy", mgr.getLastOp())
-	assert.Equal(t, "myapp", mgr.getLastService())
-	sends := fake.getSends()
-	require.Len(t, sends, 1)
-	assert.Contains(t, messageBody(t, sends[0]), "Deploy requested")
-}
-
-func TestHandleMessage_FiltersOwnMessages(t *testing.T) {
-	fake := newFakeMatrixClient()
-	mgr := newMockServiceManager()
-	bot := botForTest(t, fake, mgr, nil)
-
-	evt := makeMessageEvent("!room:example.org", "@bot:example.org", "!mezzaops status")
-	bot.handleMessage(context.Background(), evt)
-
-	assert.Empty(t, mgr.getLastOp())
-	assert.Empty(t, fake.getSends())
-}
-
-func TestHandleMessage_FiltersOtherRooms(t *testing.T) {
-	fake := newFakeMatrixClient()
-	mgr := newMockServiceManager()
-	bot := botForTest(t, fake, mgr, nil)
-
-	evt := makeMessageEvent("!other:example.org", "@user:example.org", "!mezzaops status")
-	bot.handleMessage(context.Background(), evt)
-
-	assert.Empty(t, mgr.getLastOp())
-	assert.Empty(t, fake.getSends())
-}
-
-func TestHandleMessage_NonCommand(t *testing.T) {
-	fake := newFakeMatrixClient()
-	mgr := newMockServiceManager()
-	bot := botForTest(t, fake, mgr, nil)
-
-	evt := makeMessageEvent("!room:example.org", "@user:example.org", "good morning")
-	bot.handleMessage(context.Background(), evt)
-
-	assert.Empty(t, mgr.getLastOp())
-	assert.Empty(t, fake.getSends())
-}
-
-// --- PostMessage tests ---
-
-func TestPostMessage_RendersMarkdownToHTML(t *testing.T) {
-	fake := newFakeMatrixClient()
-	bot := botForTest(t, fake, newMockServiceManager(), nil)
-
-	bot.PostMessage(context.Background(), "Deploy of `myapp` succeeded.")
-
-	sends := fake.getSends()
-	require.Len(t, sends, 1)
-	mec, ok := sends[0].Content.(event.MessageEventContent)
-	require.True(t, ok)
-	assert.Equal(t, event.MsgText, mec.MsgType)
-	assert.Equal(t, "Deploy of `myapp` succeeded.", mec.Body)
-	assert.Equal(t, event.FormatHTML, mec.Format)
-	assert.Contains(t, mec.FormattedBody, "<code>myapp</code>")
-}
-
-func TestPostMessage_TargetsConfiguredRoom(t *testing.T) {
-	fake := newFakeMatrixClient()
-	bot := botForTest(t, fake, newMockServiceManager(), nil)
-
-	bot.PostMessage(context.Background(), "hello")
-
-	sends := fake.getSends()
-	require.Len(t, sends, 1)
-	assert.Equal(t, id.RoomID("!room:example.org"), sends[0].RoomID)
-	assert.Equal(t, event.EventMessage, sends[0].Type)
-}
-
-func TestPostMessage_DropsWhenClientNil(t *testing.T) {
-	bot := &Bot{roomID: "!room:example.org"} // client deliberately nil
-	// Must not panic, must not send anywhere (no client to send through).
-	bot.PostMessage(context.Background(), "hello")
-}
-
-func TestPostMessage_DropsWhenRoomUnset(t *testing.T) {
-	fake := newFakeMatrixClient()
-	bot := &Bot{client: fake} // roomID deliberately empty
-	bot.PostMessage(context.Background(), "hello")
-	assert.Empty(t, fake.getSends(), "should not send when roomID is unset")
-}
-
-// --- SetConfirmHandler ---
+// --- Setter / getter tests ---
 
 func TestSetConfirmHandler(t *testing.T) {
 	bot := &Bot{}
@@ -628,6 +408,76 @@ func TestCommandPrefix_ReturnsNormalisedValue(t *testing.T) {
 func TestNew_DefaultsCommandPrefix(t *testing.T) {
 	bot := New(Config{Homeserver: "https://example.org", UserID: "@bot:example.org"}, "/tmp", newMockServiceManager())
 	assert.Equal(t, "!mezzaops", bot.CommandPrefix())
+}
+
+// --- PostMessage drop-when-not-ready tests ---
+//
+// matrixbot owns the rendering and send path; mezzaops only owns the guard
+// that prevents sends before Run has wired up the underlying runtime.
+
+func TestPostMessage_DropsWhenMatrixBotNil(t *testing.T) {
+	bot := &Bot{roomID: "!room:example.org"} // matrixBot deliberately nil
+	// Must not panic, must not send anywhere.
+	bot.PostMessage(context.Background(), "hello")
+}
+
+func TestPostMessage_DropsWhenRoomUnset(t *testing.T) {
+	bot := &Bot{} // both matrixBot and roomID empty
+	bot.PostMessage(context.Background(), "hello")
+}
+
+// --- resolveRoom tests ---
+
+type fakeAliasResolver struct {
+	resolve map[id.RoomAlias]id.RoomID
+	err     error
+}
+
+func (f *fakeAliasResolver) ResolveAlias(_ context.Context, alias id.RoomAlias) (*mautrix.RespAliasResolve, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	rid, ok := f.resolve[alias]
+	if !ok {
+		return nil, fmt.Errorf("no canned response for alias %s", alias)
+	}
+	return &mautrix.RespAliasResolve{RoomID: rid}, nil
+}
+
+func TestResolveRoom_PassesThroughRoomID(t *testing.T) {
+	bot := &Bot{cfg: Config{Room: "!already-an-id:example.org"}}
+	require.NoError(t, bot.resolveRoom(context.Background()))
+	assert.Equal(t, id.RoomID("!already-an-id:example.org"), bot.roomID)
+}
+
+func TestResolveRoom_ResolvesAlias(t *testing.T) {
+	bot := &Bot{
+		cfg: Config{Room: "#ops:example.org"},
+		aliasClient: &fakeAliasResolver{
+			resolve: map[id.RoomAlias]id.RoomID{
+				"#ops:example.org": "!resolved:example.org",
+			},
+		},
+	}
+	require.NoError(t, bot.resolveRoom(context.Background()))
+	assert.Equal(t, id.RoomID("!resolved:example.org"), bot.roomID)
+}
+
+func TestResolveRoom_AliasError(t *testing.T) {
+	bot := &Bot{
+		cfg:         Config{Room: "#ops:example.org"},
+		aliasClient: &fakeAliasResolver{err: fmt.Errorf("homeserver unreachable")},
+	}
+	err := bot.resolveRoom(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "#ops:example.org")
+}
+
+func TestResolveRoom_RejectsUnprefixedRoom(t *testing.T) {
+	bot := &Bot{cfg: Config{Room: "ops"}}
+	err := bot.resolveRoom(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must start with")
 }
 
 // --- Homeserver resolution tests ---
@@ -718,8 +568,6 @@ func TestNew_ResolvesServerName(t *testing.T) {
 
 	bot := New(Config{Homeserver: "example.org", UserID: "@bot:example.org"}, "/tmp", newMockServiceManager())
 
-	require.NoError(t, bot.newClientErr)
-	require.NotNil(t, bot.realClient)
-	require.NotNil(t, bot.realClient.HomeserverURL)
-	assert.Equal(t, "https://matrix.example.org", bot.realClient.HomeserverURL.String())
+	require.NoError(t, bot.newErr)
+	assert.Equal(t, "https://matrix.example.org", bot.resolvedHomeserver)
 }
