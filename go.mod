@@ -8,7 +8,7 @@ require (
 	github.com/mattermost/mattermost/server/public v0.3.0
 	github.com/rs/zerolog v1.35.0
 	github.com/shirou/gopsutil/v3 v3.24.5
-	github.com/shishberg/matrixbot v0.0.0-20260427124744-0cefb5805d63
+	github.com/shishberg/matrixbot v0.0.0-20260427220808-9d48b71d4e44
 	github.com/stretchr/testify v1.11.1
 	gopkg.in/yaml.v3 v3.0.1
 	maunium.net/go/mautrix v0.27.0
