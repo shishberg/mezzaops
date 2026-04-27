@@ -261,7 +261,20 @@ func TestHandleInteraction_LogsService(t *testing.T) {
 	resp := b.routeInteraction(fakeGroupInteraction("logs", "api"))
 	assert.Equal(t, "api", mgr.doName)
 	assert.Equal(t, "logs", mgr.doOp)
-	assert.Equal(t, "api: some log output", resp)
+	assert.Equal(t, "api:\n```\nsome log output\n```", resp)
+}
+
+func TestHandleInteraction_LogsService_EscapesBackticks(t *testing.T) {
+	// Log lines containing ``` would otherwise close the fence early and
+	// leak the rest of the message out of the code block.
+	mgr := &mockManager{
+		doResult: "before\n```\nafter",
+	}
+	b := &Bot{manager: mgr}
+
+	resp := b.routeInteraction(fakeGroupInteraction("logs", "api"))
+	assert.Equal(t, 2, strings.Count(resp, "```"),
+		"expected exactly two fence delimiters, got: %q", resp)
 }
 
 func TestHandleInteraction_StatusService(t *testing.T) {

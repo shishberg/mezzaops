@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -241,6 +242,11 @@ func (b *Bot) routeInteraction(i *discordgo.InteractionCreate) string {
 	}
 
 	result := b.manager.Do(svcName, opName)
+	if opName == "logs" {
+		// Stop ``` in log output from closing the fence early.
+		safe := strings.ReplaceAll(result, "```", "``")
+		return fmt.Sprintf("%s:\n```\n%s\n```", svcName, safe)
+	}
 	return fmt.Sprintf("%s: %s", svcName, result)
 }
 
