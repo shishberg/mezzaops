@@ -61,6 +61,12 @@ type Config struct {
 	// MagicDNS not ready yet) cannot block adopt:false / autostart
 	// services indefinitely. Default 30s when zero or unset.
 	ReadinessTimeout time.Duration `yaml:"readiness_timeout"`
+
+	// StartOnBoot, when true, makes the manager autostart process
+	// services on cold boot if adoption did not result in a running
+	// process. Per-service ServiceConfig.Autostart overrides this.
+	// Default false to preserve the pre-C1 behaviour (adopt-only).
+	StartOnBoot bool `yaml:"start_on_boot"`
 }
 
 // ServiceProcessConfig describes how to manage a service's process.
@@ -83,6 +89,19 @@ type ServiceConfig struct {
 	RequireConfirmation bool                 `yaml:"require_confirmation"`
 	SelfDeploy          bool                 `yaml:"self_deploy"`
 	Adopt               *bool                `yaml:"adopt"`
+	// Autostart, when true, makes the manager Start a process service
+	// on cold boot if adoption did not result in a running process
+	// (stale pid, no state, adoption disabled). Per-service overrides
+	// the global Config.StartOnBoot default. nil means "use the
+	// global default". Honoured only when the persisted desired
+	// state is not "stopped" (operator explicitly stopped) unless
+	// AutostartForce is also set.
+	Autostart *bool `yaml:"autostart"`
+	// AutostartForce overrides the persisted-"stopped" guard: a
+	// service with status:"stopped" in its state file is still
+	// started on cold boot. Use with care — it ignores the
+	// operator's last command.
+	AutostartForce bool `yaml:"autostart_force"`
 }
 
 // ShouldAdopt returns whether this service should be adopted on startup.
@@ -92,6 +111,19 @@ func (s *ServiceConfig) ShouldAdopt() bool {
 		return *s.Adopt
 	}
 	return true
+}
+
+// ShouldAutostart resolves the per-service autostart decision against
+// the global default. Per-service autostart overrides the global; if
+// neither is set, the default is false (preserve the pre-C1
+// behaviour). Returns the resolved autostart decision and whether the
+// per-service field was set (used to decide precedence in callers
+// that need to log a "global applied to" line).
+func (s *ServiceConfig) ShouldAutostart(globalDefault bool) bool {
+	if s.Autostart != nil {
+		return *s.Autostart
+	}
+	return globalDefault
 }
 
 // DefaultReadinessTimeout is used when Config.ReadinessTimeout is zero or
@@ -161,6 +193,7 @@ var knownTopLevelConfigKeys = map[string]struct{}{
 	"webhook":           {},
 	"dashboard":         {},
 	"readiness_timeout": {},
+	"start_on_boot":     {},
 }
 
 // warnUnknownTopLevelKeys walks the top-level mapping of a parsed config

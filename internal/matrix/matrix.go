@@ -133,15 +133,16 @@ type Bot struct {
 }
 
 // discoverFunc resolves a Matrix server name to its client-server API
-// well-known document. It mirrors mautrix.DiscoverClientAPI but drops the
-// context parameter so tests can inject a fake without managing one.
-type discoverFunc func(serverName string) (*mautrix.ClientWellKnown, error)
+// well-known document. It accepts a context so a stuck discovery (e.g.
+// a black-holed Tailscale MagicDNS) is cancellable: C2's acceptance
+// criteria require the retry loop to be cancellable via ctx.
+type discoverFunc func(ctx context.Context, serverName string) (*mautrix.ClientWellKnown, error)
 
 // discoverClientAPI is the package-level default used by resolveHomeserverURL.
-// Tests override it; the variable is read once per New call from a single
-// goroutine, so tests must not call t.Parallel while mutating it.
-var discoverClientAPI discoverFunc = func(serverName string) (*mautrix.ClientWellKnown, error) {
-	return mautrix.DiscoverClientAPI(context.Background(), serverName)
+// Tests override it; the variable is read once per runOnce call from a
+// single goroutine, so tests must not call t.Parallel while mutating it.
+var discoverClientAPI discoverFunc = func(ctx context.Context, serverName string) (*mautrix.ClientWellKnown, error) {
+	return mautrix.DiscoverClientAPI(ctx, serverName)
 }
 
 // resolveHomeserverURL turns a homeserver config value into the client-server
@@ -155,11 +156,14 @@ var discoverClientAPI discoverFunc = func(serverName string) (*mautrix.ClientWel
 //   - A 200 with an empty base_url is FAIL_ERROR per spec; we surface it as
 //     an error so an operator misconfiguration doesn't silently route the
 //     bot at the apex domain.
-func resolveHomeserverURL(homeserver string, discover discoverFunc) (string, error) {
+//
+// The ctx is forwarded to the discovery call so a stuck HTTP request is
+// cancellable from the caller's context.
+func resolveHomeserverURL(ctx context.Context, homeserver string, discover discoverFunc) (string, error) {
 	if strings.Contains(homeserver, "://") {
 		return homeserver, nil
 	}
-	wk, err := discover(homeserver)
+	wk, err := discover(ctx, homeserver)
 	if err != nil {
 		return "", fmt.Errorf("discovering client API for %q: %w", homeserver, err)
 	}
@@ -250,13 +254,40 @@ func (b *Bot) Run(ctx context.Context) error {
 // registered once per attempt against a fresh syncer, which avoids the
 // duplicate-dispatch bug that would occur if we re-registered them
 // against a reused syncer (DefaultSyncer has no Reset).
+//
+// Publish-late: the client is published under connMu only AFTER
+// helper.Init succeeds, so PostMessage can never observe a client
+// without a working Crypto helper (which would otherwise let
+// SendMessageEvent send plaintext into a room the operator expects to
+// be encrypted). A failed Init returns without publishing, leaving the
+// previously-published state (if any) cleared at the top of runOnce
+// for the next attempt to repopulate.
 func (b *Bot) runOnce(ctx context.Context) error {
-	if err := b.connectClient(); err != nil {
+	// Clear any prior published state from a previous attempt, and
+	// close its helper if any so the SQLite store is not leaked.
+	b.connMu.Lock()
+	prior := b.realClient
+	b.realClient = nil
+	b.client = nil
+	b.connMu.Unlock()
+	if prior != nil && prior.Crypto != nil {
+		// The Crypto field is typed as the CryptoHelper interface,
+		// which has no Close method; the concrete cryptohelper
+		// implementation does. Type-assert to call it.
+		if helper, ok := prior.Crypto.(*cryptohelper.CryptoHelper); ok {
+			if err := helper.Close(); err != nil {
+				log.Printf("matrix: closing crypto helper from previous attempt: %v", err)
+			}
+		}
+	}
+
+	client, err := b.buildLocalClient(ctx)
+	if err != nil {
 		return err
 	}
 
 	if b.roomID == "" {
-		if err := b.resolveRoom(ctx); err != nil {
+		if err := b.resolveRoomOnClient(ctx, client); err != nil {
 			return fmt.Errorf("resolving room: %w", err)
 		}
 	}
@@ -266,7 +297,7 @@ func (b *Bot) runOnce(ctx context.Context) error {
 		cryptoDB = filepath.Join(b.stateDir, "matrix-crypto.db")
 	}
 
-	helper, err := cryptohelper.NewCryptoHelper(b.realClient, []byte(b.cfg.PickleKey), cryptoDB)
+	helper, err := cryptohelper.NewCryptoHelper(client, []byte(b.cfg.PickleKey), cryptoDB)
 	if err != nil {
 		return fmt.Errorf("creating crypto helper: %w", err)
 	}
@@ -278,11 +309,27 @@ func (b *Bot) runOnce(ctx context.Context) error {
 		}
 		return fmt.Errorf("initialising crypto helper: %w", err)
 	}
-	b.realClient.Crypto = helper
+	// Set Crypto on the local client BEFORE publishing. PostMessage's
+	// defensive Crypto==nil check ensures that even if a future code
+	// path publishes the client before this assignment, a plaintext
+	// send cannot happen.
+	client.Crypto = helper
+
+	b.connMu.Lock()
+	b.client = client
+	b.realClient = client
+	b.connMu.Unlock()
 
 	b.markReady()
 
-	syncErr := b.realClient.SyncWithContext(ctx)
+	syncErr := client.SyncWithContext(ctx)
+	// Teardown: clear the published client under connMu so PostMessage
+	// stops calling SendMessageEvent on it, then close the helper so
+	// its SQLite store is released for the next attempt.
+	b.connMu.Lock()
+	b.client = nil
+	b.realClient = nil
+	b.connMu.Unlock()
 	if cerr := helper.Close(); cerr != nil {
 		log.Printf("matrix: closing crypto helper: %v", cerr)
 	}
@@ -292,14 +339,22 @@ func (b *Bot) runOnce(ctx context.Context) error {
 	return syncErr
 }
 
-// connectClient performs the homeserver discovery, builds the mautrix
-// client, and registers the sync handlers exactly once. It is called
-// from runOnce on the first attempt, and its result is reused across
-// subsequent retries. A failure here bubbles up to the retry loop.
-func (b *Bot) connectClient() error {
-	homeserverURL, err := resolveHomeserverURL(b.cfg.Homeserver, discoverClientAPI)
+// buildLocalClient performs the homeserver discovery, builds a fresh
+// mautrix client, and registers the syncer handlers. The returned
+// client is NOT published; the caller is responsible for publishing it
+// under connMu once the crypto helper has initialised successfully.
+// This is the "publish-late" approach: PostMessage will only ever see
+// a client whose Crypto is set, so it cannot send plaintext into a
+// room the operator expects to be encrypted.
+//
+// Per-attempt construction (rather than reusing the previous attempt's
+// client) also avoids the duplicate-dispatch bug that mautrix's
+// DefaultSyncer would otherwise produce if we re-registered handlers
+// against a reused syncer (DefaultSyncer has no Reset).
+func (b *Bot) buildLocalClient(ctx context.Context) (*mautrix.Client, error) {
+	homeserverURL, err := resolveHomeserverURL(ctx, b.cfg.Homeserver, discoverClientAPI)
 	if err != nil {
-		return fmt.Errorf("matrix client: %w", err)
+		return nil, fmt.Errorf("matrix client: %w", err)
 	}
 	if homeserverURL != b.cfg.Homeserver {
 		log.Printf("matrix: homeserver %q resolved to %s", b.cfg.Homeserver, homeserverURL)
@@ -307,7 +362,7 @@ func (b *Bot) connectClient() error {
 
 	client, err := mautrix.NewClient(homeserverURL, id.UserID(b.cfg.UserID), b.cfg.AccessToken)
 	if err != nil {
-		return fmt.Errorf("matrix client: %w", err)
+		return nil, fmt.Errorf("matrix client: %w", err)
 	}
 	client.DeviceID = id.DeviceID(b.cfg.DeviceID)
 	// Route mautrix's internal logs to stderr so they land alongside the
@@ -316,16 +371,11 @@ func (b *Bot) connectClient() error {
 
 	syncer, ok := client.Syncer.(*mautrix.DefaultSyncer)
 	if !ok {
-		return fmt.Errorf("matrix client: unexpected syncer type %T", client.Syncer)
+		return nil, fmt.Errorf("matrix client: unexpected syncer type %T", client.Syncer)
 	}
 	syncer.OnEventType(event.EventMessage, b.handleMessage)
 	syncer.OnEventType(event.StateMember, b.handleInvite)
-
-	b.connMu.Lock()
-	b.client = client
-	b.realClient = client
-	b.connMu.Unlock()
-	return nil
+	return client, nil
 }
 
 // publishRoomID stores the resolved roomID under the connection lock so
@@ -337,21 +387,19 @@ func (b *Bot) publishRoomID(r id.RoomID) {
 	b.connMu.Unlock()
 }
 
-// resolveRoom turns either a room ID (!) or a room alias (#) into the
-// canonical id.RoomID stored on the bot. Anything else is a config error.
-func (b *Bot) resolveRoom(ctx context.Context) error {
+// resolveRoomOnClient turns either a room ID (!) or a room alias (#) into
+// the canonical id.RoomID stored on the bot, using the supplied client
+// directly (so the call does not depend on the client being published).
+// Anything else is a config error. The caller in runOnce uses the local
+// client from buildLocalClient rather than b.client, because the
+// publish-late invariant means b.client is still nil at this point.
+func (b *Bot) resolveRoomOnClient(ctx context.Context, client matrixClient) error {
 	room := b.cfg.Room
 	switch {
 	case strings.HasPrefix(room, "!"):
 		b.publishRoomID(id.RoomID(room))
 		return nil
 	case strings.HasPrefix(room, "#"):
-		b.connMu.Lock()
-		client := b.client
-		b.connMu.Unlock()
-		if client == nil {
-			return fmt.Errorf("resolving alias %q: client not initialised", room)
-		}
 		resp, err := client.ResolveAlias(ctx, id.RoomAlias(room))
 		if err != nil {
 			return fmt.Errorf("resolving alias %q: %w", room, err)
@@ -378,13 +426,22 @@ func (b *Bot) resolveRoom(ctx context.Context) error {
 // The (client, roomID) pair is snapshotted under connMu so concurrent
 // retry-driven teardown cannot leave PostMessage using a half-updated
 // pair (a client whose roomID has been cleared, or vice versa).
+//
+// Defensive Crypto check: the publish-late invariant in runOnce means
+// b.client/b.realClient are only ever both set AND b.realClient.Crypto
+// is non-nil, so this is a belt-and-braces check for the case where a
+// future code path publishes the client before its Crypto helper is
+// initialised. Without it, SendMessageEvent on an unencrypted client
+// would send plaintext into a room the operator expects to be
+// encrypted.
 func (b *Bot) PostMessage(ctx context.Context, message string) {
 	b.connMu.Lock()
 	client := b.client
+	realClient := b.realClient
 	roomID := b.roomID
 	b.connMu.Unlock()
 
-	if client == nil || roomID == "" {
+	if client == nil || roomID == "" || (realClient != nil && realClient.Crypto == nil) {
 		log.Printf("matrix: PostMessage called before bot is ready, dropping message")
 		return
 	}

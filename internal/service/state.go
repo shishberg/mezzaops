@@ -8,14 +8,28 @@ import (
 )
 
 // State represents the persisted state of a managed service.
+//
+// Status is the live status as last observed (running, stopped, deploying,
+// failed). It is overwritten on every save based on the backend's
+// current status, so an unexpected process exit looks identical to an
+// operator-initiated stop in this field.
+//
+// DesiredStatus is the operator's last expressed intent. It is set by
+// the "start" and "stop" ops and never overwritten by live status.
+// C1's autostart-on-cold-boot consults this field (not Status) to
+// decide whether the operator explicitly stopped the service, so a
+// crashed process is correctly distinguished from an intentional
+// stop. An empty DesiredStatus means "no explicit intent recorded";
+// in that case autostart proceeds.
 type State struct {
-	Status      string          `json:"status"`
-	LastDeploy  time.Time       `json:"last_deploy,omitzero"`
-	LastRestart time.Time       `json:"last_restart,omitzero"`
-	LastResult  string          `json:"last_result,omitempty"`
-	LastOutput  string          `json:"last_output,omitempty"`
-	FailedStep  string          `json:"failed_step,omitempty"`
-	Backend     json.RawMessage `json:"backend,omitempty"`
+	Status        string          `json:"status"`
+	DesiredStatus string          `json:"desired_status,omitempty"`
+	LastDeploy    time.Time       `json:"last_deploy,omitzero"`
+	LastRestart   time.Time       `json:"last_restart,omitzero"`
+	LastResult    string          `json:"last_result,omitempty"`
+	LastOutput    string          `json:"last_output,omitempty"`
+	FailedStep    string          `json:"failed_step,omitempty"`
+	Backend       json.RawMessage `json:"backend,omitempty"`
 }
 
 func statePath(dir, name string) string {

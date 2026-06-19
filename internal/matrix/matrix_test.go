@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/shishberg/mezzaops/internal/service"
 	"github.com/stretchr/testify/assert"
@@ -611,6 +612,39 @@ func TestPostMessage_DropsWhenRoomUnset(t *testing.T) {
 	assert.Empty(t, fake.getSends(), "should not send when roomID is unset")
 }
 
+func TestPostMessage_DropsWhenCryptoUnset(t *testing.T) {
+	// Codex review of e7e817d: runOnce previously published the
+	// mautrix client to b.client/b.realClient before helper.Init
+	// succeeded. PostMessage's pre-fix check (client==nil, roomID=="")
+	// would have let the call through and SendMessageEvent would have
+	// sent plaintext into a room the operator expects to be encrypted.
+	// The fix publishes the client only after Init succeeds, and adds
+	// a defensive Crypto==nil check in PostMessage for the case where
+	// a future code path publishes the client earlier again.
+	//
+	// Construct a real *mautrix.Client (no network I/O at construction)
+	// and a fake matrixClient to make the test self-contained: the
+	// defensive check reads b.realClient.Crypto, sees nil, and drops
+	// the message before SendMessageEvent is reached. The fake is the
+	// one wired to b.client, so an empty getSends() proves the drop.
+	fake := newFakeMatrixClient()
+	realClient, err := mautrix.NewClient("https://matrix.example.org", id.UserID("@bot:example.org"), "")
+	require.NoError(t, err)
+	require.Nil(t, realClient.Crypto, "freshly-constructed client should have no Crypto helper")
+
+	bot := &Bot{
+		cfg:        Config{UserID: "@bot:example.org"},
+		userID:     "@bot:example.org",
+		client:     fake,
+		realClient: realClient,
+		roomID:     "!room:example.org",
+	}
+
+	bot.PostMessage(context.Background(), "hello")
+	assert.Empty(t, fake.getSends(),
+		"PostMessage must not call SendMessageEvent when Crypto is unset")
+}
+
 // --- SetConfirmHandler ---
 
 func TestSetConfirmHandler(t *testing.T) {
@@ -634,11 +668,11 @@ func TestNew_DefaultsCommandPrefix(t *testing.T) {
 
 func TestResolveHomeserverURL_PassesThroughHTTPSURL(t *testing.T) {
 	called := false
-	discover := func(string) (*mautrix.ClientWellKnown, error) {
+	discover := func(context.Context, string) (*mautrix.ClientWellKnown, error) {
 		called = true
 		return nil, nil
 	}
-	got, err := resolveHomeserverURL("https://matrix.example.org", discover)
+	got, err := resolveHomeserverURL(context.Background(), "https://matrix.example.org", discover)
 	require.NoError(t, err)
 	assert.Equal(t, "https://matrix.example.org", got)
 	assert.False(t, called, "discover must not be called for full URL input")
@@ -646,11 +680,11 @@ func TestResolveHomeserverURL_PassesThroughHTTPSURL(t *testing.T) {
 
 func TestResolveHomeserverURL_PassesThroughHTTPURL(t *testing.T) {
 	called := false
-	discover := func(string) (*mautrix.ClientWellKnown, error) {
+	discover := func(context.Context, string) (*mautrix.ClientWellKnown, error) {
 		called = true
 		return nil, nil
 	}
-	got, err := resolveHomeserverURL("http://localhost:8008", discover)
+	got, err := resolveHomeserverURL(context.Background(), "http://localhost:8008", discover)
 	require.NoError(t, err)
 	assert.Equal(t, "http://localhost:8008", got)
 	assert.False(t, called, "discover must not be called for full URL input")
@@ -658,13 +692,13 @@ func TestResolveHomeserverURL_PassesThroughHTTPURL(t *testing.T) {
 
 func TestResolveHomeserverURL_ResolvesServerNameViaWellKnown(t *testing.T) {
 	var gotName string
-	discover := func(serverName string) (*mautrix.ClientWellKnown, error) {
+	discover := func(_ context.Context, serverName string) (*mautrix.ClientWellKnown, error) {
 		gotName = serverName
 		return &mautrix.ClientWellKnown{
 			Homeserver: mautrix.HomeserverInfo{BaseURL: "https://matrix.example.org"},
 		}, nil
 	}
-	got, err := resolveHomeserverURL("example.org", discover)
+	got, err := resolveHomeserverURL(context.Background(), "example.org", discover)
 	require.NoError(t, err)
 	assert.Equal(t, "https://matrix.example.org", got)
 	assert.Equal(t, "example.org", gotName)
@@ -674,10 +708,10 @@ func TestResolveHomeserverURL_FallsBackWhenNoWellKnown(t *testing.T) {
 	// mautrix.DiscoverClientAPI returns (nil, nil) when the server's
 	// .well-known endpoint responds with 404 — i.e. no discovery info
 	// published. The helper must fall back to https://<serverName>.
-	discover := func(string) (*mautrix.ClientWellKnown, error) {
+	discover := func(context.Context, string) (*mautrix.ClientWellKnown, error) {
 		return nil, nil
 	}
-	got, err := resolveHomeserverURL("example.org", discover)
+	got, err := resolveHomeserverURL(context.Background(), "example.org", discover)
 	require.NoError(t, err)
 	assert.Equal(t, "https://example.org", got)
 }
@@ -686,10 +720,10 @@ func TestResolveHomeserverURL_ErrorsWhenWellKnownEmptyBaseURL(t *testing.T) {
 	// A 200 with an empty m.homeserver.base_url is FAIL_ERROR in the Matrix
 	// client-server discovery spec, distinct from the 404 → FAIL_PROMPT
 	// fallback. Surface it instead of silently sending the bot to the apex.
-	discover := func(string) (*mautrix.ClientWellKnown, error) {
+	discover := func(context.Context, string) (*mautrix.ClientWellKnown, error) {
 		return &mautrix.ClientWellKnown{}, nil
 	}
-	_, err := resolveHomeserverURL("example.org", discover)
+	_, err := resolveHomeserverURL(context.Background(), "example.org", discover)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "example.org")
 	assert.Contains(t, err.Error(), "base_url")
@@ -697,10 +731,10 @@ func TestResolveHomeserverURL_ErrorsWhenWellKnownEmptyBaseURL(t *testing.T) {
 
 func TestResolveHomeserverURL_PropagatesDiscoverError(t *testing.T) {
 	discoverErr := fmt.Errorf("network exploded")
-	discover := func(string) (*mautrix.ClientWellKnown, error) {
+	discover := func(context.Context, string) (*mautrix.ClientWellKnown, error) {
 		return nil, discoverErr
 	}
-	_, err := resolveHomeserverURL("example.org", discover)
+	_, err := resolveHomeserverURL(context.Background(), "example.org", discover)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, discoverErr)
 	assert.Contains(t, err.Error(), `"example.org"`)
@@ -711,7 +745,7 @@ func TestNew_DoesNotPerformIO(t *testing.T) {
 	// not at construction time, so a transient boot-time discovery
 	// failure (e.g. Tailscale MagicDNS not ready) can be retried.
 	prev := discoverClientAPI
-	discoverClientAPI = func(serverName string) (*mautrix.ClientWellKnown, error) {
+	discoverClientAPI = func(_ context.Context, serverName string) (*mautrix.ClientWellKnown, error) {
 		t.Errorf("discoverClientAPI should not be called from New; was called with %q", serverName)
 		return nil, nil
 	}
@@ -723,13 +757,14 @@ func TestNew_DoesNotPerformIO(t *testing.T) {
 	assert.Nil(t, bot.client, "client should be nil until first Run")
 }
 
-func TestConnectClient_ResolvesHomeserverAndRegistersHandlers(t *testing.T) {
-	// connectClient is the per-first-attempt setup path. It should call
-	// discovery, build the client, and register the syncer handlers
-	// exactly once (no Reset on DefaultSyncer means a second
-	// registration would cause duplicate dispatches).
+func TestBuildLocalClient_ResolvesHomeserverAndRegistersHandlers(t *testing.T) {
+	// buildLocalClient is the per-attempt setup path. It should call
+	// discovery, build a fresh client, and register the syncer
+	// handlers. The caller (runOnce) is responsible for publishing the
+	// returned client under connMu once Crypto is set; this test
+	// verifies the local-only contract.
 	prev := discoverClientAPI
-	discoverClientAPI = func(serverName string) (*mautrix.ClientWellKnown, error) {
+	discoverClientAPI = func(_ context.Context, serverName string) (*mautrix.ClientWellKnown, error) {
 		return &mautrix.ClientWellKnown{
 			Homeserver: mautrix.HomeserverInfo{BaseURL: "https://matrix.example.org"},
 		}, nil
@@ -737,33 +772,30 @@ func TestConnectClient_ResolvesHomeserverAndRegistersHandlers(t *testing.T) {
 	t.Cleanup(func() { discoverClientAPI = prev })
 
 	bot := New(Config{Homeserver: "example.org", UserID: "@bot:example.org"}, "/tmp", newMockServiceManager())
-	require.NoError(t, bot.connectClient())
-
-	require.NotNil(t, bot.realClient)
-	assert.Equal(t, "https://matrix.example.org", bot.realClient.HomeserverURL.String())
-
-	// Second call should be a no-op (we don't expose a setter, so we
-	// just confirm the client is the same one). A regression in which
-	// runOnce calls connectClient every attempt would create a new
-	// mautrix client with fresh syncer handlers on each retry, but
-	// runOnce guards with `if b.realClient == nil` to avoid that.
-	assert.NotNil(t, bot.realClient)
+	client, err := bot.buildLocalClient(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	assert.Equal(t, "https://matrix.example.org", client.HomeserverURL.String())
+	// The client must NOT be published by buildLocalClient itself —
+	// runOnce publishes it only after Crypto is set. This is the
+	// publish-late invariant.
+	assert.Nil(t, bot.realClient, "buildLocalClient must not publish the client")
 }
 
-func TestConnectClient_PropagatesDiscoveryError(t *testing.T) {
-	// A discovery error must surface from connectClient so the retry
-	// loop can log it and try again. Previously this was caught once
-	// in New() and permanently disabled the frontend.
+func TestBuildLocalClient_PropagatesDiscoveryError(t *testing.T) {
+	// A discovery error must surface from buildLocalClient so the
+	// retry loop can log it and try again.
 	prev := discoverClientAPI
-	discoverClientAPI = func(serverName string) (*mautrix.ClientWellKnown, error) {
+	discoverClientAPI = func(_ context.Context, serverName string) (*mautrix.ClientWellKnown, error) {
 		return nil, fmt.Errorf("simulated discovery failure")
 	}
 	t.Cleanup(func() { discoverClientAPI = prev })
 
 	bot := New(Config{Homeserver: "example.org", UserID: "@bot:example.org"}, "/tmp", newMockServiceManager())
-	err := bot.connectClient()
+	_, err := bot.buildLocalClient(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "matrix client")
+	assert.Nil(t, bot.realClient, "buildLocalClient must not publish on failure")
 }
 
 // --- C2: retry, Ready gating, markReady idempotence ---
@@ -773,9 +805,9 @@ func TestRun_DiscoveryErrorSurfacesFromRunOnce(t *testing.T) {
 	// not ready yet) must surface the error to the retry loop, not
 	// fail permanently. We can't drive SyncWithContext in a test, so
 	// we drive runOnce directly and assert that the error from
-	// connectClient flows through.
+	// buildLocalClient flows through.
 	prev := discoverClientAPI
-	discoverClientAPI = func(serverName string) (*mautrix.ClientWellKnown, error) {
+	discoverClientAPI = func(_ context.Context, serverName string) (*mautrix.ClientWellKnown, error) {
 		return nil, fmt.Errorf("simulated discovery failure")
 	}
 	t.Cleanup(func() { discoverClientAPI = prev })
@@ -788,8 +820,47 @@ func TestRun_DiscoveryErrorSurfacesFromRunOnce(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "matrix client")
 	// runOnce returned without building a realClient, so the next
-	// retry can still attempt connectClient again.
+	// retry can still attempt buildLocalClient again.
 	assert.Nil(t, bot.realClient)
+}
+
+func TestRunOnce_DiscoveryRespectsContextCancel(t *testing.T) {
+	// Codex review of e7e817d: discoverClientAPI used context.Background(),
+	// so a stuck discovery (e.g. Tailscale MagicDNS black-holed on boot)
+	// would only unblock on the HTTP client's own timeout, not on
+	// ctx cancellation. C2's acceptance criteria require the retry
+	// loop to be cancellable via ctx. After the fix, discovery is
+	// called with the runOnce ctx and a fake that respects ctx
+	// cancellation returns promptly.
+	prev := discoverClientAPI
+	discoverClientAPI = func(ctx context.Context, serverName string) (*mautrix.ClientWellKnown, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	t.Cleanup(func() { discoverClientAPI = prev })
+
+	bot := New(Config{Homeserver: "example.org", UserID: "@bot:example.org"}, "/tmp", newMockServiceManager())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel in a goroutine so the call to runOnce doesn't see a
+	// already-cancelled context before the fake gets a chance to
+	// start blocking.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	done := make(chan error, 1)
+	go func() { done <- bot.runOnce(ctx) }()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.Canceled,
+			"expected ctx cancellation to surface from discovery, got: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("runOnce did not return after ctx was cancelled during discovery")
+	}
 }
 
 func TestRun_MarkReadyIsIdempotent(t *testing.T) {

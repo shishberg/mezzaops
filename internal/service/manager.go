@@ -29,12 +29,13 @@ type syncOp struct {
 
 // ServiceState holds the current state of a managed service.
 type ServiceState struct {
-	Status      string    `json:"status"`
-	LastDeploy  time.Time `json:"last_deploy,omitzero"`
-	LastRestart time.Time `json:"last_restart,omitzero"`
-	LastResult  string    `json:"last_result,omitempty"`
-	LastOutput  string    `json:"last_output,omitempty"`
-	FailedStep  string    `json:"failed_step,omitempty"`
+	Status        string    `json:"status"`
+	DesiredStatus string    `json:"desired_status,omitempty"`
+	LastDeploy    time.Time `json:"last_deploy,omitzero"`
+	LastRestart   time.Time `json:"last_restart,omitzero"`
+	LastResult    string    `json:"last_result,omitempty"`
+	LastOutput    string    `json:"last_output,omitempty"`
+	FailedStep    string    `json:"failed_step,omitempty"`
 }
 
 // managedService wraps a backend with its config, event loop, and deploy queue.
@@ -44,6 +45,7 @@ type managedService struct {
 	opCh             chan syncOp   // synchronous ops: start/stop/restart/status/logs/pull
 	deployCh         chan struct{} // async deploy trigger (capacity 1, latest-wins)
 	restartOnStartup bool          // adopt: false triggers a restart when the loop starts
+	autostartOnReady bool          // C1: cold-boot autostart issues a "start" (not "restart") after SignalReady
 
 	// state is only accessed from the service loop goroutine (no lock needed).
 	state ServiceState
@@ -69,6 +71,15 @@ type Manager struct {
 	// For reload
 	servicesDir string
 
+	// startOnBoot is the resolved autostart default (Config.StartOnBoot).
+	// Per-service ServiceConfig.Autostart overrides this. Read by
+	// newManagedService and Reload.
+	startOnBoot bool
+
+	// stateLock is the exclusive flock file on the state dir, held for
+	// the lifetime of the manager. Released by Stop.
+	stateLock *os.File
+
 	// readyCh is closed when frontends are connected and it's safe to send notifications.
 	readyCh chan struct{}
 
@@ -81,11 +92,16 @@ func NewManager(cfg *config.Config, services []config.ServiceConfig, notifier No
 	if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
 		return nil, fmt.Errorf("create log dir: %w", err)
 	}
-	// TODO: take an exclusive flock or pidfile on cfg.StateDir here to prevent
-	// a second mezzaops instance from adopting/killing the same processes.
-	// We hit this in production: a stale binary kept running alongside the live
-	// one and killed adopted services out from under it.
+	// C5: take an exclusive flock on cfg.StateDir to prevent a second
+	// mezzaops instance from adopting/killing the same processes. We
+	// hit this in production: a stale binary kept running alongside the
+	// live one and killed adopted services out from under it.
+	stateLock, err := acquireStateLock(cfg.StateDir)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(cfg.StateDir, 0755); err != nil {
+		releaseStateLock(stateLock)
 		return nil, fmt.Errorf("create state dir: %w", err)
 	}
 
@@ -98,12 +114,14 @@ func NewManager(cfg *config.Config, services []config.ServiceConfig, notifier No
 		logDir:      cfg.LogDir,
 		stateDir:    cfg.StateDir,
 		servicesDir: cfg.ServicesDir,
+		startOnBoot: cfg.StartOnBoot,
+		stateLock:   stateLock,
 		readyCh:     make(chan struct{}),
 		shutdownCh:  make(chan struct{}),
 	}
 
 	for _, svc := range services {
-		ms := m.newManagedService(svc)
+		ms := m.newManagedService(svc, cfg.StartOnBoot)
 		m.services[svc.Name] = ms
 		m.startServiceLoop(ms)
 	}
@@ -115,7 +133,7 @@ func NewManager(cfg *config.Config, services []config.ServiceConfig, notifier No
 }
 
 // newManagedService creates a managedService with the appropriate backend.
-func (m *Manager) newManagedService(svc config.ServiceConfig) *managedService {
+func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool) *managedService {
 	backend := m.backendForConfig(svc)
 
 	ms := &managedService{
@@ -125,7 +143,26 @@ func (m *Manager) newManagedService(svc config.ServiceConfig) *managedService {
 		deployCh: make(chan struct{}, 1),
 	}
 
-	// Always try to load persisted state (deploy info, backend state)
+	// Always try to load persisted state (deploy info, backend state).
+	// We need the loaded DesiredStatus to decide whether to autostart a
+	// process whose pid is dead: if the operator explicitly stopped
+	// the service on the previous run, DesiredStatus is "stopped" and
+	// autostart must not override that (unless AutostartForce is set).
+	// The live Status field is not used here because an unexpected
+	// process exit also writes "stopped" into it, which would
+	// incorrectly suppress autostart.
+	//
+	// Legacy state files (written before C1) lack the desired_status
+	// field entirely. The two pre-C1 paths that produce status:stopped
+	// (operator stop and crashed-process exit) are indistinguishable
+	// on disk. We choose to autostart in that ambiguous case: a
+	// service that the operator stopped before upgrading will start
+	// once after the upgrade, at which point the next state save
+	// records the running intent and the operator can re-stop if
+	// needed. The alternative (treating absent desired_status as
+	// stopped) would silently break cold-boot recovery for services
+	// that crashed just before the upgrade.
+	var persistedDesired string
 	s, raw, err := LoadState(m.stateDir, svc.Name)
 	if err == nil {
 		ms.state.LastDeploy = s.LastDeploy
@@ -133,15 +170,40 @@ func (m *Manager) newManagedService(svc config.ServiceConfig) *managedService {
 		ms.state.LastResult = s.LastResult
 		ms.state.LastOutput = s.LastOutput
 		ms.state.FailedStep = s.FailedStep
+		ms.state.DesiredStatus = s.DesiredStatus
+		persistedDesired = s.DesiredStatus
 		backend.RestoreBackendState(raw)
 	}
 
-	// On startup: adopt existing state or mark for restart
+	// On startup: adopt existing state, mark for restart, or
+	// autostart on cold boot.
 	adopt := svc.ShouldAdopt()
 	if pb, ok := backend.(*ProcessBackend); ok {
 		pb.adopt = adopt
 		msg := pb.TryAdopt()
 		log.Printf("**%s**: %s", svc.Name, msg)
+
+		// C1: if adoption did not result in a running process and
+		// autostart is enabled (and the operator did not explicitly
+		// stop the service on the previous run), queue a Start.
+		// The actual Start is gated on SignalReady in serviceLoop
+		// via the existing restartOnStartup machinery. We set
+		// autostartOnReady (not just restartOnStartup) so the loop
+		// issues a "start" op rather than a "restart" — a cold-boot
+		// autostart should not look like a hot reload to the
+		// notifier (no "restarted" event, no LastRestart bump).
+		adopted := strings.HasPrefix(msg, "adopted")
+		if !adopted && svc.ShouldAutostart(startOnBoot) {
+			if persistedDesired != "stopped" || svc.AutostartForce {
+				ms.autostartOnReady = true
+				ms.restartOnStartup = true
+				reason := "cold boot (adoption failed)"
+				if persistedDesired == "stopped" && svc.AutostartForce {
+					reason = "cold boot (autostart_force; ignoring stopped state)"
+				}
+				log.Printf("**%s**: autostart scheduled (%s)", svc.Name, reason)
+			}
+		}
 	} else if !adopt {
 		ms.restartOnStartup = true
 	}
@@ -183,16 +245,31 @@ func (m *Manager) startServiceLoop(ms *managedService) {
 func (m *Manager) serviceLoop(ms *managedService) {
 	defer m.wg.Done()
 
-	// Restart on startup if adopt: false (non-process backends).
-	// Wait for frontends to be ready so notifications can be delivered.
+	// Cold-boot op on startup. Two flavours:
+	//   - autostartOnReady (C1): a process service whose pid was
+	//     dead on cold boot, and autostart is enabled. We issue
+	//     "start" so the notification reads "started" (not
+	//     "restarted") and LastRestart is not bumped.
+	//   - restartOnStartup (pre-existing): non-process backends with
+	//     adopt: false, or process services that legitimately need
+	//     a "restart" semantics. We issue "restart".
+	// Both paths wait on readyCh so the notification has somewhere
+	// to land (the frontends reconnect in the background via the
+	// C2 retry loop; if SignalReady has not fired by the time
+	// frontends are working, the notification is still dropped
+	// silently — we do not block the cold boot on chat health).
 	if ms.restartOnStartup {
+		op := "restart"
+		if ms.autostartOnReady {
+			op = "start"
+		}
 		select {
 		case <-m.readyCh:
 		case <-m.ctx.Done():
 			return
 		}
-		log.Printf("**%s**: restarting (adopt: false)", ms.config.Name)
-		result := m.handleOp(ms, "restart")
+		log.Printf("**%s**: cold-boot op %q (adopt: false / autostart)", ms.config.Name, op)
+		result := m.handleOp(ms, op)
 		log.Printf("**%s**: %s", ms.config.Name, result)
 		m.saveServiceState(ms)
 	}
@@ -249,6 +326,12 @@ func (m *Manager) handleOp(ms *managedService, op string) string {
 		if err := ms.backend.Start(ctx); err != nil {
 			return fmt.Sprintf("start failed: %v", err)
 		}
+		// Operator intent is now "running". Clear the persisted
+		// "stopped" so a future C1 autostart does not get blocked
+		// by a prior operator stop.
+		ms.stateMu.Lock()
+		ms.state.DesiredStatus = "running"
+		ms.stateMu.Unlock()
 		m.notifyEvent(ms.config.Name, "started")
 		return "started"
 
@@ -256,6 +339,13 @@ func (m *Manager) handleOp(ms *managedService, op string) string {
 		if err := ms.backend.Stop(ctx); err != nil {
 			return fmt.Sprintf("stop failed: %v", err)
 		}
+		// Record operator intent. Live status is also "stopped" but
+		// will be overwritten on the next saveServiceState when the
+		// backend reports its status; DesiredStatus is preserved
+		// across that rewrite.
+		ms.stateMu.Lock()
+		ms.state.DesiredStatus = "stopped"
+		ms.stateMu.Unlock()
 		m.notifyEvent(ms.config.Name, "stopped")
 		return "stopped"
 
@@ -265,6 +355,7 @@ func (m *Manager) handleOp(ms *managedService, op string) string {
 		}
 		ms.stateMu.Lock()
 		ms.state.LastRestart = time.Now()
+		ms.state.DesiredStatus = "running"
 		ms.stateMu.Unlock()
 		m.notifyEvent(ms.config.Name, "restarted")
 		return "restarted"
@@ -396,16 +487,20 @@ func (m *Manager) saveServiceState(ms *managedService) {
 	}
 	ms.stateMu.Lock()
 	state := State{
-		Status:     ms.state.Status,
-		LastDeploy: ms.state.LastDeploy,
-		LastResult: ms.state.LastResult,
-		LastOutput: ms.state.LastOutput,
-		FailedStep: ms.state.FailedStep,
-		Backend:    ms.backend.SaveBackendState(),
+		Status:        ms.state.Status,
+		DesiredStatus: ms.state.DesiredStatus,
+		LastDeploy:    ms.state.LastDeploy,
+		LastResult:    ms.state.LastResult,
+		LastOutput:    ms.state.LastOutput,
+		FailedStep:    ms.state.FailedStep,
+		Backend:       ms.backend.SaveBackendState(),
 	}
 	ms.stateMu.Unlock()
 
-	// If status is not a special deploy state, query the backend for live status
+	// If status is not a special deploy state, query the backend for live status.
+	// We only overwrite Status, never DesiredStatus — the operator's last
+	// expressed intent must survive an unexpected process exit so C1
+	// autostart can distinguish "operator stopped" from "crashed".
 	if state.Status != "deploying" && state.Status != "failed" {
 		if status, err := ms.backend.Status(m.ctx); err == nil {
 			state.Status = status
@@ -541,7 +636,7 @@ func (m *Manager) Reload() error {
 				m.Do(svc.Name, "stop")
 				// Cancel the old loop by removing from map; it will exit on ctx.Done
 				// when manager stops, but we need to replace it now.
-				ms := m.newManagedService(svc)
+				ms := m.newManagedService(svc, m.startOnBoot)
 				m.mu.Lock()
 				m.services[svc.Name] = ms
 				m.mu.Unlock()
@@ -551,7 +646,7 @@ func (m *Manager) Reload() error {
 		}
 
 		// New service
-		ms := m.newManagedService(svc)
+		ms := m.newManagedService(svc, m.startOnBoot)
 		m.mu.Lock()
 		m.services[svc.Name] = ms
 		m.mu.Unlock()
@@ -610,7 +705,37 @@ func serviceConfigEqual(a, b config.ServiceConfig) bool {
 	if a.RequireConfirmation != b.RequireConfirmation {
 		return false
 	}
-	return a.SelfDeploy == b.SelfDeploy
+	if a.SelfDeploy != b.SelfDeploy {
+		return false
+	}
+	// Tri-state booleans: compare the pointers first (nil vs set),
+	// then the values when both are set. A change to Adopt / Autostart
+	// must trigger a config-equal mismatch so Reload re-creates the
+	// managed service with the new startup behaviour.
+	if !sameBoolPtr(a.Adopt, b.Adopt) {
+		return false
+	}
+	if !sameBoolPtr(a.Autostart, b.Autostart) {
+		return false
+	}
+	if a.AutostartForce != b.AutostartForce {
+		return false
+	}
+	return true
+}
+
+// sameBoolPtr returns true if the two *bool values are both nil, or
+// both non-nil and dereference to the same value. Tri-state fields
+// like Adopt / Autostart use this so a transition from "unset" to
+// "true" or "true" to "false" is correctly detected as a config change.
+func sameBoolPtr(a, b *bool) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
 }
 
 // ServiceNames returns a sorted list of all service names.
@@ -738,6 +863,12 @@ func (m *Manager) ShutdownCh() <-chan struct{} {
 func (m *Manager) Stop() {
 	m.cancel()
 	m.wg.Wait()
+	// Release the state lock so a follow-up instance can start
+	// immediately. flock(2) would also release this on process exit,
+	// but releasing explicitly makes the lifecycle clear and lets a
+	// subsequent NewManager in the same process (e.g. a test) succeed.
+	releaseStateLock(m.stateLock)
+	m.stateLock = nil
 }
 
 // SetNotifier sets or replaces the notifier. Must be called before deploys

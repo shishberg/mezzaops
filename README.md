@@ -52,7 +52,7 @@ ignored — this catches misplaced keys (e.g. a stray `process: { adopt: true }`
 block that was once hoped to be a global default). `process` and `adopt` are
 per-service fields, not top-level ones. The recognised top-level keys are
 `services_dir`, `log_dir`, `state_dir`, `discord`, `mattermost`, `matrix`,
-`webhook`, `dashboard`, and `readiness_timeout`.
+`webhook`, `dashboard`, `readiness_timeout`, and `start_on_boot`.
 
 `readiness_timeout` (default 30s, parsed as a Go duration like `45s`) bounds
 how long the supervisor waits for the chat frontends to connect on boot
@@ -60,6 +60,15 @@ before signalling readiness. A chat server that's unreachable on boot
 (e.g. Tailscale MagicDNS not ready yet) cannot block `adopt: false` /
 `autostart` services indefinitely — the frontends reconnect in the
 background via exponential backoff, and the gate opens after the timeout.
+
+`start_on_boot` (default false) is the global autostart default for
+process-backed services. When a process service's recorded pid is dead
+on cold boot and the persisted state is not `"stopped"`, the manager
+issues a Start once the frontends are ready. Per-service `autostart:
+true|false` in `services/*.yaml` overrides the global. A service with
+`autostart_force: true` is started even if the previous run ended
+with `status: "stopped"` — use with care, it ignores the operator's
+last command.
 
 **`services/*.yaml`** — one file per managed service:
 
@@ -76,6 +85,9 @@ branch: main
 repo: "github.com/org/mybot"
 service_name: "com.example.mybot"   # for launchctl/systemctl
 require_confirmation: false
+adopt: true                         # default true; re-attach to a running child
+autostart: true                     # default: Config.start_on_boot; cold-boot Start
+autostart_force: false              # default false; if true, ignore persisted "stopped"
 ```
 
 **`.env`** — secrets (or set as real env vars):

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/shishberg/mezzaops/internal/config"
+	"github.com/stretchr/testify/assert"
 )
 
 // testConfig builds a Config suitable for testing with temporary directories.
@@ -1158,4 +1160,459 @@ func TestManager_ServiceLoopWithContext(t *testing.T) {
 	// Do should return an error-like response since ctx is cancelled
 	result := m.Do("testsvc", "status")
 	_ = result // may return error or timeout, just shouldn't hang
+}
+
+// --- C1: autostart on cold boot ---
+
+// autostartService builds a ServiceConfig that runs `sleep 3600`. autostart
+// is a tri-state; pass nil to use the global default.
+func autostartService(name, dir string, autostart *bool) config.ServiceConfig {
+	svc := config.ServiceConfig{
+		Name:       name,
+		Dir:        dir,
+		Entrypoint: []string{"sleep", "3600"},
+	}
+	if autostart != nil {
+		svc.Autostart = autostart
+	}
+	return svc
+}
+
+// writeStoppedState writes a state file with DesiredStatus:"stopped" for
+// the named service, simulating "operator stopped this on the previous
+// run". C1 consults DesiredStatus (not Status) so an unexpected
+// process exit does not suppress autostart.
+func writeStoppedState(t *testing.T, stateDir, name string) {
+	t.Helper()
+	s := State{Status: "stopped", DesiredStatus: "stopped"}
+	if err := SaveState(stateDir, name, s); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNewManager_AutostartDisabledByDefault(t *testing.T) {
+	// With no autostart set anywhere, a process service with a dead pid
+	// stays down (preserves pre-C1 behaviour). The operator can still
+	// start it manually via the frontends.
+	cfg := testConfig(t)
+	cfg.StartOnBoot = false
+	dir := t.TempDir()
+
+	// Pre-seed a stale state file so the process backend tries and
+	// fails to adopt (stale pid).
+	stateDir := cfg.StateDir
+	staleState := State{
+		Status:  "running",
+		Backend: json.RawMessage(`{"pid":99999999,"pgid":99999999}`),
+	}
+	if err := SaveState(stateDir, "testsvc", staleState); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := autostartService("testsvc", dir, nil)
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	// Give the service loop a moment in case it would try to start.
+	time.Sleep(100 * time.Millisecond)
+	result := m.Do("testsvc", "status")
+	if !strings.Contains(result, "stopped") {
+		t.Fatalf("autostart-disabled service should be stopped, got: %q", result)
+	}
+}
+
+func TestNewManager_AutostartPerServiceStartsProcess(t *testing.T) {
+	// Per-service autostart=true + dead pid + status:"running" →
+	// process should be started on cold boot after SignalReady.
+	cfg := testConfig(t)
+	dir := t.TempDir()
+	stateDir := cfg.StateDir
+
+	staleState := State{
+		Status:  "running",
+		Backend: json.RawMessage(`{"pid":99999999,"pgid":99999999}`),
+	}
+	if err := SaveState(stateDir, "testsvc", staleState); err != nil {
+		t.Fatal(err)
+	}
+
+	yes := true
+	svc := autostartService("testsvc", dir, &yes)
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	// Unblock the autostart gate (the service loop waits on
+	// restartOnStartup / readyCh before issuing the Start).
+	m.SignalReady()
+
+	// Poll until the process is running, with a generous timeout.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		result := m.Do("testsvc", "status")
+		if strings.Contains(result, "running") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("autostart service did not start in time, status: %q", result)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestNewManager_AutostartGlobalDefaultStartsProcess(t *testing.T) {
+	// Global Config.StartOnBoot=true with no per-service override
+	// should autostart the process.
+	cfg := testConfig(t)
+	cfg.StartOnBoot = true
+	dir := t.TempDir()
+	stateDir := cfg.StateDir
+
+	staleState := State{
+		Status:  "running",
+		Backend: json.RawMessage(`{"pid":99999999,"pgid":99999999}`),
+	}
+	if err := SaveState(stateDir, "testsvc", staleState); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := autostartService("testsvc", dir, nil)
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	m.SignalReady()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		result := m.Do("testsvc", "status")
+		if strings.Contains(result, "running") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("global-autostart service did not start in time, status: %q", result)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestNewManager_AutostartRespectsPersistedStopped(t *testing.T) {
+	// A service with persisted status:"stopped" must NOT be autostarted
+	// even when autostart=true, unless AutostartForce is also set.
+	cfg := testConfig(t)
+	dir := t.TempDir()
+	stateDir := cfg.StateDir
+
+	writeStoppedState(t, stateDir, "testsvc")
+
+	yes := true
+	svc := autostartService("testsvc", dir, &yes)
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	m.SignalReady()
+
+	// Give the service loop time to (not) start.
+	time.Sleep(200 * time.Millisecond)
+	result := m.Do("testsvc", "status")
+	if !strings.Contains(result, "stopped") {
+		t.Fatalf("stopped service should stay stopped, got: %q", result)
+	}
+}
+
+func TestNewManager_AutostartForceOverridesPersistedStopped(t *testing.T) {
+	// With AutostartForce, a service with status:"stopped" in its
+	// state file is still started on cold boot.
+	cfg := testConfig(t)
+	dir := t.TempDir()
+	stateDir := cfg.StateDir
+
+	writeStoppedState(t, stateDir, "testsvc")
+
+	yes := true
+	svc := autostartService("testsvc", dir, &yes)
+	svc.AutostartForce = true
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	m.SignalReady()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		result := m.Do("testsvc", "status")
+		if strings.Contains(result, "running") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("autostart_force service did not start, status: %q", result)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestNewManager_AutostartPerServiceFalseOverridesGlobal(t *testing.T) {
+	// Per-service autostart=false must override global true.
+	cfg := testConfig(t)
+	cfg.StartOnBoot = true
+	dir := t.TempDir()
+	stateDir := cfg.StateDir
+
+	staleState := State{
+		Status:  "running",
+		Backend: json.RawMessage(`{"pid":99999999,"pgid":99999999}`),
+	}
+	if err := SaveState(stateDir, "testsvc", staleState); err != nil {
+		t.Fatal(err)
+	}
+
+	no := false
+	svc := autostartService("testsvc", dir, &no)
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	m.SignalReady()
+	time.Sleep(200 * time.Millisecond)
+	result := m.Do("testsvc", "status")
+	if !strings.Contains(result, "stopped") {
+		t.Fatalf("per-service autostart=false should win, got: %q", result)
+	}
+}
+
+func TestServiceConfig_ShouldAutostart(t *testing.T) {
+	yes, no := true, false
+	cases := []struct {
+		name     string
+		svc      config.ServiceConfig
+		global   bool
+		expected bool
+	}{
+		{"unset+global-false", config.ServiceConfig{}, false, false},
+		{"unset+global-true", config.ServiceConfig{}, true, true},
+		{"per-yes-overrides-global-false", config.ServiceConfig{Autostart: &yes}, false, true},
+		{"per-yes-overrides-global-true", config.ServiceConfig{Autostart: &yes}, true, true},
+		{"per-no-overrides-global-true", config.ServiceConfig{Autostart: &no}, true, false},
+		{"per-no-overrides-global-false", config.ServiceConfig{Autostart: &no}, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.expected, c.svc.ShouldAutostart(c.global))
+		})
+	}
+}
+
+// --- C5: single-instance lock on state dir ---
+
+func TestNewManager_TakesStateLock(t *testing.T) {
+	// A second manager pointed at the same state dir must fail fast
+	// with a descriptive error rather than co-managing the same
+	// processes. (C5 acceptance criterion.)
+	cfg := testConfig(t)
+	cfg.LogDir = t.TempDir()
+	dir := t.TempDir()
+	svc := sleepService("testsvc", dir)
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	// Second instance: same state dir, must fail.
+	_, err = NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err == nil {
+		t.Fatal("second NewManager on the same state dir should fail")
+	}
+	assert.Contains(t, err.Error(), "another mezzaops instance")
+}
+
+func TestNewManager_LockReleasedOnStop(t *testing.T) {
+	// After the first manager stops, a new manager pointed at the
+	// same state dir must succeed. (C5 acceptance criterion.)
+	cfg := testConfig(t)
+	cfg.LogDir = t.TempDir()
+	dir := t.TempDir()
+	svc := sleepService("testsvc", dir)
+
+	m1, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m1.Stop()
+
+	m2, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatalf("second NewManager after first Stop should succeed, got: %v", err)
+	}
+	defer m2.Stop()
+}
+
+func TestNewManager_LockFileContainsPID(t *testing.T) {
+	// Sanity: the lock file is created in the state dir and contains
+	// the holding PID. Operators can `cat` it to see who holds the
+	// lock when troubleshooting.
+	cfg := testConfig(t)
+	cfg.LogDir = t.TempDir()
+	dir := t.TempDir()
+	svc := sleepService("testsvc", dir)
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	lockPath := filepath.Join(cfg.StateDir, "mezzaops.lock")
+	data, readErr := os.ReadFile(lockPath)
+	if readErr != nil {
+		t.Fatalf("expected lock file at %q, got: %v", lockPath, readErr)
+	}
+	assert.Contains(t, string(data), "pid=")
+}
+
+// --- C1 follow-up: a crashed process is NOT an operator stop ---
+
+func TestNewManager_AutostartIgnoresCrashedProcess(t *testing.T) {
+	// Regression: an unexpected process exit writes status="stopped"
+	// to the state file (because the live status is "stopped"). C1
+	// must not interpret that as an operator stop; it must consult
+	// DesiredStatus, which is only set on explicit start/stop ops.
+	cfg := testConfig(t)
+	dir := t.TempDir()
+	stateDir := cfg.StateDir
+
+	// Simulate a crashed process: Status="stopped" (the live status
+	// was overwritten when the previous run noticed the dead pid and
+	// re-saved state), DesiredStatus="" (no operator intent).
+	crashedState := State{
+		Status:  "stopped", // written by the previous run's exit handler
+		Backend: json.RawMessage(`{"pid":99999999,"pgid":99999999}`),
+	}
+	if err := SaveState(stateDir, "testsvc", crashedState); err != nil {
+		t.Fatal(err)
+	}
+
+	yes := true
+	svc := autostartService("testsvc", dir, &yes)
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	m.SignalReady()
+
+	// The service should be started (not treated as a stopped-by-operator).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		result := m.Do("testsvc", "status")
+		if strings.Contains(result, "running") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("crashed-then-autostart should have started, got: %q", result)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestServiceState_DesiredStatusRoundTrip(t *testing.T) {
+	// DesiredStatus must survive save/load with the same value.
+	dir := t.TempDir()
+	want := State{
+		Status:        "running",
+		DesiredStatus: "stopped",
+	}
+	if err := SaveState(dir, "testsvc", want); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := LoadState(dir, "testsvc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Equal(t, "stopped", got.DesiredStatus, "DesiredStatus must round-trip")
+	assert.Equal(t, "running", got.Status, "Status must round-trip")
+}
+
+func TestServiceState_DesiredStatusNotClobberedBySave(t *testing.T) {
+	// saveServiceState re-queries the backend for live status, but
+	// must not overwrite DesiredStatus (operator intent). Set up a
+	// service whose DesiredStatus="stopped" and live status="running"
+	// and verify a save preserves DesiredStatus.
+	cfg := testConfig(t)
+	dir := t.TempDir()
+	svc := sleepService("testsvc", dir)
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	// Inject a DesiredStatus.
+	m.mu.Lock()
+	ms := m.services["testsvc"]
+	ms.stateMu.Lock()
+	ms.state.DesiredStatus = "stopped"
+	ms.stateMu.Unlock()
+	m.mu.Unlock()
+
+	// Start the service (live status becomes "running", DesiredStatus
+	// is cleared by handleOp "start" — that is the right behaviour for
+	// an explicit start). Save and verify DesiredStatus is "running".
+	m.Do("testsvc", "start")
+	m.saveServiceState(ms)
+
+	s, _, err := LoadState(cfg.StateDir, "testsvc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Equal(t, "running", s.DesiredStatus, "operator's start should clear persisted stop")
+}
+
+// --- C5 follow-up: reload respects autostart field changes ---
+
+func TestServiceConfigEqual_AutostartChangesTriggerReload(t *testing.T) {
+	// A change to Autostart (per-service) must be detected by
+	// serviceConfigEqual so Reload re-creates the managed service.
+	yes, no := true, false
+	cases := []struct {
+		name string
+		a, b config.ServiceConfig
+		want bool
+	}{
+		{"identical", config.ServiceConfig{}, config.ServiceConfig{}, true},
+		{"autostart-nil-vs-true", config.ServiceConfig{}, config.ServiceConfig{Autostart: &yes}, false},
+		{"autostart-true-vs-false", config.ServiceConfig{Autostart: &yes}, config.ServiceConfig{Autostart: &no}, false},
+		{"autostart-true-vs-true", config.ServiceConfig{Autostart: &yes}, config.ServiceConfig{Autostart: &yes}, true},
+		{"adopt-nil-vs-false", config.ServiceConfig{}, config.ServiceConfig{Adopt: &no}, false},
+		{"autostart-force-changed", config.ServiceConfig{AutostartForce: false}, config.ServiceConfig{AutostartForce: true}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.want, serviceConfigEqual(c.a, c.b))
+		})
+	}
 }

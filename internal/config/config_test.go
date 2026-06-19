@@ -453,6 +453,31 @@ func TestLoadConfig_NoWarningOnMinimalConfig(t *testing.T) {
 		"minimal config should not log a warning, got: %q", out)
 }
 
+func TestLoadConfig_StartOnBootNotFlaggedUnknown(t *testing.T) {
+	// Codex review of C1 caught that the global `start_on_boot` key
+	// was missing from knownTopLevelConfigKeys, so a perfectly valid
+	// C1 config was always logged as an unknown key. Regression test.
+	yaml := `
+start_on_boot: true
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+
+	var (
+		cfg *config.Config
+		err error
+	)
+	out := captureLog(t, func() {
+		cfg, err = config.LoadConfig(path)
+	})
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	assert.True(t, cfg.StartOnBoot,
+		"start_on_boot: true should round-trip into the Config struct")
+	assert.False(t, strings.Contains(out, "unknown"),
+		"start_on_boot is a recognised key and should not log a warning, got: %q", out)
+}
+
 func TestLoadConfig_DefaultsReadinessTimeoutTo30s(t *testing.T) {
 	yaml := `{}`
 	path := filepath.Join(t.TempDir(), "config.yaml")
