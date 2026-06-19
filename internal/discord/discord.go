@@ -79,6 +79,20 @@ func (b *Bot) Run(ctx context.Context) error {
 		return fmt.Errorf("discord open: %w", err)
 	}
 
+	// Build and register commands first; if registration fails we want to
+	// bail before the status goroutine and other long-lived handlers are
+	// started, so a C2 retry of Run doesn't accumulate orphaned goroutines.
+	b.rebuildCommands()
+
+	b.mu.Lock()
+	cmds := b.commands
+	b.mu.Unlock()
+
+	if err := b.setCommands(b.session, cmds); err != nil {
+		_ = b.session.Close()
+		return fmt.Errorf("discord register commands: %w", err)
+	}
+
 	// Set up presence status via a channel + goroutine so counter reads are
 	// always serialized after the state change that triggered them.
 	type statusEvent struct {
@@ -133,19 +147,6 @@ func (b *Bot) Run(ctx context.Context) error {
 		statusCh <- statusEvent{"", "reconnected"}
 	})
 
-	// Build and register commands.
-	b.rebuildCommands()
-
-	b.mu.Lock()
-	cmds := b.commands
-	b.mu.Unlock()
-
-	_, err = b.session.ApplicationCommandBulkOverwrite(b.session.State.User.ID, b.cfg.GuildID, cmds)
-	if err != nil {
-		_ = b.session.Close()
-		return fmt.Errorf("discord register commands: %w", err)
-	}
-
 	// Handle interactions.
 	b.session.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		if i.ApplicationCommandData().Name != "ops" {
@@ -167,11 +168,30 @@ func (b *Bot) Run(ctx context.Context) error {
 
 	log.Println("Discord bot shutting down.")
 
-	// Deregister commands and close session.
-	_, _ = b.session.ApplicationCommandBulkOverwrite(b.session.State.User.ID, b.cfg.GuildID, nil)
+	// Deregister commands (best-effort) and close session.
+	_ = b.setCommands(b.session, nil)
 	_ = b.session.Close()
 
 	return nil
+}
+
+// setCommands registers (or deregisters, when cmds is nil) the bot's
+// slash commands with Discord. It guards against partial-open sessions
+// where the WebSocket is connected but the Ready event has not yet
+// populated State.User — the previous inline dereference would panic the
+// whole process. Returning an error here lets the C2 retry loop take over.
+func (b *Bot) setCommands(sess *discordgo.Session, cmds []*discordgo.ApplicationCommand) error {
+	if sess == nil {
+		return fmt.Errorf("discord: nil session")
+	}
+	if sess.State == nil {
+		return fmt.Errorf("discord: session state is nil")
+	}
+	if sess.State.User == nil {
+		return fmt.Errorf("discord: session state user is nil (Ready not yet received)")
+	}
+	_, err := sess.ApplicationCommandBulkOverwrite(sess.State.User.ID, b.cfg.GuildID, cmds)
+	return err
 }
 
 // rebuildCommands rebuilds the slash command list from current service names.
@@ -198,12 +218,10 @@ func (b *Bot) routeInteraction(i *discordgo.InteractionCreate) string {
 				err := b.manager.Reload()
 				// Rebuild and re-register commands after reload.
 				b.rebuildCommands()
-				if b.session != nil {
-					b.mu.Lock()
-					cmds := b.commands
-					b.mu.Unlock()
-					_, _ = b.session.ApplicationCommandBulkOverwrite(b.session.State.User.ID, b.cfg.GuildID, cmds)
-				}
+				b.mu.Lock()
+				cmds := b.commands
+				b.mu.Unlock()
+				_ = b.setCommands(b.session, cmds)
 				if err != nil {
 					return "Config reload error: " + err.Error()
 				}

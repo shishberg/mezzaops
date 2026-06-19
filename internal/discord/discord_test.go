@@ -478,3 +478,42 @@ func TestNotifier_FallbackToLog(t *testing.T) {
 	// Should not panic — falls back to log.Println
 	n.ServiceEvent("api", "started")
 }
+
+// --- C4: nil-session guard for command registration ---
+//
+// Regression tests for the panic at line ~143 of discord.go:
+// `_, err = b.session.ApplicationCommandBulkOverwrite(b.session.State.User.ID, ...)`
+// In a partial-open scenario the WebSocket is connected but the Ready event
+// has not yet populated State.User. Dereferencing it panics the whole
+// process. The fix routes through a `setCommands` helper that returns an
+// error instead of dereferencing, so the C2 retry loop can take over.
+
+func TestSetCommands_NilSession(t *testing.T) {
+	mgr := &mockManager{serviceNames: []string{"api"}}
+	b := &Bot{cfg: Config{GuildID: "123"}, manager: mgr}
+
+	err := b.setCommands(nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "session")
+}
+
+func TestSetCommands_NilState(t *testing.T) {
+	mgr := &mockManager{serviceNames: []string{"api"}}
+	b := &Bot{cfg: Config{GuildID: "123"}, manager: mgr}
+
+	// Zero-value session — State field is nil.
+	err := b.setCommands(&discordgo.Session{}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "state")
+}
+
+func TestSetCommands_NilUser(t *testing.T) {
+	mgr := &mockManager{serviceNames: []string{"api"}}
+	b := &Bot{cfg: Config{GuildID: "123"}, manager: mgr}
+
+	// Session with a non-nil State whose User is nil — this is the exact
+	// partial-open case that used to panic.
+	err := b.setCommands(&discordgo.Session{State: discordgo.NewState()}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "user")
+}
