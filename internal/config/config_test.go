@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/shishberg/mezzaops/internal/config"
 	"github.com/stretchr/testify/assert"
@@ -450,4 +451,57 @@ func TestLoadConfig_NoWarningOnMinimalConfig(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, strings.Contains(out, "unknown"),
 		"minimal config should not log a warning, got: %q", out)
+}
+
+func TestLoadConfig_DefaultsReadinessTimeoutTo30s(t *testing.T) {
+	yaml := `{}`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+
+	cfg, err := config.LoadConfig(path)
+	require.NoError(t, err)
+	assert.Equal(t, 30*time.Second, cfg.EffectiveReadinessTimeout(),
+		"zero/empty readiness_timeout should default to 30s")
+}
+
+func TestLoadConfig_ParsesReadinessTimeout(t *testing.T) {
+	// YAML library decodes time.Duration as nanoseconds when the value is
+	// a bare integer, so we write it as a Go duration string ("45s") which
+	// the library also accepts.
+	yaml := `readiness_timeout: 45s`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+
+	cfg, err := config.LoadConfig(path)
+	require.NoError(t, err)
+	assert.Equal(t, 45*time.Second, cfg.EffectiveReadinessTimeout())
+}
+
+func TestLoadConfig_ZeroReadinessTimeoutUsesDefault(t *testing.T) {
+	// Explicit zero should still trigger the default. The app layer
+	// must not block indefinitely on a misconfigured value.
+	yaml := `readiness_timeout: 0s`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+
+	cfg, err := config.LoadConfig(path)
+	require.NoError(t, err)
+	assert.Equal(t, 30*time.Second, cfg.EffectiveReadinessTimeout())
+}
+
+func TestLoadConfig_ReadinessTimeoutIsKnownKey(t *testing.T) {
+	// readiness_timeout is a real top-level key — it must not be reported
+	// as unknown. Regression for a codex review finding: adding the field
+	// to Config but forgetting to add it to knownTopLevelConfigKeys.
+	yaml := `readiness_timeout: 45s`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+
+	var err error
+	out := captureLog(t, func() {
+		_, err = config.LoadConfig(path)
+	})
+	require.NoError(t, err)
+	assert.False(t, strings.Contains(out, "unknown"),
+		"readiness_timeout should be a known top-level key, got: %q", out)
 }

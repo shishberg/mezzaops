@@ -98,9 +98,23 @@ func (m *mockWSClient) SetListenError(err *model.AppError) {
 type mockRestClient struct {
 	mu    sync.Mutex
 	posts []*model.Post
+
+	// identityErrors makes the first N GetMe calls return an error, then
+	// the (N+1)-th call returns a valid user. Used by the C2 retry tests.
+	identityErrors int
+	// channelByName, when non-nil, is returned by GetChannelByNameForTeamName.
+	channelByName *model.Channel
+	// channelByNameErr makes GetChannelByNameForTeamName return an error.
+	channelByNameErr error
 }
 
 func (m *mockRestClient) GetMe(_ context.Context, _ string) (*model.User, *model.Response, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.identityErrors > 0 {
+		m.identityErrors--
+		return nil, &model.Response{}, fmt.Errorf("simulated identity lookup failure")
+	}
 	return &model.User{Id: "bot-user-id"}, &model.Response{}, nil
 }
 
@@ -116,7 +130,22 @@ func (m *mockRestClient) GetChannel(_ context.Context, channelId string) (*model
 }
 
 func (m *mockRestClient) GetChannelByNameForTeamName(_ context.Context, _, _ string, _ string) (*model.Channel, *model.Response, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.channelByNameErr != nil {
+		return nil, &model.Response{}, m.channelByNameErr
+	}
+	if m.channelByName != nil {
+		return m.channelByName, &model.Response{}, nil
+	}
 	return &model.Channel{Id: "channel-id-123"}, &model.Response{}, nil
+}
+
+// newMockRestClient is a constructor with optional setters for the C2
+// retry tests. Use struct-field initialisation directly when the existing
+// zero-value behaviour is fine.
+func newMockRestClient() *mockRestClient {
+	return &mockRestClient{}
 }
 
 func (m *mockRestClient) getPosts() []*model.Post {
@@ -1213,4 +1242,91 @@ func TestStatusOverview_Sorted(t *testing.T) {
 	copy(sorted, svcLines)
 	sort.Strings(sorted)
 	assert.Equal(t, sorted, svcLines)
+}
+
+// --- C2: initial connect retry ---
+
+// runWithFakeREST returns a Bot wired with the standard mock rest client
+// and a configurable identity-error injector, plus a WS mock that listens
+// forever. Used by the C2 tests below.
+func runWithFakeREST(t *testing.T, identityErrsBeforeSuccess int) *Bot {
+	t.Helper()
+	rest := newMockRestClient()
+	// Queue N errors before the call succeeds.
+	rest.identityErrors = identityErrsBeforeSuccess
+
+	ws := newMockWSClient()
+	bot := &Bot{
+		cfg:       Config{URL: "http://localhost", Channel: "team/chan"},
+		rest:      rest,
+		readyCh:   make(chan struct{}),
+		manager:   newMockServiceManager(),
+		connectWS: func(_, _ string) (wsClient, error) { return ws, nil },
+	}
+	// Stub GetChannelByNameForTeamName to succeed.
+	rest.channelByName = &model.Channel{Id: "chan-id"}
+	return bot
+}
+
+func TestRun_RetriesInitialConnectUntilSuccess(t *testing.T) {
+	// resolveIdentity is the front of the connect path. With 2 errors
+	// queued before the third call succeeds, Run should retry through them
+	// and only close readyCh when the third call works.
+	bot := runWithFakeREST(t, 2)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- bot.Run(ctx) }()
+
+	select {
+	case <-bot.Ready():
+		// good
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ready did not fire after retries succeeded")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+func TestRun_DoesNotCloseReadyOnPermanentFailure(t *testing.T) {
+	// If every attempt fails, Run never closes readyCh — the C3 app-layer
+	// timeout is what eventually unblocks the manager. We assert the
+	// negative: readyCh is open while attempts are failing.
+	bot := runWithFakeREST(t, 100) // effectively permanent failure for the test
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- bot.Run(ctx) }()
+
+	// Give a couple of attempts time to fail.
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-bot.Ready():
+		t.Fatal("Ready should not fire while every attempt fails")
+	default:
+		// expected
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+func TestRun_MarkReadyIsIdempotent(t *testing.T) {
+	// markReady is called once per successful connect attempt. A retry
+	// that follows a successful first connect would call it again on the
+	// next successful attempt — which must not panic on a closed channel.
+	bot := runWithFakeREST(t, 0)
+	bot.markReady()
+	bot.markReady() // second call must be a no-op, not a panic
 }

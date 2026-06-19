@@ -13,8 +13,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/shishberg/mezzaops/internal/reconnect"
 	"github.com/shishberg/mezzaops/internal/service"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/crypto/cryptohelper"
@@ -109,13 +112,24 @@ type Bot struct {
 	// is the same *mautrix.Client (when not under test); we keep the typed
 	// reference so we can set Crypto, register Sync handlers, and call
 	// SyncWithContext, which the abstraction deliberately does not expose.
-	client       matrixClient
-	realClient   *mautrix.Client
-	newClientErr error
-	stateDir     string
-	userID       id.UserID
-	roomID       id.RoomID
-	readyCh      chan struct{}
+	//
+	// Both client and realClient are nil until Run makes the first
+	// successful connect. New() does not perform I/O; the discovery +
+	// client construction is part of the retried connect path so a
+	// transient failure on boot (e.g. Tailscale MagicDNS not ready
+	// yet) does not permanently disable the frontend.
+	//
+	// client, realClient, and roomID are written by runOnce and read by
+	// PostMessage and the event handlers. connMu protects them so a
+	// notification issued while runOnce is still building the client (or
+	// tearing it down on retry) sees a consistent snapshot.
+	client     matrixClient
+	realClient *mautrix.Client
+	stateDir   string
+	userID     id.UserID
+	roomID     id.RoomID
+	readyCh    chan struct{}
+	connMu     sync.Mutex
 }
 
 // discoverFunc resolves a Matrix server name to its client-server API
@@ -158,15 +172,13 @@ func resolveHomeserverURL(homeserver string, discover discoverFunc) (string, err
 	return wk.Homeserver.BaseURL, nil
 }
 
-// New constructs a Bot. The real connection, alias resolution, and crypto
-// bootstrap happen in Run; the only I/O performed here is the optional
-// /.well-known/matrix/client lookup when cfg.Homeserver is a bare server
-// name. stateDir is used to derive the default crypto database path when
-// cfg.CryptoDB is empty.
-//
-// A malformed homeserver URL or a failed discovery is recorded and surfaces
-// from Run; matching the Mattermost frontend, construction itself does not
-// return an error.
+// New constructs a Bot. No I/O is performed: the real connection, homeserver
+// discovery, alias resolution, and crypto bootstrap happen in Run. Doing
+// the construction lazily is what lets the C2 retry loop recover from a
+// transient failure on boot (e.g. Tailscale MagicDNS not ready yet) —
+// a failure during discovery or NewClient no longer permanently disables
+// the frontend. stateDir is used to derive the default crypto database
+// path when cfg.CryptoDB is empty.
 func New(cfg Config, stateDir string, manager ServiceManager) *Bot {
 	prefix := cfg.CommandPrefix
 	if prefix == "" {
@@ -174,35 +186,13 @@ func New(cfg Config, stateDir string, manager ServiceManager) *Bot {
 	}
 	cfg.CommandPrefix = prefix
 
-	bot := &Bot{
+	return &Bot{
 		cfg:      cfg,
 		manager:  manager,
 		stateDir: stateDir,
 		userID:   id.UserID(cfg.UserID),
 		readyCh:  make(chan struct{}),
 	}
-
-	homeserverURL, err := resolveHomeserverURL(cfg.Homeserver, discoverClientAPI)
-	if err != nil {
-		bot.newClientErr = err
-		return bot
-	}
-	if homeserverURL != cfg.Homeserver {
-		log.Printf("matrix: homeserver %q resolved to %s", cfg.Homeserver, homeserverURL)
-	}
-
-	client, err := mautrix.NewClient(homeserverURL, id.UserID(cfg.UserID), cfg.AccessToken)
-	if err != nil {
-		bot.newClientErr = err
-		return bot
-	}
-	client.DeviceID = id.DeviceID(cfg.DeviceID)
-	// Route mautrix's internal logs to stderr so they land alongside the
-	// standard library log output the rest of mezzaops uses.
-	client.Log = zerolog.New(os.Stderr).Level(zerolog.InfoLevel).With().Timestamp().Logger()
-	bot.client = client
-	bot.realClient = client
-	return bot
 }
 
 // SetConfirmHandler installs the deploy-confirmation handler.
@@ -217,19 +207,58 @@ func (b *Bot) CommandPrefix() string { return b.cfg.CommandPrefix }
 // bootstrap, so callers know it is safe to call PostMessage.
 func (b *Bot) Ready() <-chan struct{} { return b.readyCh }
 
-// Run resolves the configured room, initialises crypto, registers sync
-// handlers, and blocks on SyncWithContext until ctx is cancelled. mautrix
-// reconnects internally; an error here means the loop exited for good.
+// markReady closes readyCh exactly once. Safe to call from multiple retry
+// attempts; the second close is recovered.
+func (b *Bot) markReady() {
+	defer func() { _ = recover() }()
+	close(b.readyCh)
+}
+
+// Run resolves the configured room, initialises crypto, and blocks on
+// SyncWithContext until ctx is cancelled. The crypto init + sync loop is
+// wrapped in a reconnect loop with capped exponential backoff so a
+// transient failure on boot (e.g. Tailscale MagicDNS not ready yet) does
+// not permanently disable the frontend. mautrix reconnects internally
+// within a single sync loop; the retry here covers the loop exiting.
+//
+// resolveRoom is called once and cached: the room ID is stable for the
+// life of the bot, and re-resolving an alias on every retry is wasted
+// work that could itself fail.
+// Run is the entry point for the C2 retry loop. Discovery + client
+// construction are part of the first attempt and may be retried on
+// transient failure. ctx cancellation aborts the loop.
 func (b *Bot) Run(ctx context.Context) error {
-	if b.newClientErr != nil {
-		return fmt.Errorf("matrix client: %w", b.newClientErr)
-	}
-	if b.realClient == nil {
-		return fmt.Errorf("matrix client not initialised")
+	return reconnect.RunWithBackoff(ctx, "matrix", reconnect.Options{
+		InitialDelay:   1 * time.Second,
+		MaxDelay:       60 * time.Second,
+		Factor:         2.0,
+		JitterFraction: 0.2,
+		Logger: func(name string, attempt int, err error, nextDelay time.Duration) {
+			log.Printf("%s: connect attempt %d failed: %v; retrying in %s", name, attempt, err, nextDelay)
+		},
+	}, b.runOnce)
+}
+
+// runOnce performs the per-attempt connect path: build a fresh mautrix
+// client (every attempt, because the previous attempt's crypto helper
+// closes the SQLite database and re-using the client would point its
+// StateStore at a closed connection), resolve the room (cached after
+// the first success), initialise the crypto helper, mark the bot ready,
+// and then block on SyncWithContext until ctx is cancelled.
+//
+// Per-attempt client construction also means the syncer handlers are
+// registered once per attempt against a fresh syncer, which avoids the
+// duplicate-dispatch bug that would occur if we re-registered them
+// against a reused syncer (DefaultSyncer has no Reset).
+func (b *Bot) runOnce(ctx context.Context) error {
+	if err := b.connectClient(); err != nil {
+		return err
 	}
 
-	if err := b.resolveRoom(ctx); err != nil {
-		return fmt.Errorf("resolving room: %w", err)
+	if b.roomID == "" {
+		if err := b.resolveRoom(ctx); err != nil {
+			return fmt.Errorf("resolving room: %w", err)
+		}
 	}
 
 	cryptoDB := b.cfg.CryptoDB
@@ -242,18 +271,16 @@ func (b *Bot) Run(ctx context.Context) error {
 		return fmt.Errorf("creating crypto helper: %w", err)
 	}
 	if err := helper.Init(ctx); err != nil {
+		// Close the helper so its SQLite store is not leaked. The
+		// next attempt will rebuild the client and helper from scratch.
+		if cerr := helper.Close(); cerr != nil {
+			log.Printf("matrix: closing crypto helper after failed init: %v", cerr)
+		}
 		return fmt.Errorf("initialising crypto helper: %w", err)
 	}
 	b.realClient.Crypto = helper
 
-	syncer, ok := b.realClient.Syncer.(*mautrix.DefaultSyncer)
-	if !ok {
-		return fmt.Errorf("unexpected syncer type %T", b.realClient.Syncer)
-	}
-	syncer.OnEventType(event.EventMessage, b.handleMessage)
-	syncer.OnEventType(event.StateMember, b.handleInvite)
-
-	close(b.readyCh)
+	b.markReady()
 
 	syncErr := b.realClient.SyncWithContext(ctx)
 	if cerr := helper.Close(); cerr != nil {
@@ -265,20 +292,71 @@ func (b *Bot) Run(ctx context.Context) error {
 	return syncErr
 }
 
+// connectClient performs the homeserver discovery, builds the mautrix
+// client, and registers the sync handlers exactly once. It is called
+// from runOnce on the first attempt, and its result is reused across
+// subsequent retries. A failure here bubbles up to the retry loop.
+func (b *Bot) connectClient() error {
+	homeserverURL, err := resolveHomeserverURL(b.cfg.Homeserver, discoverClientAPI)
+	if err != nil {
+		return fmt.Errorf("matrix client: %w", err)
+	}
+	if homeserverURL != b.cfg.Homeserver {
+		log.Printf("matrix: homeserver %q resolved to %s", b.cfg.Homeserver, homeserverURL)
+	}
+
+	client, err := mautrix.NewClient(homeserverURL, id.UserID(b.cfg.UserID), b.cfg.AccessToken)
+	if err != nil {
+		return fmt.Errorf("matrix client: %w", err)
+	}
+	client.DeviceID = id.DeviceID(b.cfg.DeviceID)
+	// Route mautrix's internal logs to stderr so they land alongside the
+	// standard library log output the rest of mezzaops uses.
+	client.Log = zerolog.New(os.Stderr).Level(zerolog.InfoLevel).With().Timestamp().Logger()
+
+	syncer, ok := client.Syncer.(*mautrix.DefaultSyncer)
+	if !ok {
+		return fmt.Errorf("matrix client: unexpected syncer type %T", client.Syncer)
+	}
+	syncer.OnEventType(event.EventMessage, b.handleMessage)
+	syncer.OnEventType(event.StateMember, b.handleInvite)
+
+	b.connMu.Lock()
+	b.client = client
+	b.realClient = client
+	b.connMu.Unlock()
+	return nil
+}
+
+// publishRoomID stores the resolved roomID under the connection lock so
+// concurrent readers in PostMessage / event handlers see a consistent
+// snapshot.
+func (b *Bot) publishRoomID(r id.RoomID) {
+	b.connMu.Lock()
+	b.roomID = r
+	b.connMu.Unlock()
+}
+
 // resolveRoom turns either a room ID (!) or a room alias (#) into the
 // canonical id.RoomID stored on the bot. Anything else is a config error.
 func (b *Bot) resolveRoom(ctx context.Context) error {
 	room := b.cfg.Room
 	switch {
 	case strings.HasPrefix(room, "!"):
-		b.roomID = id.RoomID(room)
+		b.publishRoomID(id.RoomID(room))
 		return nil
 	case strings.HasPrefix(room, "#"):
-		resp, err := b.client.ResolveAlias(ctx, id.RoomAlias(room))
+		b.connMu.Lock()
+		client := b.client
+		b.connMu.Unlock()
+		if client == nil {
+			return fmt.Errorf("resolving alias %q: client not initialised", room)
+		}
+		resp, err := client.ResolveAlias(ctx, id.RoomAlias(room))
 		if err != nil {
 			return fmt.Errorf("resolving alias %q: %w", room, err)
 		}
-		b.roomID = resp.RoomID
+		b.publishRoomID(resp.RoomID)
 		return nil
 	default:
 		return fmt.Errorf("invalid room %q: must start with '!' (room ID) or '#' (alias)", room)
@@ -291,12 +369,22 @@ func (b *Bot) resolveRoom(ctx context.Context) error {
 // have a place to surface them.
 //
 // Drops the message if called before Run has completed setup: client is nil
-// when mautrix.NewClient failed in New, and roomID is unset until resolveRoom
-// runs. The bot is appended to the manager's notifier list during app.New, so
+// when mautrix.NewClient failed, and roomID is unset until resolveRoom runs.
+// The bot is appended to the manager's notifier list during app.New, so
 // either condition is reachable before Run finishes (or at all, if it
-// errored).
+// errored). The C3 readiness timeout explicitly allows notifications
+// before all frontends are connected, so this race is a real possibility.
+//
+// The (client, roomID) pair is snapshotted under connMu so concurrent
+// retry-driven teardown cannot leave PostMessage using a half-updated
+// pair (a client whose roomID has been cleared, or vice versa).
 func (b *Bot) PostMessage(ctx context.Context, message string) {
-	if b.client == nil || b.roomID == "" {
+	b.connMu.Lock()
+	client := b.client
+	roomID := b.roomID
+	b.connMu.Unlock()
+
+	if client == nil || roomID == "" {
 		log.Printf("matrix: PostMessage called before bot is ready, dropping message")
 		return
 	}
@@ -304,7 +392,7 @@ func (b *Bot) PostMessage(ctx context.Context, message string) {
 	content.MsgType = event.MsgText
 	content.Body = message
 	content.Format = event.FormatHTML
-	if _, err := b.client.SendMessageEvent(ctx, b.roomID, event.EventMessage, content); err != nil {
+	if _, err := client.SendMessageEvent(ctx, roomID, event.EventMessage, content); err != nil {
 		log.Printf("matrix: send message: %v", err)
 	}
 }
@@ -312,7 +400,10 @@ func (b *Bot) PostMessage(ctx context.Context, message string) {
 // handleMessage filters to the configured room, ignores our own messages,
 // parses the command, and posts the response back.
 func (b *Bot) handleMessage(ctx context.Context, evt *event.Event) {
-	if evt.RoomID != b.roomID {
+	b.connMu.Lock()
+	roomID := b.roomID
+	b.connMu.Unlock()
+	if evt.RoomID != roomID {
 		return
 	}
 	if evt.Sender == b.userID {
@@ -332,7 +423,10 @@ func (b *Bot) handleMessage(ctx context.Context, evt *event.Event) {
 // handleInvite auto-joins only when the invite is for our user and the
 // configured room. Invites to any other room are ignored.
 func (b *Bot) handleInvite(ctx context.Context, evt *event.Event) {
-	if evt.RoomID != b.roomID {
+	b.connMu.Lock()
+	roomID := b.roomID
+	b.connMu.Unlock()
+	if evt.RoomID != roomID {
 		return
 	}
 	if evt.GetStateKey() != string(b.userID) {
@@ -345,7 +439,13 @@ func (b *Bot) handleInvite(ctx context.Context, evt *event.Event) {
 	if mec.Membership != event.MembershipInvite {
 		return
 	}
-	if _, err := b.client.JoinRoomByID(ctx, evt.RoomID); err != nil {
+	b.connMu.Lock()
+	client := b.client
+	b.connMu.Unlock()
+	if client == nil {
+		return
+	}
+	if _, err := client.JoinRoomByID(ctx, evt.RoomID); err != nil {
 		log.Printf("matrix: join room %s: %v", evt.RoomID, err)
 	}
 }

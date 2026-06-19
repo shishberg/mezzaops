@@ -207,26 +207,75 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	// Wait for frontends to be ready before signalling the manager.
-	go func() {
-		if a.mmBot != nil {
-			select {
-			case <-a.mmBot.Ready():
-			case <-ctx.Done():
-				return
-			}
-		}
-		if a.matrixBot != nil {
-			select {
-			case <-a.matrixBot.Ready():
-			case <-ctx.Done():
-				return
-			}
-		}
-		a.manager.SignalReady()
-	}()
+	// Bounded by ReadinessTimeout (default 30s) so a chat server that's
+	// unreachable on boot (e.g. Tailscale MagicDNS not ready yet) cannot
+	// block adopt:false / autostart services indefinitely. With the C2
+	// reconnect loops in place, the frontends will re-establish
+	// themselves later regardless; the gate just needs to open.
+	go a.waitForReady(ctx)
 
 	<-ctx.Done()
 	return nil
+}
+
+// waitForReady signals manager.SignalReady() once all configured frontends
+// are Ready(), or once ReadinessTimeout has elapsed, whichever comes
+// first. If ctx is cancelled before either, no signal is fired (the
+// manager is being shut down anyway).
+//
+// The actual wait logic lives in waitForReadyChannels, a free function,
+// so it can be tested in isolation with a stub Ready() channel.
+func (a *App) waitForReady(ctx context.Context) {
+	// Collect the Ready() channels we have to wait on. Discord joined
+	// the protocol in C4/C2.
+	var readyChs []<-chan struct{}
+	if a.discordBot != nil {
+		readyChs = append(readyChs, a.discordBot.Ready())
+	}
+	if a.mmBot != nil {
+		readyChs = append(readyChs, a.mmBot.Ready())
+	}
+	if a.matrixBot != nil {
+		readyChs = append(readyChs, a.matrixBot.Ready())
+	}
+
+	waitForReadyChannels(ctx, readyChs, a.cfg.EffectiveReadinessTimeout(), a.manager.SignalReady)
+}
+
+// waitForReadyChannels fires signal once all channels in readyChs have
+// closed, once timeout has elapsed, or once ctx is cancelled. If
+// readyChs is empty, signal fires immediately. signal is called at most
+// once.
+//
+// Extracted from App.waitForReady for testability.
+func waitForReadyChannels(ctx context.Context, readyChs []<-chan struct{}, timeout time.Duration, signal func()) {
+	if len(readyChs) == 0 {
+		signal()
+		return
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	remaining := len(readyChs)
+	for _, ch := range readyChs {
+		select {
+		case <-ch:
+			remaining--
+			if remaining == 0 {
+				signal()
+				return
+			}
+		case <-timer.C:
+			// Timeout fired. Fire signal regardless — the C2
+			// retry loops will reconnect the unreachable frontends
+			// later. The gate must not block indefinitely.
+			signal()
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // Shutdown gracefully stops all components.

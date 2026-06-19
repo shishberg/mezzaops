@@ -314,3 +314,103 @@ func TestManager_Accessor(t *testing.T) {
 // app_New is an alias that lets us call New without conflicting with test helpers.
 // This avoids import cycles and lets the test file stay in the same package.
 var app_New = New
+
+// --- C3: bounded readiness wait ---
+
+func TestWaitForReadyChannels_FiresImmediatelyWhenEmpty(t *testing.T) {
+	// No frontends configured — nothing to wait for. SignalReady should
+	// fire synchronously (well, in the same call frame).
+	var called int
+	waitForReadyChannels(context.Background(), nil, time.Hour, func() { called++ })
+	assert.Equal(t, 1, called)
+}
+
+func TestWaitForReadyChannels_FiresAfterAllBotsReady(t *testing.T) {
+	// Two bots, both Ready() before the timeout — signal should fire as
+	// soon as the last one closes, not after the timeout.
+	ch1 := make(chan struct{})
+	ch2 := make(chan struct{})
+
+	var called int
+	start := time.Now()
+	var elapsed time.Duration
+
+	done := make(chan struct{})
+	go func() {
+		waitForReadyChannels(context.Background(),
+			[]<-chan struct{}{ch1, ch2},
+			10*time.Second,
+			func() {
+				called++
+				elapsed = time.Since(start)
+			})
+		close(done)
+	}()
+
+	// Close them in order with a small delay.
+	close(ch1)
+	time.Sleep(50 * time.Millisecond)
+	close(ch2)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitForReadyChannels did not return")
+	}
+	assert.Equal(t, 1, called, "signal should fire exactly once")
+	// The signal should fire roughly when the second bot closed,
+	// not at the 10s timeout. Allow generous slack for CI.
+	assert.Less(t, elapsed, 5*time.Second)
+}
+
+func TestWaitForReadyChannels_FiresAfterTimeoutWhenBotNeverReady(t *testing.T) {
+	// A bot whose Ready() never closes must not prevent SignalReady —
+	// the C2 reconnect loop will re-establish the bot later, but the
+	// gate must open after the timeout so adopt:false / autostart
+	// services are not blocked indefinitely.
+	ch := make(chan struct{}) // never closed
+
+	var called int
+	done := make(chan struct{})
+	go func() {
+		waitForReadyChannels(context.Background(),
+			[]<-chan struct{}{ch},
+			50*time.Millisecond,
+			func() { called++ })
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitForReadyChannels did not return after timeout")
+	}
+	assert.Equal(t, 1, called, "signal should fire on timeout")
+}
+
+func TestWaitForReadyChannels_HonoursCtxCancel(t *testing.T) {
+	// ctx is cancelled before any signal fires — signal must NOT fire.
+	ch := make(chan struct{})
+
+	var called int
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		waitForReadyChannels(ctx,
+			[]<-chan struct{}{ch},
+			10*time.Second,
+			func() { called++ })
+		close(done)
+	}()
+
+	// Cancel before the timeout.
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waitForReadyChannels did not return after ctx cancel")
+	}
+	assert.Equal(t, 0, called, "signal must not fire on ctx cancel")
+}

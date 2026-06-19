@@ -52,7 +52,14 @@ ignored — this catches misplaced keys (e.g. a stray `process: { adopt: true }`
 block that was once hoped to be a global default). `process` and `adopt` are
 per-service fields, not top-level ones. The recognised top-level keys are
 `services_dir`, `log_dir`, `state_dir`, `discord`, `mattermost`, `matrix`,
-`webhook`, and `dashboard`.
+`webhook`, `dashboard`, and `readiness_timeout`.
+
+`readiness_timeout` (default 30s, parsed as a Go duration like `45s`) bounds
+how long the supervisor waits for the chat frontends to connect on boot
+before signalling readiness. A chat server that's unreachable on boot
+(e.g. Tailscale MagicDNS not ready yet) cannot block `adopt: false` /
+`autostart` services indefinitely — the frontends reconnect in the
+background via exponential backoff, and the gate opens after the timeout.
 
 **`services/*.yaml`** — one file per managed service:
 

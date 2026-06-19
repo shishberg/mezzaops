@@ -517,3 +517,35 @@ func TestSetCommands_NilUser(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "user")
 }
+
+// --- C2 + C3: Ready channel, markReady idempotence ---
+
+func TestReady_OpenUntilMarkReady(t *testing.T) {
+	// The Ready channel starts open and closes exactly once after the
+	// first successful setCommands. C3's bounded wait can use it
+	// alongside Mattermost and Matrix Ready channels.
+	b := &Bot{cfg: Config{GuildID: "123"}, manager: &mockManager{}, readyCh: make(chan struct{})}
+
+	select {
+	case <-b.Ready():
+		t.Fatal("Ready should be open before markReady")
+	default:
+		// expected
+	}
+	b.markReady()
+	select {
+	case <-b.Ready():
+		// expected
+	default:
+		t.Fatal("Ready should be closed after markReady")
+	}
+}
+
+func TestMarkReady_Idempotent(t *testing.T) {
+	// A successful first connect closes readyCh. If a subsequent retry
+	// also reaches a successful setCommands, markReady is called again
+	// and must not panic on the second close.
+	b := &Bot{cfg: Config{GuildID: "123"}, manager: &mockManager{}, readyCh: make(chan struct{})}
+	b.markReady()
+	b.markReady() // must not panic
+}

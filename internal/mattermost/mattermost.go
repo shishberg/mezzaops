@@ -8,9 +8,11 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/shishberg/mezzaops/internal/reconnect"
 	"github.com/shishberg/mezzaops/internal/service"
 )
 
@@ -115,14 +117,20 @@ var validCommands = []string{
 
 // Bot connects to Mattermost via the SDK and dispatches commands.
 type Bot struct {
-	cfg       Config
-	manager   ServiceManager
-	confirm   ConfirmHandler // may be nil
+	cfg     Config
+	manager ServiceManager
+	confirm ConfirmHandler // may be nil
+	// userID and channelID are written by runOnce (resolveIdentity,
+	// resolveChannel) and read by PostMessage / event handlers. idMu
+	// protects them so a notification issued while runOnce is still
+	// building the connection (or tearing it down on retry) sees a
+	// consistent snapshot.
 	userID    string
 	channelID string
 	rest      restClient
 	connectWS wsConnectFunc
 	readyCh   chan struct{} // closed when the bot is connected and ready
+	idMu      sync.Mutex
 }
 
 // New creates a new Bot from the given Config and ServiceManager.
@@ -154,17 +162,45 @@ func (b *Bot) SetConfirmHandler(ch ConfirmHandler) {
 
 // Run connects to Mattermost, resolves the channel, and listens for events
 // until ctx is cancelled.
+//
+// The initial REST setup (resolveIdentity + resolveChannel) is wrapped in a
+// reconnect loop with capped exponential backoff so a transient failure on
+// boot (e.g. Tailscale MagicDNS not ready yet) does not permanently disable
+// the frontend. Once the bot is connected, readyCh is closed; the
+// WebSocket listener takes over and uses its own internal backoff on
+// disconnect. readyCh is not re-closed on reconnect — the C3 bounded
+// readiness wait in app.go has already fired by then, and the gate is
+// past.
 func (b *Bot) Run(ctx context.Context) error {
-	if err := b.resolveIdentity(ctx); err != nil {
-		return fmt.Errorf("resolving bot identity: %w", err)
-	}
+	return reconnect.RunWithBackoff(ctx, "mattermost", reconnect.Options{
+		InitialDelay:   1 * time.Second,
+		MaxDelay:       60 * time.Second,
+		Factor:         2.0,
+		JitterFraction: 0.2,
+		Logger: func(name string, attempt int, err error, nextDelay time.Duration) {
+			log.Printf("%s: connect attempt %d failed: %v; retrying in %s", name, attempt, err, nextDelay)
+		},
+	}, func(ctx context.Context) error {
+		if err := b.resolveIdentity(ctx); err != nil {
+			return fmt.Errorf("resolving bot identity: %w", err)
+		}
+		if err := b.resolveChannel(ctx); err != nil {
+			return fmt.Errorf("resolving channel: %w", err)
+		}
+		// Close readyCh once per successful connect. Safe to close multiple
+		// times via the recover: a closed-channel panic here means a
+		// retry reached here after a successful first connect, which is
+		// exactly when a subsequent retry's close would race.
+		b.markReady()
+		return b.listenWebSocket(ctx)
+	})
+}
 
-	if err := b.resolveChannel(ctx); err != nil {
-		return fmt.Errorf("resolving channel: %w", err)
-	}
-
+// markReady closes readyCh exactly once. It is safe to call from multiple
+// retry attempts: subsequent calls are no-ops.
+func (b *Bot) markReady() {
+	defer func() { _ = recover() }()
 	close(b.readyCh)
-	return b.listenWebSocket(ctx)
 }
 
 // Ready returns a channel that is closed when the bot has connected
@@ -174,9 +210,18 @@ func (b *Bot) Ready() <-chan struct{} {
 }
 
 // PostMessage sends a message to the configured Mattermost channel.
+// channelID is snapshotted under idMu so concurrent retry-driven
+// re-resolution cannot leave PostMessage using a half-updated value.
 func (b *Bot) PostMessage(ctx context.Context, message string) {
+	b.idMu.Lock()
+	channelID := b.channelID
+	b.idMu.Unlock()
+	if channelID == "" {
+		log.Printf("mattermost: PostMessage called before channel resolved, dropping message")
+		return
+	}
 	post := &model.Post{
-		ChannelId: b.channelID,
+		ChannelId: channelID,
 		Message:   message,
 	}
 	if _, _, err := b.rest.CreatePost(ctx, post); err != nil {
@@ -193,7 +238,9 @@ func (b *Bot) resolveIdentity(ctx context.Context) error {
 	if user.Id == "" {
 		return fmt.Errorf("empty user ID (check token)")
 	}
+	b.idMu.Lock()
 	b.userID = user.Id
+	b.idMu.Unlock()
 	return nil
 }
 
@@ -206,7 +253,9 @@ func (b *Bot) resolveChannel(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("looking up channel %q in team %q: %w", parts[1], parts[0], err)
 		}
+		b.idMu.Lock()
 		b.channelID = ch.Id
+		b.idMu.Unlock()
 		log.Printf("mattermost: resolved channel %q to ID %s", b.cfg.Channel, ch.Id)
 		return nil
 	}
@@ -220,7 +269,9 @@ func (b *Bot) resolveChannel(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("looking up channel ID %q: %w", b.cfg.Channel, err)
 	}
+	b.idMu.Lock()
 	b.channelID = ch.Id
+	b.idMu.Unlock()
 	return nil
 }
 
@@ -254,7 +305,10 @@ func (b *Bot) connectAndListen(ctx context.Context) error {
 	defer ws.Close()
 
 	ws.Listen()
-	log.Printf("mattermost: connected to %s, watching channel %s", b.cfg.URL, b.channelID)
+	b.idMu.Lock()
+	channelID := b.channelID
+	b.idMu.Unlock()
+	log.Printf("mattermost: connected to %s, watching channel %s", b.cfg.URL, channelID)
 
 	for {
 		select {
@@ -294,12 +348,17 @@ func (b *Bot) handleEvent(ctx context.Context, event *model.WebSocketEvent) {
 		return
 	}
 
-	if post.UserId == b.userID {
+	b.idMu.Lock()
+	userID := b.userID
+	channelID := b.channelID
+	b.idMu.Unlock()
+
+	if post.UserId == userID {
 		return // ignore own messages
 	}
 
 	// Filter: must be in our channel OR mention us
-	if post.ChannelId != b.channelID && !b.isMentioned(data) {
+	if post.ChannelId != channelID && !b.isMentioned(data) {
 		return
 	}
 
@@ -406,5 +465,8 @@ func (b *Bot) isMentioned(data map[string]any) bool {
 	if err := json.Unmarshal([]byte(mentionsStr), &mentions); err != nil {
 		return false
 	}
-	return slices.Contains(mentions, b.userID)
+	b.idMu.Lock()
+	userID := b.userID
+	b.idMu.Unlock()
+	return slices.Contains(mentions, userID)
 }

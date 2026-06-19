@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/shishberg/mezzaops/internal/reconnect"
 )
 
 // Config holds Discord bot configuration.
@@ -39,6 +40,7 @@ type Bot struct {
 
 	mu       sync.Mutex
 	commands []*discordgo.ApplicationCommand
+	readyCh  chan struct{} // closed once the first setCommands succeeds
 }
 
 // New creates a Discord bot. Does not connect yet — call Run() for that.
@@ -46,38 +48,110 @@ func New(cfg Config, manager ServiceManager) *Bot {
 	return &Bot{
 		cfg:     cfg,
 		manager: manager,
+		readyCh: make(chan struct{}),
 	}
+}
+
+// Ready returns a channel that is closed once the first setCommands
+// registration succeeds. Mirrors the other frontends' Ready() so the
+// app-layer C3 bounded readiness wait can treat all three frontends
+// uniformly. The channel is closed exactly once across all retry attempts;
+// the second markReady is a no-op.
+func (b *Bot) Ready() <-chan struct{} {
+	return b.readyCh
+}
+
+// markReady closes readyCh exactly once. Safe to call from multiple
+// retry attempts; the second close is recovered.
+func (b *Bot) markReady() {
+	defer func() { _ = recover() }()
+	close(b.readyCh)
 }
 
 // Notifier returns a Notifier that sends messages to the bot's channel using
 // the bot's session. Because the session is only created in Run(), the notifier
 // resolves it lazily — messages sent before Run() are logged to stdout.
+//
+// The session is snapshotted under b.mu on every send so a retry in Run
+// that closes the old session and swaps in a new one cannot race with an
+// in-flight notifier call.
 func (b *Bot) Notifier() *Notifier {
 	return &Notifier{
 		channelID: b.cfg.ChannelID,
 		sendFunc: func(msg string) {
-			if b.session == nil || b.cfg.ChannelID == "" {
+			sess := b.currentSession()
+			if sess == nil || b.cfg.ChannelID == "" {
 				log.Println(msg)
 				return
 			}
-			if _, err := b.session.ChannelMessageSend(b.cfg.ChannelID, msg); err != nil {
+			if _, err := sess.ChannelMessageSend(b.cfg.ChannelID, msg); err != nil {
 				log.Printf("discord send error: %v", err)
 			}
 		},
 	}
 }
 
+// currentSession returns b.session under the lock, or nil if no session
+// is currently set. The result is a snapshot the caller can use without
+// worrying about a concurrent Run retry.
+func (b *Bot) currentSession() *discordgo.Session {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.session
+}
+
+// setSession sets b.session under the lock. Used by runOnce to publish
+// a freshly opened session and to clear it on failure.
+func (b *Bot) setSession(s *discordgo.Session) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.session = s
+}
+
 // Run connects to Discord, registers commands, and blocks until ctx is done.
+//
+// The full connect path (discordgo.New + Open + setCommands + status
+// goroutine + reconnect handlers) is wrapped in a reconnect loop with
+// capped exponential backoff so a transient failure on boot (e.g.
+// Tailscale MagicDNS not ready yet) does not permanently disable the
+// frontend. The session is closed and recreated on each attempt. The
+// status goroutine and handlers are started only after a successful
+// setCommands, so a failed attempt cannot leak goroutines.
+//
+// readyCh is closed on the first successful setCommands and not
+// re-closed on subsequent retries — by then the C3 app-layer readiness
+// wait has already fired, and the gate is past.
 func (b *Bot) Run(ctx context.Context) error {
+	return reconnect.RunWithBackoff(ctx, "discord", reconnect.Options{
+		InitialDelay:   1 * time.Second,
+		MaxDelay:       60 * time.Second,
+		Factor:         2.0,
+		JitterFraction: 0.2,
+		Logger: func(name string, attempt int, err error, nextDelay time.Duration) {
+			log.Printf("%s: connect attempt %d failed: %v; retrying in %s", name, attempt, err, nextDelay)
+		},
+	}, b.runOnce)
+}
+
+// runOnce performs one connect attempt: build a session, open it,
+// register commands, set up presence and interaction handlers, and
+// block until ctx is cancelled. On any failure the session is closed
+// and the error is returned for the retry loop to handle.
+//
+// The session is held in the local `session` variable and only published
+// to b.session via setSession after it is fully open. The status
+// goroutine and AddHandler calls capture the local session directly, so
+// they are not affected by a concurrent retry that swaps b.session.
+func (b *Bot) runOnce(ctx context.Context) error {
 	session, err := discordgo.New("Bot " + b.cfg.Token)
 	if err != nil {
 		return fmt.Errorf("discord session: %w", err)
 	}
-	b.session = session
 
-	if err := b.session.Open(); err != nil {
+	if err := session.Open(); err != nil {
 		return fmt.Errorf("discord open: %w", err)
 	}
+	b.setSession(session)
 
 	// Build and register commands first; if registration fails we want to
 	// bail before the status goroutine and other long-lived handlers are
@@ -88,49 +162,23 @@ func (b *Bot) Run(ctx context.Context) error {
 	cmds := b.commands
 	b.mu.Unlock()
 
-	if err := b.setCommands(b.session, cmds); err != nil {
-		_ = b.session.Close()
+	if err := b.setCommands(session, cmds); err != nil {
+		_ = session.Close()
+		b.setSession(nil)
 		return fmt.Errorf("discord register commands: %w", err)
 	}
 
+	// First successful connect — close readyCh exactly once.
+	b.markReady()
+
 	// Set up presence status via a channel + goroutine so counter reads are
 	// always serialized after the state change that triggered them.
-	type statusEvent struct {
-		name, event string
-	}
 	statusCh := make(chan statusEvent, 16)
 
-	go func() {
-		var lastStatus string
-		ticker := time.NewTicker(2 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case ev := <-statusCh:
-				// Drain queued events — only the latest matters.
-				for {
-					select {
-					case newer := <-statusCh:
-						ev = newer
-					default:
-						goto drained
-					}
-				}
-			drained:
-				running, total := b.manager.CountRunning()
-				lastStatus = fmt.Sprintf("%d/%d | %s %s", running, total, ev.name, ev.event)
-				_ = b.session.UpdateGameStatus(0, lastStatus)
-			case <-ticker.C:
-				if lastStatus == "" {
-					running, total := b.manager.CountRunning()
-					lastStatus = fmt.Sprintf("%d/%d tasks running", running, total)
-				}
-				_ = b.session.UpdateGameStatus(0, lastStatus)
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	// The status goroutine captures the local `session` directly, not
+	// b.session, so a concurrent retry that swaps b.session cannot
+	// affect this goroutine's view of the session.
+	go b.runStatusLoop(ctx, session, statusCh)
 
 	b.manager.SetOnChange(func(name, event string) {
 		select {
@@ -140,15 +188,15 @@ func (b *Bot) Run(ctx context.Context) error {
 	})
 
 	// Re-set presence on connect/reconnect/resume — Discord doesn't persist it.
-	b.session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
+	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
 		statusCh <- statusEvent{"", "connected"}
 	})
-	b.session.AddHandler(func(s *discordgo.Session, r *discordgo.Resumed) {
+	session.AddHandler(func(s *discordgo.Session, r *discordgo.Resumed) {
 		statusCh <- statusEvent{"", "reconnected"}
 	})
 
 	// Handle interactions.
-	b.session.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	session.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		if i.ApplicationCommandData().Name != "ops" {
 			return
 		}
@@ -169,10 +217,53 @@ func (b *Bot) Run(ctx context.Context) error {
 	log.Println("Discord bot shutting down.")
 
 	// Deregister commands (best-effort) and close session.
-	_ = b.setCommands(b.session, nil)
-	_ = b.session.Close()
+	_ = b.setCommands(session, nil)
+	_ = session.Close()
+	b.setSession(nil)
 
 	return nil
+}
+
+// statusEvent is one update for the presence goroutine. The presence
+// goroutine drains queued events and only the latest matters.
+type statusEvent struct {
+	name, event string
+}
+
+// runStatusLoop drives the presence status updates for one session. It
+// runs until ctx is cancelled. Captures the session parameter directly
+// rather than reading b.session, so a concurrent retry that swaps the
+// field does not affect this goroutine.
+func (b *Bot) runStatusLoop(ctx context.Context, session *discordgo.Session, statusCh chan statusEvent) {
+	var lastStatus string
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case ev := <-statusCh:
+			// Drain queued events — only the latest matters.
+			for {
+				select {
+				case newer := <-statusCh:
+					ev = newer
+				default:
+					goto drained
+				}
+			}
+		drained:
+			running, total := b.manager.CountRunning()
+			lastStatus = fmt.Sprintf("%d/%d | %s %s", running, total, ev.name, ev.event)
+			_ = session.UpdateGameStatus(0, lastStatus)
+		case <-ticker.C:
+			if lastStatus == "" {
+				running, total := b.manager.CountRunning()
+				lastStatus = fmt.Sprintf("%d/%d tasks running", running, total)
+			}
+			_ = session.UpdateGameStatus(0, lastStatus)
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // setCommands registers (or deregisters, when cmds is nil) the bot's
@@ -221,7 +312,7 @@ func (b *Bot) routeInteraction(i *discordgo.InteractionCreate) string {
 				b.mu.Lock()
 				cmds := b.commands
 				b.mu.Unlock()
-				_ = b.setCommands(b.session, cmds)
+				_ = b.setCommands(b.currentSession(), cmds)
 				if err != nil {
 					return "Config reload error: " + err.Error()
 				}

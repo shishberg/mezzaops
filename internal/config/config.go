@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v3"
@@ -53,6 +54,13 @@ type Config struct {
 	Matrix      *MatrixConfig     `yaml:"matrix"`
 	Webhook     *WebhookConfig    `yaml:"webhook"`
 	Dashboard   *DashboardConfig  `yaml:"dashboard"`
+
+	// ReadinessTimeout is the maximum time the app layer waits for all
+	// chat frontends to report Ready before firing manager.SignalReady().
+	// Bounded so a chat server that's unreachable on boot (e.g. Tailscale
+	// MagicDNS not ready yet) cannot block adopt:false / autostart
+	// services indefinitely. Default 30s when zero or unset.
+	ReadinessTimeout time.Duration `yaml:"readiness_timeout"`
 }
 
 // ServiceProcessConfig describes how to manage a service's process.
@@ -84,6 +92,21 @@ func (s *ServiceConfig) ShouldAdopt() bool {
 		return *s.Adopt
 	}
 	return true
+}
+
+// DefaultReadinessTimeout is used when Config.ReadinessTimeout is zero or
+// unset. Bounded so a chat server that's unreachable on boot (e.g. Tailscale
+// MagicDNS not ready yet) cannot block adopt:false / autostart services
+// indefinitely.
+const DefaultReadinessTimeout = 30 * time.Second
+
+// EffectiveReadinessTimeout returns the configured readiness timeout, or
+// DefaultReadinessTimeout when the field is zero.
+func (c *Config) EffectiveReadinessTimeout() time.Duration {
+	if c.ReadinessTimeout <= 0 {
+		return DefaultReadinessTimeout
+	}
+	return c.ReadinessTimeout
 }
 
 // Env holds secrets loaded from environment variables or a .env file.
@@ -129,14 +152,15 @@ func LoadConfig(path string) (*Config, error) {
 // Kept in one place so warnUnknownTopLevelKeys and the Config struct cannot
 // drift apart without a compile error in tests.
 var knownTopLevelConfigKeys = map[string]struct{}{
-	"services_dir": {},
-	"log_dir":      {},
-	"state_dir":    {},
-	"discord":      {},
-	"mattermost":   {},
-	"matrix":       {},
-	"webhook":      {},
-	"dashboard":    {},
+	"services_dir":      {},
+	"log_dir":           {},
+	"state_dir":         {},
+	"discord":           {},
+	"mattermost":        {},
+	"matrix":            {},
+	"webhook":           {},
+	"dashboard":         {},
+	"readiness_timeout": {},
 }
 
 // warnUnknownTopLevelKeys walks the top-level mapping of a parsed config
