@@ -1,8 +1,12 @@
 package config_test
 
 import (
+	"bytes"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/shishberg/mezzaops/internal/config"
@@ -260,4 +264,190 @@ func TestLoadServices_IgnoresNonYAMLAndDirectories(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, services, 1)
 	assert.Equal(t, "good", services[0].Name)
+}
+
+// --- C6: warn on unknown top-level config keys ---
+
+// captureLog redirects the default log writer for the duration of fn and
+// returns whatever was written. Tests use it to assert on log.Printf output
+// from LoadConfig. Concurrent calls are serialised so parallel test runs do
+// not race on the default log writer.
+var logCaptureMu sync.Mutex
+
+func captureLog(t *testing.T, fn func()) string {
+	t.Helper()
+	logCaptureMu.Lock()
+	defer logCaptureMu.Unlock()
+
+	orig := log.Writer()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(orig) })
+
+	fn()
+	return buf.String()
+}
+
+func TestLoadConfig_WarnsOnUnknownTopLevelKey(t *testing.T) {
+	// `process:` is the canonical example from boot-resilience.md P6: the
+	// operator reasonably assumed it was a global default, but Config has
+	// no Process field and the block is silently discarded.
+	yaml := `
+log_dir: "/var/log/mezzaops"
+state_dir: "/var/state"
+process:
+  adopt: true
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+
+	var (
+		cfg *config.Config
+		err error
+	)
+	out := captureLog(t, func() {
+		cfg, err = config.LoadConfig(path)
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	assert.Equal(t, "/var/log/mezzaops", cfg.LogDir)
+	assert.Equal(t, "/var/state", cfg.StateDir)
+
+	// Assert the warning names the unknown key as a quoted token, not just
+	// that the string "process" appears in the help text.
+	keys := parseUnknownKeys(out)
+	assert.Contains(t, keys, "process",
+		"expected a warning naming 'process' as an unknown key, got: %q", out)
+}
+
+func TestLoadConfig_WarnsOnMultipleUnknownTopLevelKeys(t *testing.T) {
+	yaml := `
+log_dir: "/var/log/mezzaops"
+process:
+  adopt: true
+typo_field: 42
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+
+	var err error
+	out := captureLog(t, func() {
+		_, err = config.LoadConfig(path)
+	})
+
+	require.NoError(t, err)
+	keys := parseUnknownKeys(out)
+	assert.ElementsMatch(t, []string{"process", "typo_field"}, keys,
+		"expected warnings for both unknown keys, got: %v", keys)
+}
+
+func TestLoadConfig_WarnsAfterYAMLMergeKey(t *testing.T) {
+	// Regression for the codex review: walking the raw AST warned about
+	// the merge key `<<` itself, not the keys it merged in. A merged-in
+	// `process:` block should warn about `process`.
+	yaml := `
+defaults: &def
+  process:
+    adopt: true
+  log_dir: /tmp
+log_dir: /tmp
+process: {adopt: true}
+<<: *def
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+
+	var err error
+	out := captureLog(t, func() {
+		_, err = config.LoadConfig(path)
+	})
+	require.NoError(t, err)
+	keys := parseUnknownKeys(out)
+	assert.Contains(t, keys, "process",
+		"merged-in process should be reported as unknown, got: %v", keys)
+	assert.NotContains(t, keys, "<<",
+		"the merge key itself should not be reported, got: %v", keys)
+}
+
+// parseUnknownKeys extracts the set of unknown top-level keys named in log
+// output. LoadConfig logs them as `unknown top-level key %q`; we parse the
+// quoted value rather than asserting on substrings (which the help text
+// would otherwise satisfy for any unknown key).
+func parseUnknownKeys(logOutput string) []string {
+	var keys []string
+	for _, line := range strings.Split(logOutput, "\n") {
+		const marker = `unknown top-level key "`
+		i := strings.Index(line, marker)
+		if i < 0 {
+			continue
+		}
+		rest := line[i+len(marker):]
+		j := strings.IndexByte(rest, '"')
+		if j < 0 {
+			continue
+		}
+		keys = append(keys, rest[:j])
+	}
+	return keys
+}
+
+func TestLoadConfig_NoWarningOnValidConfig(t *testing.T) {
+	// Same shape as TestLoadConfig_AllSections. Every key here is in the
+	// known set, so no warning is expected.
+	yaml := `
+services_dir: "/opt/services"
+log_dir: "/var/log/mezzaops"
+state_dir: "/var/state"
+discord:
+  guild_id: "123"
+  channel_id: "456"
+mattermost:
+  url: "http://mm:8065"
+  channel: "team/chan"
+matrix:
+  homeserver: "https://matrix.example.org"
+  room: "!abc:matrix.example.org"
+  command_prefix: "!ops"
+  crypto_db: "/var/state/matrix.db"
+webhook:
+  port: 9090
+dashboard:
+  port: 9091
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+
+	var (
+		cfg *config.Config
+		err error
+	)
+	out := captureLog(t, func() {
+		cfg, err = config.LoadConfig(path)
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	assert.Equal(t, "/opt/services", cfg.ServicesDir)
+	// Default test runs in parallel; captureLog already serialises against
+	// other captureLog callers, so we just need to assert no warning was
+	// emitted about an unknown key.
+	assert.False(t, strings.Contains(out, "unknown"),
+		"valid config should not log a warning, got: %q", out)
+}
+
+func TestLoadConfig_NoWarningOnMinimalConfig(t *testing.T) {
+	// Just the three required keys plus one optional section that happens
+	// to be absent — no warning expected, because absence is not a typo.
+	yaml := `{}`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+
+	var err error
+	out := captureLog(t, func() {
+		_, err = config.LoadConfig(path)
+	})
+	require.NoError(t, err)
+	assert.False(t, strings.Contains(out, "unknown"),
+		"minimal config should not log a warning, got: %q", out)
 }

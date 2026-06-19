@@ -26,9 +26,6 @@ services_dir: "./services"
 log_dir: "./logs"
 state_dir: "./state"
 
-process:
-  adopt: true        # re-adopt orphaned processes on restart
-
 discord:
   guild_id: ""
   channel_id: ""
@@ -49,6 +46,13 @@ webhook:
 dashboard:
   port: 8081
 ```
+
+Unknown top-level keys in `config.yaml` are logged as warnings and otherwise
+ignored — this catches misplaced keys (e.g. a stray `process: { adopt: true }`
+block that was once hoped to be a global default). `process` and `adopt` are
+per-service fields, not top-level ones. The recognised top-level keys are
+`services_dir`, `log_dir`, `state_dir`, `discord`, `mattermost`, `matrix`,
+`webhook`, and `dashboard`.
 
 **`services/*.yaml`** — one file per managed service:
 
@@ -113,7 +117,9 @@ Mattermost and Matrix additionally support `confirm` (for services with `require
 
 ## Process adoption
 
-When `process.adopt: true` (the default), MezzaOps re-adopts child processes that survive a restart. It verifies process identity via boot time and process creation time to detect PID reuse. Set `process.adopt: false` in dev to get a clean slate each time.
+Per-service `adopt: true` (the default) makes MezzaOps re-adopt child processes that survive a restart. Set `adopt: false` per-service in dev to get a clean slate each time. MezzaOps verifies process identity via boot time and process creation time to detect PID reuse.
+
+Note: `adopt` is a per-service field on each entry in `services/*.yaml`, not a top-level key in `config.yaml`. Older configs sometimes carry a stray top-level `process: { adopt: true }` block; mezzaops will log a warning naming that key and otherwise ignore it.
 
 ## Building
 

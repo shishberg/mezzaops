@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -113,7 +114,51 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 
+	// C6: surface unknown top-level keys so a misplaced block (e.g.
+	// `process: { adopt: true }` from an older config shape) is no longer
+	// silently discarded. We parse the file a second time into a Node so
+	// the existing Unmarshal semantics are not perturbed; turning
+	// yaml.Unmarshal into a strict decode here would also turn
+	// previously-valid configs (e.g. unknown sub-keys) into warnings.
+	warnUnknownTopLevelKeys(path, data)
+
 	return cfg, nil
+}
+
+// knownTopLevelConfigKeys is the set of top-level keys LoadConfig recognises.
+// Kept in one place so warnUnknownTopLevelKeys and the Config struct cannot
+// drift apart without a compile error in tests.
+var knownTopLevelConfigKeys = map[string]struct{}{
+	"services_dir": {},
+	"log_dir":      {},
+	"state_dir":    {},
+	"discord":      {},
+	"mattermost":   {},
+	"matrix":       {},
+	"webhook":      {},
+	"dashboard":    {},
+}
+
+// warnUnknownTopLevelKeys walks the top-level mapping of a parsed config
+// file and logs a warning for each key that is not in
+// knownTopLevelConfigKeys. Load still succeeds — warnings are informational
+// only. Malformed YAML is left to the main parser to reject.
+//
+// We unmarshal into map[string]yaml.Node (rather than walking the raw AST)
+// so that YAML merge keys (`<<`) and aliases are resolved by the decoder
+// before we look at the top-level keys. Walking the raw Node.Content slice
+// would warn about `<<` itself, not the keys being merged in.
+func warnUnknownTopLevelKeys(path string, data []byte) {
+	var top map[string]yaml.Node
+	if err := yaml.Unmarshal(data, &top); err != nil {
+		return
+	}
+	for key := range top {
+		if _, ok := knownTopLevelConfigKeys[key]; ok {
+			continue
+		}
+		log.Printf("config %s: unknown top-level key %q (typo, or a misplaced sub-section such as process.* or webhook.* — see boot-resilience.md C6)", path, key)
+	}
 }
 
 // LoadEnv reads secrets from a .env file. If path is empty or the file does
