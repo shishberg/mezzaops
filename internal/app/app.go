@@ -119,7 +119,11 @@ func New(configPath string, envPath string, templatesFS fs.FS) (*App, error) {
 	}
 
 	// Telegram.
-	if cfg.Telegram != nil && env.TelegramToken != "" {
+	if cfg.Telegram != nil && env.TelegramToken != "" && cfg.Telegram.ChatID == 0 {
+		// A missing or misspelled chat_id would otherwise start a bot that
+		// silently ignores every message. Skip it rather than failing boot.
+		log.Printf("app: telegram section has no chat_id (missing or misspelled?); telegram frontend disabled")
+	} else if cfg.Telegram != nil && env.TelegramToken != "" {
 		tgcfg := telegram.Config{
 			Token:  env.TelegramToken,
 			ChatID: cfg.Telegram.ChatID,

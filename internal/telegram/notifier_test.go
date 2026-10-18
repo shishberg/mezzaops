@@ -12,14 +12,14 @@ import (
 func notifierBot(t *testing.T) (*Bot, *fakeAPI) {
 	t.Helper()
 	api := newFakeAPI(t)
-	return newTestBot(t, api, nil, nil), api
+	return newSendingBot(t, api, nil, nil), api
 }
 
 func TestNotifier_ServiceEvent(t *testing.T) {
 	bot, api := notifierBot(t)
 	NewNotifier(bot).ServiceEvent("myapp", "started")
 
-	texts := api.sentTexts()
+	texts := flush(t, bot, api)
 	require.Len(t, texts, 1)
 	assert.Equal(t, "<code>myapp</code> started.", texts[0])
 }
@@ -28,7 +28,7 @@ func TestNotifier_DeployStarted(t *testing.T) {
 	bot, api := notifierBot(t)
 	NewNotifier(bot).DeployStarted("myapp")
 
-	texts := api.sentTexts()
+	texts := flush(t, bot, api)
 	require.Len(t, texts, 1)
 	assert.Equal(t, "Deploying <code>myapp</code>...", texts[0])
 }
@@ -37,7 +37,7 @@ func TestNotifier_DeploySucceeded(t *testing.T) {
 	bot, api := notifierBot(t)
 	NewNotifier(bot).DeploySucceeded("myapp", "build output")
 
-	texts := api.sentTexts()
+	texts := flush(t, bot, api)
 	require.Len(t, texts, 1)
 	assert.Equal(t, "Deploy of <code>myapp</code> succeeded.", texts[0])
 }
@@ -46,7 +46,7 @@ func TestNotifier_DeployFailed(t *testing.T) {
 	bot, api := notifierBot(t)
 	NewNotifier(bot).DeployFailed("myapp", "build", "error <output>")
 
-	texts := api.sentTexts()
+	texts := flush(t, bot, api)
 	require.Len(t, texts, 1)
 	assert.Equal(t, "Deploy of <code>myapp</code> failed at step <code>build</code>.\n<pre>error &lt;output&gt;</pre>", texts[0])
 }
@@ -59,13 +59,13 @@ func TestNotifier_DeployFailed_LargeOutputTruncated(t *testing.T) {
 
 	NewNotifier(bot).DeployFailed("slurp", "go test ./...", output)
 
-	texts := api.sentTexts()
+	texts := flush(t, bot, api)
 	require.Len(t, texts, 1)
 	body := texts[0]
 
 	// Tags do not count towards Telegram's limit; strip them before counting.
 	visible := strings.NewReplacer("<pre>", "", "</pre>", "", "<code>", "", "</code>", "").Replace(body)
-	assert.LessOrEqual(t, len([]rune(visible)), telegramMaxRunes)
+	assert.LessOrEqual(t, utf16Len(visible), telegramMaxUTF16Units)
 	assert.Contains(t, body, "truncated")
 	assert.Contains(t, body, tailMarker)
 	assert.True(t, strings.HasSuffix(body, tailMarker+"</pre>"),
@@ -77,7 +77,7 @@ func TestNotifier_DeployFailed_BackticksInOutputDoNotBreakFence(t *testing.T) {
 	bot, api := notifierBot(t)
 	NewNotifier(bot).DeployFailed("myapp", "build", "a ``` b")
 
-	texts := api.sentTexts()
+	texts := flush(t, bot, api)
 	require.Len(t, texts, 1)
 	assert.Contains(t, texts[0], "<pre>a `` b</pre>")
 }
@@ -96,7 +96,7 @@ func TestNotifier_WebhookReceived(t *testing.T) {
 		Timestamp: "2026-04-10T12:34:56Z",
 	})
 
-	texts := api.sentTexts()
+	texts := flush(t, bot, api)
 	require.Len(t, texts, 1)
 	body := texts[0]
 	assert.Contains(t, body, "myapp")

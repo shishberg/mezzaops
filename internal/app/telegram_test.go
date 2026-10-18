@@ -1,9 +1,12 @@
 package app
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -41,7 +44,15 @@ func newFakeTelegramAPI(t *testing.T) *fakeTelegramAPI {
 			f.mu.Unlock()
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"ok":true,"result":true}`)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/getMe"):
+			_, _ = io.WriteString(w, `{"ok":true,"result":{"id":1,"is_bot":true,"username":"test_bot"}}`)
+		case strings.HasSuffix(r.URL.Path, "/getUpdates"):
+			time.Sleep(20 * time.Millisecond)
+			_, _ = io.WriteString(w, `{"ok":true,"result":[]}`)
+		default:
+			_, _ = io.WriteString(w, `{"ok":true,"result":true}`)
+		}
 	}))
 	t.Cleanup(f.Close)
 	return f
@@ -137,6 +148,12 @@ func TestHandlePush_RequireConfirmation_PromptsTelegram(t *testing.T) {
 	defer a.manager.Stop()
 	require.NotNil(t, a.telegramBot)
 
+	// The sender goroutine starts with Run; HandlePush only queues.
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); _ = a.Run(ctx) }()
+	defer func() { cancel(); <-runDone }()
+
 	a.HandlePush(webhook.PushEvent{Repo: "org/confirmrepo", Branch: "main"})
 
 	assert.True(t, a.confirmations.IsPending("confirmsvc"))
@@ -149,4 +166,27 @@ func TestHandlePush_RequireConfirmation_PromptsTelegram(t *testing.T) {
 		}
 		return false
 	}, 5*time.Second, 5*time.Millisecond, "sent: %v", api.sent())
+}
+
+func TestNew_TelegramWithoutChatIDIsDisabledWithWarning(t *testing.T) {
+	api := newFakeTelegramAPI(t)
+	dir := t.TempDir()
+	cfgPath, envPath := writeTelegramConfig(t, dir, api.URL, "TELEGRAM_TOKEN=123:tok\n")
+	data, err := os.ReadFile(cfgPath)
+	require.NoError(t, err)
+	// A misspelled key leaves chat_id at zero.
+	require.NoError(t, os.WriteFile(cfgPath, []byte(strings.ReplaceAll(string(data), "chat_id:", "chat_idd:")), 0o644))
+
+	var buf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(orig)
+
+	a, err := app_New(cfgPath, envPath, telegramTemplates())
+	require.NoError(t, err, "one bad section must not stop the supervisor booting")
+	defer a.manager.Stop()
+
+	assert.Nil(t, a.telegramBot)
+	assert.Contains(t, buf.String(), "telegram")
+	assert.Contains(t, buf.String(), "chat_id")
 }

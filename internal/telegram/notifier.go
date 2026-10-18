@@ -43,13 +43,13 @@ func (n *Notifier) DeploySucceeded(name, _ string) {
 
 // DeployFailed posts a deploy-failed notification with the failed step and
 // output. The output is truncated from the head (keeping the tail, where the
-// real error usually is) so the whole message stays under telegramMaxRunes
+// real error usually is) so the whole message stays under telegramMaxUTF16Units
 // and the code fence survives.
 func (n *Notifier) DeployFailed(name, step, output string) {
 	const format = "Deploy of `%s` failed at step `%s`.\n```\n%s\n```"
 	scaffolding := fmt.Sprintf(format, name, step, "")
-	budget := telegramMaxRunes - len([]rune(scaffolding))
-	truncated := service.TruncateTailToRuneBudget(defuseFences(output), budget)
+	budget := telegramMaxUTF16Units - utf16Len(scaffolding)
+	truncated := truncateTailUTF16(defuseFences(output), budget)
 	n.sender.PostMessage(context.Background(), fmt.Sprintf(format, name, step, truncated))
 }
 

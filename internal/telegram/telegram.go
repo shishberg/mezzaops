@@ -23,10 +23,11 @@ import (
 	"github.com/shishberg/mezzaops/internal/service"
 )
 
-// telegramMaxRunes caps the rune count of a message posted to Telegram. The
-// API limit is 4096 characters counted after entity parsing; this leaves
-// headroom for the scaffolding around truncated content.
-const telegramMaxRunes = 4000
+// telegramMaxUTF16Units caps the length of a message posted to Telegram. The
+// API limit is 4096 UTF-16 code units counted after entity parsing (so an
+// emoji counts as 2); this leaves headroom for the scaffolding around
+// truncated content.
+const telegramMaxUTF16Units = 4000
 
 const (
 	defaultAPIURL         = "https://api.telegram.org"
@@ -38,6 +39,16 @@ const (
 	// the poll timeout plus slack so the HTTP request outlives the poll.
 	requestTimeout = 30 * time.Second
 	pollSlack      = 15 * time.Second
+
+	// outboxSize bounds the send queue. When it is full new messages are
+	// dropped rather than blocking the manager's notifier or a webhook.
+	outboxSize = 100
+
+	// maxSendRetries is how many times one message is retried after HTTP 429.
+	// maxRetryAfter caps a single wait so a bad retry_after cannot stall the
+	// queue for hours.
+	maxSendRetries = 3
+	maxRetryAfter  = 60 * time.Second
 )
 
 // Command is a parsed bot command.
@@ -114,12 +125,13 @@ type Bot struct {
 	confirm service.ConfirmHandler
 	http    *http.Client
 
-	// started is when the Bot was constructed. Messages dated before it are
-	// skipped: Telegram only acknowledges an update on the next getUpdates
-	// with a higher offset, so a command that restarts mezzaops itself
-	// (/deploy on a self_deploy service) would otherwise be redelivered and
-	// run again on every boot.
-	started time.Time
+	// outbox holds messages waiting to be sent. PostMessage enqueues; a single
+	// sender goroutine started by Run drains it in order, so a slow Bot API
+	// or a 429 never blocks the caller.
+	outbox chan outbound
+
+	// sleep waits between 429 retries. A field so tests don't wait.
+	sleep func(ctx context.Context, d time.Duration)
 
 	// pollTimeout and the backoff bounds are fields rather than constants so
 	// tests don't wait 30s polls or 1s retries.
@@ -128,15 +140,30 @@ type Bot struct {
 	backoffMax     time.Duration
 
 	// offset is the next update_id to request. It lives on the Bot, not in
-	// runOnce, so a reconnect does not replay updates. Only the poll loop
-	// touches it.
+	// runOnce, so a reconnect does not replay updates. Only the connect/poll
+	// goroutine touches it.
 	offset int64
+
+	// drained records that the first connect has skipped updates left over
+	// from before this process started. Telegram acknowledges an update only
+	// on a later getUpdates with a higher offset, so an unacknowledged
+	// /deploy of a self_deploy service (which restarts mezzaops) would
+	// otherwise be redelivered and run again on every boot.
+	drained bool
 
 	// username is the bot's own @username, set from getMe. mu protects it
 	// because runOnce writes it while handlers read it.
 	mu       sync.Mutex
 	username string
+	botID    int64
 	readyCh  chan struct{}
+}
+
+// outbound is one queued message. threadID is the forum topic to send to; zero
+// means the chat's default topic.
+type outbound struct {
+	text     string
+	threadID int64
 }
 
 // New constructs a Bot. No I/O is performed: validating the token and
@@ -151,7 +178,8 @@ func New(cfg Config, manager service.ServiceManager) *Bot {
 		cfg:            cfg,
 		manager:        manager,
 		http:           &http.Client{},
-		started:        time.Now(),
+		outbox:         make(chan outbound, outboxSize),
+		sleep:          sleepCtx,
 		pollTimeout:    defaultPollTimeout,
 		backoffInitial: defaultBackoffInitial,
 		backoffMax:     defaultBackoffMax,
@@ -173,6 +201,22 @@ func (b *Bot) markReady() {
 	close(b.readyCh)
 }
 
+// sleepCtx waits for d or until ctx is cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+	}
+}
+
+func (b *Bot) ownID() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.botID
+}
+
 func (b *Bot) botUsername() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -184,6 +228,13 @@ func (b *Bot) botUsername() string {
 // backoff so a transient failure on boot does not permanently disable the
 // frontend.
 func (b *Bot) Run(ctx context.Context) error {
+	// The sender starts here, not in New, so New does no I/O. Messages
+	// queued before Run are sent once it starts.
+	sendCtx, stopSender := context.WithCancel(ctx)
+	senderDone := make(chan struct{})
+	go func() { defer close(senderDone); b.sendLoop(sendCtx) }()
+	defer func() { stopSender(); <-senderDone }()
+
 	return reconnect.RunWithBackoff(ctx, "telegram", reconnect.Options{
 		InitialDelay:   b.backoffInitial,
 		MaxDelay:       b.backoffMax,
@@ -198,22 +249,47 @@ func (b *Bot) Run(ctx context.Context) error {
 // runOnce validates the token, registers the command list (best-effort),
 // marks the bot ready, and polls until ctx is cancelled.
 func (b *Bot) runOnce(ctx context.Context) error {
-	username, err := b.getMe(ctx)
+	me, err := b.getMe(ctx)
 	if err != nil {
 		return err
 	}
 	b.mu.Lock()
-	b.username = username
+	b.username = me.Username
+	b.botID = me.ID
 	b.mu.Unlock()
 
 	if err := b.setMyCommands(ctx); err != nil {
 		log.Printf("telegram: setMyCommands: %v", err)
 	}
 
+	// Drain before marking ready: a command sent just after Ready must not be
+	// mistaken for a leftover and skipped.
+	if !b.drained {
+		if err := b.drainPending(ctx); err != nil {
+			return err
+		}
+		b.drained = true
+	}
+
 	b.markReady()
-	log.Printf("telegram: connected as @%s, watching chat %d", username, b.cfg.ChatID)
+	log.Printf("telegram: connected as @%s, watching chat %d", me.Username, b.cfg.ChatID)
 
 	b.pollLoop(ctx)
+	return nil
+}
+
+// drainPending skips updates that arrived before this process started, by
+// asking for the newest one (offset -1, no long poll) and moving the offset
+// past it. This does not depend on the host clock, unlike filtering on
+// message dates.
+func (b *Bot) drainPending(ctx context.Context) error {
+	updates, err := b.getUpdatesAt(ctx, -1, 0)
+	if err != nil {
+		return fmt.Errorf("draining pending updates: %w", err)
+	}
+	for _, u := range updates {
+		b.offset = max(b.offset, u.UpdateID+1)
+	}
 	return nil
 }
 
@@ -253,48 +329,114 @@ func (b *Bot) pollLoop(ctx context.Context) {
 	}
 }
 
-// handleUpdate filters to the configured chat, ignores bots and messages from
-// before the Bot was constructed, parses the command, and posts the response.
+// handleUpdate filters to the configured chat, ignores the bot's own and other
+// bots' messages, parses the command, and queues the response.
+//
+// An anonymous group admin sends as @GroupAnonymousBot (is_bot=true) with
+// sender_chat set to the group itself, so a message whose sender_chat is the
+// configured chat is accepted despite the bot flag.
 func (b *Bot) handleUpdate(ctx context.Context, u update) {
 	msg := u.Message
 	if msg == nil || msg.Chat.ID != b.cfg.ChatID {
 		return
 	}
-	if msg.From != nil && msg.From.IsBot {
-		return
-	}
-	if msg.Date < b.started.Unix() {
-		return
+	anonymousAdmin := msg.SenderChat != nil && msg.SenderChat.ID == b.cfg.ChatID
+	if !anonymousAdmin && msg.From != nil {
+		if msg.From.IsBot {
+			return
+		}
+		if id := b.ownID(); id != 0 && msg.From.ID == id {
+			return
+		}
 	}
 	cmd := ParseCommand(msg.Text, b.botUsername())
 	if cmd == nil {
 		return
 	}
-	b.PostMessage(ctx, b.dispatchCommand(cmd))
+	var threadID int64
+	if msg.IsTopicMessage {
+		threadID = msg.MessageThreadID
+	}
+	b.enqueue(outbound{text: b.dispatchCommand(cmd), threadID: threadID})
 }
 
-// PostMessage renders the markdown to Telegram HTML and sends it to the
-// configured chat. If Telegram rejects the markup (HTTP 400) the original text
-// is resent once as plain text. Errors are logged, not returned, since
-// notifier callers don't have a place to surface them.
+// PostMessage queues a markdown message for the configured chat's default
+// topic and returns immediately; a single sender goroutine started by Run
+// sends it. If the queue is full the message is dropped and logged, so a slow
+// or rate-limited Bot API never blocks the caller (the manager's notifier,
+// or HandlePush under the webhook's 10s write timeout).
 //
-// The chat ID comes from config, so PostMessage does not wait for getMe:
-// notifications before Ready are sent rather than dropped.
-func (b *Bot) PostMessage(ctx context.Context, message string) {
-	if strings.TrimSpace(message) == "" {
+// The chat ID comes from config, so messages queued before Ready (or before
+// Run) are sent once the sender starts rather than dropped.
+func (b *Bot) PostMessage(_ context.Context, message string) {
+	b.enqueue(outbound{text: message})
+}
+
+func (b *Bot) enqueue(m outbound) {
+	if strings.TrimSpace(m.text) == "" {
 		return
 	}
-	message = service.TruncateTailToRuneBudget(message, telegramMaxRunes)
+	m.text = truncateTailUTF16(m.text, telegramMaxUTF16Units)
+	select {
+	case b.outbox <- m:
+	default:
+		log.Printf("telegram: send queue full, dropping message")
+	}
+}
 
-	err := b.sendMessage(ctx, markdownToHTML(message), "HTML")
-	var apiErr *apiError
-	if errors.As(err, &apiErr) && apiErr.Code == http.StatusBadRequest {
-		log.Printf("telegram: send message as HTML rejected, resending as plain text: %v", err)
-		err = b.sendMessage(ctx, message, "")
+// sendLoop sends queued messages in order until ctx is cancelled.
+func (b *Bot) sendLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case m := <-b.outbox:
+			b.sendWithRetry(ctx, m)
+		}
 	}
-	if err != nil {
+}
+
+// sendWithRetry delivers m, waiting out HTTP 429 (Too Many Requests) for the
+// retry_after Telegram asks for, up to maxSendRetries times. Errors are
+// logged, not returned, since notifier callers don't have a place to surface
+// them.
+func (b *Bot) sendWithRetry(ctx context.Context, m outbound) {
+	for attempt := 0; ; attempt++ {
+		err := b.deliver(ctx, m)
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		var apiErr *apiError
+		if errors.As(err, &apiErr) && apiErr.Code == http.StatusTooManyRequests && attempt < maxSendRetries {
+			wait := min(max(time.Duration(apiErr.RetryAfter)*time.Second, time.Second), maxRetryAfter)
+			log.Printf("telegram: rate limited, retrying in %v", wait)
+			b.sleep(ctx, wait)
+			if ctx.Err() != nil {
+				return
+			}
+			continue
+		}
 		log.Printf("telegram: send message: %v", err)
+		return
 	}
+}
+
+// deliver renders m to Telegram HTML and sends it. If Telegram rejects the
+// markup (HTTP 400, "can't parse entities") the original text is resent once
+// as plain text. Other failures, such as "chat not found", are returned as is.
+func (b *Bot) deliver(ctx context.Context, m outbound) error {
+	err := b.sendMessage(ctx, markdownToHTML(m.text), "HTML", m.threadID)
+	if isEntityError(err) {
+		log.Printf("telegram: send message as HTML rejected, resending as plain text: %v", err)
+		err = b.sendMessage(ctx, m.text, "", m.threadID)
+	}
+	return err
+}
+
+func isEntityError(err error) bool {
+	var apiErr *apiError
+	return errors.As(err, &apiErr) && apiErr.Code == http.StatusBadRequest &&
+		strings.Contains(strings.ToLower(apiErr.Description), "parse entities")
 }
 
 // dispatchCommand routes a parsed command to the manager and returns a
@@ -312,8 +454,8 @@ func (b *Bot) dispatchCommand(cmd *Command) string {
 
 	case "logs":
 		const format = "%s:\n```\n%s\n```"
-		budget := telegramMaxRunes - len([]rune(fmt.Sprintf(format, cmd.Service, "")))
-		out := service.TruncateTailToRuneBudget(defuseFences(b.manager.Do(cmd.Service, "logs")), budget)
+		budget := telegramMaxUTF16Units - utf16Len(fmt.Sprintf(format, cmd.Service, ""))
+		out := truncateTailUTF16(defuseFences(b.manager.Do(cmd.Service, "logs")), budget)
 		return fmt.Sprintf(format, cmd.Service, out)
 
 	case "deploy":
@@ -352,9 +494,13 @@ func (b *Bot) dispatchCommand(cmd *Command) string {
 }
 
 // defuseFences stops ``` in command or log output from closing a code fence
-// early.
+// early. A single pass is not enough: "````" becomes "```", so it repeats until
+// no run of three backticks is left.
 func defuseFences(s string) string {
-	return strings.ReplaceAll(s, "```", "``")
+	for strings.Contains(s, "```") {
+		s = strings.ReplaceAll(s, "```", "``")
+	}
+	return s
 }
 
 // --- Bot API ---
@@ -366,10 +512,14 @@ type update struct {
 }
 
 type message struct {
-	Date int64  `json:"date"`
 	Text string `json:"text"`
 	Chat chat   `json:"chat"`
 	From *user  `json:"from"`
+	// SenderChat is set when the message is sent on behalf of a chat: the
+	// group itself for anonymous admins, or a channel.
+	SenderChat      *chat `json:"sender_chat"`
+	IsTopicMessage  bool  `json:"is_topic_message"`
+	MessageThreadID int64 `json:"message_thread_id"`
 }
 
 type chat struct {
@@ -377,6 +527,7 @@ type chat struct {
 }
 
 type user struct {
+	ID       int64  `json:"id"`
 	IsBot    bool   `json:"is_bot"`
 	Username string `json:"username"`
 }
@@ -386,6 +537,8 @@ type apiError struct {
 	Method      string
 	Code        int
 	Description string
+	// RetryAfter is the wait in seconds Telegram asks for on HTTP 429.
+	RetryAfter int
 }
 
 func (e *apiError) Error() string {
@@ -425,6 +578,9 @@ func (b *Bot) call(ctx context.Context, method string, params, out any, timeout 
 		Result      json.RawMessage `json:"result"`
 		ErrorCode   int             `json:"error_code"`
 		Description string          `json:"description"`
+		Parameters  struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return &apiError{Method: method, Code: resp.StatusCode, Description: http.StatusText(resp.StatusCode)}
@@ -434,7 +590,7 @@ func (b *Bot) call(ctx context.Context, method string, params, out any, timeout 
 		if code == 0 {
 			code = resp.StatusCode
 		}
-		return &apiError{Method: method, Code: code, Description: env.Description}
+		return &apiError{Method: method, Code: code, Description: env.Description, RetryAfter: env.Parameters.RetryAfter}
 	}
 	if out != nil {
 		if err := json.Unmarshal(env.Result, out); err != nil {
@@ -459,18 +615,22 @@ func (b *Bot) scrub(method string, err error) error {
 	return fmt.Errorf("telegram %s: %s", method, msg)
 }
 
-// getMe validates the token and returns the bot's username.
-func (b *Bot) getMe(ctx context.Context) (string, error) {
-	var me struct {
-		Username string `json:"username"`
+// me is the part of getMe's result the bot uses.
+type me struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+}
+
+// getMe validates the token and returns the bot's identity.
+func (b *Bot) getMe(ctx context.Context) (me, error) {
+	var m me
+	if err := b.call(ctx, "getMe", struct{}{}, &m, requestTimeout); err != nil {
+		return me{}, err
 	}
-	if err := b.call(ctx, "getMe", struct{}{}, &me, requestTimeout); err != nil {
-		return "", err
+	if m.Username == "" {
+		return me{}, errors.New("telegram getMe: empty username (check token)")
 	}
-	if me.Username == "" {
-		return "", errors.New("telegram getMe: empty username (check token)")
-	}
-	return me.Username, nil
+	return m, nil
 }
 
 // setMyCommands registers the command list so clients autocomplete it.
@@ -488,21 +648,26 @@ func (b *Bot) setMyCommands(ctx context.Context) error {
 
 // getUpdates long-polls for new messages starting at the current offset.
 func (b *Bot) getUpdates(ctx context.Context) ([]update, error) {
+	return b.getUpdatesAt(ctx, b.offset, b.pollTimeout)
+}
+
+// getUpdatesAt calls getUpdates with an explicit offset and long-poll timeout.
+func (b *Bot) getUpdatesAt(ctx context.Context, offset int64, pollTimeout time.Duration) ([]update, error) {
 	params := map[string]any{
-		"offset":          b.offset,
-		"timeout":         int(b.pollTimeout / time.Second),
+		"offset":          offset,
+		"timeout":         int(pollTimeout / time.Second),
 		"allowed_updates": []string{"message"},
 	}
 	var updates []update
-	if err := b.call(ctx, "getUpdates", params, &updates, b.pollTimeout+pollSlack); err != nil {
+	if err := b.call(ctx, "getUpdates", params, &updates, pollTimeout+pollSlack); err != nil {
 		return nil, err
 	}
 	return updates, nil
 }
 
-// sendMessage posts text to the configured chat. An empty parseMode sends
-// plain text.
-func (b *Bot) sendMessage(ctx context.Context, text, parseMode string) error {
+// sendMessage posts text to the configured chat, in forum topic threadID if
+// nonzero. An empty parseMode sends plain text.
+func (b *Bot) sendMessage(ctx context.Context, text, parseMode string, threadID int64) error {
 	params := map[string]any{
 		"chat_id":              b.cfg.ChatID,
 		"text":                 text,
@@ -510,6 +675,9 @@ func (b *Bot) sendMessage(ctx context.Context, text, parseMode string) error {
 	}
 	if parseMode != "" {
 		params["parse_mode"] = parseMode
+	}
+	if threadID != 0 {
+		params["message_thread_id"] = threadID
 	}
 	return b.call(ctx, "sendMessage", params, nil, requestTimeout)
 }

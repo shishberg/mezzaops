@@ -132,8 +132,13 @@ To set up the Telegram bot:
    `https://api.telegram.org/bot<token>/getUpdates` and read `message.chat.id`
    (group and supergroup IDs are negative). Put it in `telegram.chat_id`.
 
-Only messages from that one chat are handled; everything else is ignored. The
-bot only needs `/` commands, so Telegram's privacy mode can stay on. The
+Only messages from that one chat are handled; everything else is ignored. If
+`chat_id` is missing the frontend is disabled and a warning is logged. Commands
+from anonymous group admins work, and replies to a command sent in a forum
+topic go to that topic (notifications go to the default topic). On startup the
+bot skips any commands that were sent before it started, so a command that
+restarts mezzaops is not run twice. The bot only needs `/` commands, so
+Telegram's privacy mode can stay on. The
 frontend is enabled when the `telegram` section is present and `TELEGRAM_TOKEN`
 is non-empty.
 

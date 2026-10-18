@@ -18,17 +18,15 @@ func markdownToHTML(s string) string {
 
 	var out strings.Builder
 	started := false
-	afterBlock := false
-	// emit appends one piece, newline-separated from the previous one. Block
-	// elements (pre, blockquote) already end the line in Telegram's renderer,
-	// so no newline is added after them.
-	emit := func(piece string, block bool) {
-		if started && !afterBlock {
+	// emit appends one piece, newline-separated from the previous one. The
+	// newline after a pre or blockquote is needed: Telegram entities are ranges
+	// over the text, so without it the next line would run on from the block.
+	emit := func(piece string) {
+		if started {
 			out.WriteByte('\n')
 		}
 		out.WriteString(piece)
 		started = true
-		afterBlock = block
 	}
 
 	for i := 0; i < len(lines); {
@@ -37,7 +35,7 @@ func markdownToHTML(s string) string {
 		if strings.HasPrefix(strings.TrimSpace(line), "```") {
 			if end := closingFence(lines, i+1); end >= 0 {
 				code := strings.Join(lines[i+1:end], "\n")
-				emit("<pre>"+htmlEscaper.Replace(code)+"</pre>", true)
+				emit("<pre>" + htmlEscaper.Replace(code) + "</pre>")
 				i = end + 1
 				continue
 			}
@@ -48,11 +46,11 @@ func markdownToHTML(s string) string {
 			for ; i < len(lines) && strings.HasPrefix(lines[i], "> "); i++ {
 				quoted = append(quoted, inlineToHTML(lines[i][2:]))
 			}
-			emit("<blockquote>"+strings.Join(quoted, "\n")+"</blockquote>", true)
+			emit("<blockquote>" + strings.Join(quoted, "\n") + "</blockquote>")
 			continue
 		}
 
-		emit(inlineToHTML(line), false)
+		emit(inlineToHTML(line))
 		i++
 	}
 	return out.String()

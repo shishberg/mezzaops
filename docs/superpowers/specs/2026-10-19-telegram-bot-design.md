@@ -39,6 +39,11 @@ telegram:
 section is present and the token is non-empty (matching the other
 frontends). `telegram` joins `knownTopLevelConfigKeys`.
 
+A `chat_id` of 0 (key missing or misspelled) would start a bot that silently
+ignores everything, so `app.New` logs a warning and leaves the frontend
+disabled. It does not return an error: one bad section must not stop the
+supervisor booting.
+
 ## Commands
 
 Telegram commands are `/word`, where the word may contain only `a-z`, `0-9`
@@ -65,14 +70,33 @@ differences: the unknown-command message lists the Telegram spellings, and
 
 Only messages whose `chat.id` equals the configured `chat_id` are handled;
 everything else is ignored silently (a Telegram bot can be messaged by
-anyone). Messages from bots are ignored.
+anyone).
 
-Messages whose `date` is earlier than the time the Bot was constructed are
-skipped. Without this, an update that was received but not yet acknowledged
-(Telegram acknowledges on the next `getUpdates` with a higher offset) is
-redelivered after a restart. The specific failure: `/deploy mezzaops` on a
-`self_deploy` service restarts mezzaops before the next poll, so the deploy
-command is redelivered and runs again on every boot.
+Senders are filtered as follows:
+
+- A message whose `sender_chat.id` equals the configured `chat_id` is
+  accepted. This is how an anonymous group admin ("Remain anonymous")
+  appears: `from` is `@GroupAnonymousBot` (`is_bot: true`) and `sender_chat`
+  is the group itself.
+- Otherwise a message is ignored if `from.is_bot` is true, or if `from.id` is
+  the bot's own ID (stored from `getMe`).
+
+There is no date filter: it would depend on the host clock, and a clock that
+is fast or not yet synced would drop real commands. Instead, on the **first**
+successful connect only, the bot drains pending updates server-side before it
+reports ready: `getUpdates` with `offset=-1` and `timeout=0` returns the
+newest pending update, and the bot sets its offset to that update's
+`update_id + 1`. Later reconnects keep the in-memory offset.
+
+The reason is that Telegram acknowledges an update only on the next
+`getUpdates` with a higher offset, so an update that was received but not yet
+acknowledged is redelivered after a restart. The specific failure:
+`/deploy mezzaops` on a `self_deploy` service restarts mezzaops before the
+next poll, so the deploy command is redelivered and runs again on every boot.
+
+Replies to a command sent in a forum topic (`is_topic_message` true) carry the
+same `message_thread_id`, so they land in that topic rather than General.
+Notifications go to the chat's default topic.
 
 ## Formatting
 
@@ -90,16 +114,24 @@ so convert this subset to Telegram HTML instead (`markdownToHTML`):
 - Anything unmatched (a lone `**`, an unclosed backtick) is left as literal
   text.
 
-If `sendMessage` fails with HTTP 400 (bad entities), resend the original
-text once without `parse_mode`.
+Block elements are separated from following content by a newline: Telegram
+entities are ranges over the text, so without it the next line would run on
+from the block.
 
-Telegram limits a message to 4096 characters, counted after entity parsing,
-so HTML tags and entity escapes do not count. Define
-`telegramMaxRunes = 4000`. Callers that build fenced output (the notifier's
-`DeployFailed` and the `logs` response) truncate the content inside the fence,
-computing the budget the same way the Matrix notifier does, so the fence
-markers survive. As a fallback, `PostMessage` truncates any text over
-`telegramMaxRunes` with `service.TruncateTailToRuneBudget` before
+If `sendMessage` fails with HTTP 400 and the description is an entity-parse
+error (`Bad Request: can't parse entities: ...`), resend the original text
+once without `parse_mode`. Other 400s (for example `chat not found`) are
+logged once and not resent.
+
+Telegram limits a message to 4096 UTF-16 code units, counted after entity
+parsing, so HTML tags and entity escapes do not count, and characters outside
+the BMP (most emoji) count as 2. Define `telegramMaxUTF16Units = 4000` and a
+tail-truncation helper that measures in UTF-16 units. Callers that build
+fenced output (the notifier's `DeployFailed` and the `logs` response) truncate
+the content inside the fence with it, so the fence markers survive. Backtick
+runs of three or more in that content are reduced until no ``` remains (a
+single pass would turn four backticks into a fence). As a fallback, the send
+path truncates any text over the limit with the same helper before
 conversion. If that cuts an opening fence, the converter leaves the
 unmatched closing fence as literal text, which is acceptable.
 
@@ -117,11 +149,23 @@ Follow the boot-resilience pattern (`internal/reconnect`):
   The offset is kept on the Bot so a reconnect does not replay updates.
   HTTP 409 (a webhook is set, or another poller is running) is logged with
   that explanation.
-- `Ready()` closes once `getMe` succeeds. The app adds it to
+- `Ready()` closes once `getMe` has succeeded and the first-connect drain
+  (see Message filtering) is done; draining first means a command sent right
+  after Ready is not mistaken for a leftover. The app adds it to
   `waitForReady`.
-- `PostMessage(ctx, text)` posts to the configured chat. It does not need
-  `getMe` to have run (the chat ID comes from config), so notifications
-  before Ready are sent rather than dropped.
+- `PostMessage(ctx, text)` does not call the API. It enqueues onto a bounded
+  buffered channel (100) and returns, so a slow Bot API never blocks the
+  manager's notifier or `HandlePush` (whose webhook has a 10s timeout). When
+  the queue is full the message is logged and dropped. Command replies use the
+  same queue, so ordering is preserved.
+- A single sender goroutine, started by `Run` (so `New` still does no I/O),
+  drains the queue in order and stops when the `Run` context is cancelled. It
+  does not need `getMe` (the chat ID comes from config), so messages queued
+  before Ready are sent once the sender starts rather than dropped.
+- On HTTP 429 the sender reads `parameters.retry_after`, sleeps that long
+  (at least 1s, capped at 60s, cancellable), and retries the same message, up
+  to 3 retries; after that the message is logged and dropped. The sleep is an
+  injectable field so tests stay fast.
 
 ## App wiring
 

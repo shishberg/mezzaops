@@ -83,12 +83,12 @@ func TestMarkdownToHTML(t *testing.T) {
 		{"fenced block", "```\nfoo <b>\nbar\n```", "<pre>foo &lt;b&gt;\nbar</pre>"},
 		{"fenced block no inline", "```\n**x** `y` [a](b)\n```", "<pre>**x** `y` [a](b)</pre>"},
 		{"fenced block info string dropped", "```go\nx := 1\n```", "<pre>x := 1</pre>"},
-		{"fence surrounded by text", "before\n```\ncode\n```\nafter", "before\n<pre>code</pre>after"},
+		{"fence surrounded by text", "before\n```\ncode\n```\nafter", "before\n<pre>code</pre>\nafter"},
 		{"blockquote", "> a\n> b", "<blockquote>a\nb</blockquote>"},
 		{"blockquote inline", "> **a** `b`", "<blockquote><b>a</b> <code>b</code></blockquote>"},
-		{"blockquote then text", "> a\nafter", "<blockquote>a</blockquote>after"},
+		{"blockquote then text", "> a\nafter", "<blockquote>a</blockquote>\nafter"},
 		{"text then blockquote", "before\n> a", "before\n<blockquote>a</blockquote>"},
-		{"two separate quotes", "> a\nmid\n> b", "<blockquote>a</blockquote>mid\n<blockquote>b</blockquote>"},
+		{"two separate quotes", "> a\nmid\n> b", "<blockquote>a</blockquote>\nmid\n<blockquote>b</blockquote>"},
 		{"gt without space is not a quote", ">a", "&gt;a"},
 		{"unmatched bold", "a ** b", "a ** b"},
 		{"unclosed bold", "**bold", "**bold"},
@@ -261,9 +261,16 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 	var pending []map[string]any
 	if call.Method == "getUpdates" {
 		offset, _ := call.Body["offset"].(float64)
-		for _, u := range f.updates {
-			if u["update_id"].(float64) >= offset {
-				pending = append(pending, u)
+		if offset < 0 {
+			// Telegram returns only the newest update for a negative offset.
+			if n := len(f.updates); n > 0 {
+				pending = append(pending, f.updates[n-1])
+			}
+		} else {
+			for _, u := range f.updates {
+				if u["update_id"].(float64) >= offset {
+					pending = append(pending, u)
+				}
 			}
 		}
 	}
@@ -316,12 +323,6 @@ func (f *fakeAPI) callsTo(method string) []apiCall {
 	return out
 }
 
-func (f *fakeAPI) allCalls() []apiCall {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]apiCall(nil), f.calls...)
-}
-
 // sentTexts returns the text field of each sendMessage call, in order.
 func (f *fakeAPI) sentTexts() []string {
 	var out []string
@@ -341,9 +342,57 @@ func updateJSON(id int, chatID int64, date time.Time, text string, isBot bool) m
 			"date":       float64(date.Unix()),
 			"text":       text,
 			"chat":       map[string]any{"id": float64(chatID)},
-			"from":       map[string]any{"is_bot": isBot, "username": "someone"},
+			"from":       map[string]any{"id": float64(7), "is_bot": isBot, "username": "someone"},
 		},
 	}
+}
+
+// withSenderChat marks the update as sent on behalf of a chat, as Telegram
+// does for anonymous group admins.
+func withSenderChat(u map[string]any, chatID int64) map[string]any {
+	u["message"].(map[string]any)["sender_chat"] = map[string]any{"id": float64(chatID)}
+	return u
+}
+
+// withFrom replaces the update's sender.
+func withFrom(u map[string]any, from map[string]any) map[string]any {
+	u["message"].(map[string]any)["from"] = from
+	return u
+}
+
+// withTopic marks the update as sent inside a forum topic.
+func withTopic(u map[string]any, threadID int64) map[string]any {
+	m := u["message"].(map[string]any)
+	m["is_topic_message"] = true
+	m["message_thread_id"] = float64(threadID)
+	return u
+}
+
+// newSendingBot is newTestBot with the sender goroutine running, so
+// PostMessage and command replies reach the fake API. It is stopped on test
+// cleanup.
+func newSendingBot(t *testing.T, api *fakeAPI, mgr service.ServiceManager, ch service.ConfirmHandler) *Bot {
+	t.Helper()
+	b := newTestBot(t, api, mgr, ch)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); b.sendLoop(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	return b
+}
+
+// flush waits until everything queued so far has been sent by posting a
+// sentinel behind it, and returns the texts sent before the sentinel.
+func flush(t *testing.T, b *Bot, api *fakeAPI) []string {
+	t.Helper()
+	const sentinel = "flush-sentinel"
+	b.PostMessage(context.Background(), sentinel)
+	var texts []string
+	waitFor(t, "flush sentinel", func() bool {
+		texts = api.sentTexts()
+		return len(texts) > 0 && texts[len(texts)-1] == sentinel
+	})
+	return texts[:len(texts)-1]
 }
 
 // newTestBot builds a Bot pointed at api with fast poll/backoff timings and
@@ -359,6 +408,7 @@ func newTestBot(t *testing.T, api *fakeAPI, mgr service.ServiceManager, ch servi
 	b.pollTimeout = 20 * time.Millisecond
 	b.backoffInitial = time.Millisecond
 	b.backoffMax = 5 * time.Millisecond
+	b.sleep = func(context.Context, time.Duration) {}
 	return b
 }
 
@@ -541,7 +591,7 @@ func TestDispatch_LogsTruncatedInsideFence(t *testing.T) {
 	mgr.doResult = strings.Repeat("x\n", 5000) + tailMarker
 	b := newTestBot(t, newFakeAPI(t), mgr, nil)
 	got := b.dispatchCommand(&Command{Action: "logs", Service: "app1"})
-	assert.LessOrEqual(t, len([]rune(got)), telegramMaxRunes)
+	assert.LessOrEqual(t, utf16Len(got), telegramMaxUTF16Units)
 	assert.True(t, strings.HasPrefix(got, "app1:\n```\n"))
 	assert.True(t, strings.HasSuffix(got, tailMarker+"\n```"), "fence must survive and tail be kept")
 	assert.Contains(t, got, "truncated")
@@ -552,89 +602,170 @@ func TestDispatch_LogsTruncatedInsideFence(t *testing.T) {
 func TestHandleUpdate_DispatchesCommandAndReplies(t *testing.T) {
 	api := newFakeAPI(t)
 	mgr := newMockServiceManager()
-	b := newTestBot(t, api, mgr, nil)
+	b := newSendingBot(t, api, mgr, nil)
 
 	u := decodeUpdate(t, updateJSON(1, testChatID, time.Now(), "/restart app1", false))
 	b.handleUpdate(context.Background(), u)
 
 	assert.Equal(t, "restart", mgr.getLastOp())
 	assert.Equal(t, "app1", mgr.getLastService())
-	assert.Equal(t, []string{"ok"}, api.sentTexts())
+	assert.Equal(t, []string{"ok"}, flush(t, b, api))
 }
 
 func TestHandleUpdate_BotSuffixAndUnderscore(t *testing.T) {
 	api := newFakeAPI(t)
 	mgr := newMockServiceManager()
-	b := newTestBot(t, api, mgr, nil)
+	b := newSendingBot(t, api, mgr, nil)
 
 	b.handleUpdate(context.Background(), decodeUpdate(t, updateJSON(1, testChatID, time.Now(), "/start_all@mezzaops_bot", false)))
 	assert.Equal(t, "start-all", mgr.getLastOp())
-	assert.Equal(t, []string{"All services starting."}, api.sentTexts())
+	assert.Equal(t, []string{"All services starting."}, flush(t, b, api))
 }
 
 func TestHandleUpdate_IgnoresOtherBotSuffix(t *testing.T) {
 	api := newFakeAPI(t)
 	mgr := newMockServiceManager()
-	b := newTestBot(t, api, mgr, nil)
+	b := newSendingBot(t, api, mgr, nil)
 
 	b.handleUpdate(context.Background(), decodeUpdate(t, updateJSON(1, testChatID, time.Now(), "/restart@other_bot app1", false)))
 	assert.Empty(t, mgr.getLastOp())
-	assert.Empty(t, api.sentTexts())
+	assert.Empty(t, flush(t, b, api))
 }
 
 func TestHandleUpdate_IgnoresOtherChats(t *testing.T) {
 	api := newFakeAPI(t)
 	mgr := newMockServiceManager()
-	b := newTestBot(t, api, mgr, nil)
+	b := newSendingBot(t, api, mgr, nil)
 
 	b.handleUpdate(context.Background(), decodeUpdate(t, updateJSON(1, testChatID+1, time.Now(), "/restart app1", false)))
 	assert.Empty(t, mgr.getLastOp())
-	assert.Empty(t, api.allCalls(), "nothing should be sent to a stranger")
+	assert.Empty(t, flush(t, b, api), "nothing should be sent to a stranger")
 }
 
 func TestHandleUpdate_IgnoresBotSenders(t *testing.T) {
 	api := newFakeAPI(t)
 	mgr := newMockServiceManager()
-	b := newTestBot(t, api, mgr, nil)
+	b := newSendingBot(t, api, mgr, nil)
 
 	b.handleUpdate(context.Background(), decodeUpdate(t, updateJSON(1, testChatID, time.Now(), "/restart app1", true)))
 	assert.Empty(t, mgr.getLastOp())
-	assert.Empty(t, api.allCalls())
+	assert.Empty(t, flush(t, b, api))
 }
 
-func TestHandleUpdate_IgnoresStaleMessages(t *testing.T) {
+func TestHandleUpdate_IgnoresMessageDate(t *testing.T) {
+	// A host clock that is fast, slow or unsynced must not drop real commands.
 	api := newFakeAPI(t)
 	mgr := newMockServiceManager()
-	b := newTestBot(t, api, mgr, nil)
+	b := newSendingBot(t, api, mgr, nil)
 
-	old := b.started.Add(-time.Minute)
+	old := time.Now().Add(-48 * time.Hour)
 	b.handleUpdate(context.Background(), decodeUpdate(t, updateJSON(1, testChatID, old, "/deploy app1", false)))
-	assert.Empty(t, mgr.getLastOp(), "a message sent before the bot started must not run")
-	assert.Empty(t, api.allCalls())
-
-	b.handleUpdate(context.Background(), decodeUpdate(t, updateJSON(2, testChatID, b.started.Add(time.Second), "/deploy app1", false)))
 	assert.Equal(t, "deploy", mgr.getLastOp())
+	future := time.Now().Add(48 * time.Hour)
+	b.handleUpdate(context.Background(), decodeUpdate(t, updateJSON(2, testChatID, future, "/restart app1", false)))
+	assert.Equal(t, "restart", mgr.getLastOp())
+}
+
+func TestHandleUpdate_AnonymousAdminAccepted(t *testing.T) {
+	api := newFakeAPI(t)
+	mgr := newMockServiceManager()
+	b := newSendingBot(t, api, mgr, nil)
+
+	u := withSenderChat(updateJSON(1, testChatID, time.Now(), "/restart app1", true), testChatID)
+	withFrom(u, map[string]any{"id": float64(1087968824), "is_bot": true, "username": "GroupAnonymousBot"})
+	b.handleUpdate(context.Background(), decodeUpdate(t, u))
+	assert.Equal(t, "restart", mgr.getLastOp())
+	assert.Equal(t, []string{"ok"}, flush(t, b, api))
+}
+
+func TestHandleUpdate_SenderChatOfOtherChatIsIgnored(t *testing.T) {
+	api := newFakeAPI(t)
+	mgr := newMockServiceManager()
+	b := newSendingBot(t, api, mgr, nil)
+
+	// A channel posting into the group: is_bot sender, sender_chat is not the group.
+	u := withSenderChat(updateJSON(1, testChatID, time.Now(), "/restart app1", true), testChatID-5)
+	b.handleUpdate(context.Background(), decodeUpdate(t, u))
+	assert.Empty(t, mgr.getLastOp())
+}
+
+func TestHandleUpdate_IgnoresOwnMessages(t *testing.T) {
+	api := newFakeAPI(t)
+	mgr := newMockServiceManager()
+	b := newSendingBot(t, api, mgr, nil)
+	b.botID = 42
+
+	u := withFrom(updateJSON(1, testChatID, time.Now(), "/restart app1", false),
+		map[string]any{"id": float64(42), "is_bot": false})
+	b.handleUpdate(context.Background(), decodeUpdate(t, u))
+	assert.Empty(t, mgr.getLastOp())
+}
+
+func TestHandleUpdate_NonBotUserWithOtherIDAccepted(t *testing.T) {
+	api := newFakeAPI(t)
+	mgr := newMockServiceManager()
+	b := newSendingBot(t, api, mgr, nil)
+	b.botID = 42
+
+	b.handleUpdate(context.Background(), decodeUpdate(t, updateJSON(1, testChatID, time.Now(), "/restart app1", false)))
+	assert.Equal(t, "restart", mgr.getLastOp())
+}
+
+func TestHandleUpdate_RepliesInTopic(t *testing.T) {
+	api := newFakeAPI(t)
+	b := newSendingBot(t, api, nil, nil)
+
+	b.handleUpdate(context.Background(), decodeUpdate(t, withTopic(updateJSON(1, testChatID, time.Now(), "/status app1", false), 99)))
+	flush(t, b, api)
+	calls := api.callsTo("sendMessage")
+	require.GreaterOrEqual(t, len(calls), 1)
+	assert.Equal(t, float64(99), calls[0].Body["message_thread_id"])
+}
+
+func TestHandleUpdate_NoThreadIDOutsideTopics(t *testing.T) {
+	api := newFakeAPI(t)
+	b := newSendingBot(t, api, nil, nil)
+
+	// A reply thread in an ordinary group carries message_thread_id but is
+	// not a topic message; sending with that ID would be rejected.
+	u := updateJSON(1, testChatID, time.Now(), "/status app1", false)
+	u["message"].(map[string]any)["message_thread_id"] = float64(55)
+	b.handleUpdate(context.Background(), decodeUpdate(t, u))
+	flush(t, b, api)
+	calls := api.callsTo("sendMessage")
+	require.GreaterOrEqual(t, len(calls), 1)
+	_, has := calls[0].Body["message_thread_id"]
+	assert.False(t, has)
+}
+
+func TestNotifications_GoToDefaultTopic(t *testing.T) {
+	api := newFakeAPI(t)
+	b := newSendingBot(t, api, nil, nil)
+	b.PostMessage(context.Background(), "note")
+	flush(t, b, api)
+	_, has := api.callsTo("sendMessage")[0].Body["message_thread_id"]
+	assert.False(t, has)
 }
 
 func TestHandleUpdate_IgnoresNonCommandAndNonMessage(t *testing.T) {
 	api := newFakeAPI(t)
 	mgr := newMockServiceManager()
-	b := newTestBot(t, api, mgr, nil)
+	b := newSendingBot(t, api, mgr, nil)
 
 	b.handleUpdate(context.Background(), decodeUpdate(t, updateJSON(1, testChatID, time.Now(), "just chatting", false)))
 	b.handleUpdate(context.Background(), update{UpdateID: 2})
 	assert.Empty(t, mgr.getLastOp())
-	assert.Empty(t, api.allCalls())
+	assert.Empty(t, flush(t, b, api))
 }
 
 func TestHandleUpdate_ConfirmCommand(t *testing.T) {
 	api := newFakeAPI(t)
 	ch := &mockConfirmHandler{result: true}
-	b := newTestBot(t, api, nil, ch)
+	b := newSendingBot(t, api, nil, ch)
 
 	b.handleUpdate(context.Background(), decodeUpdate(t, updateJSON(1, testChatID, time.Now(), "/confirm app1", false)))
 	assert.Equal(t, "app1", ch.getLastService())
-	assert.Equal(t, []string{"Confirmed deploy for <b>app1</b>."}, api.sentTexts())
+	assert.Equal(t, []string{"Confirmed deploy for <b>app1</b>."}, flush(t, b, api))
 }
 
 // --- Run / polling ---
@@ -736,11 +867,11 @@ func TestRun_ProcessesUpdatesAndAdvancesOffset(t *testing.T) {
 	api := newFakeAPI(t)
 	mgr := newMockServiceManager()
 	b := newTestBot(t, api, mgr, nil)
-	b.started = time.Now().Add(-time.Hour)
 
+	startRun(t, b)
+	<-b.Ready()
 	api.queueUpdate(updateJSON(10, testChatID, time.Now(), "/status", false))
 	api.queueUpdate(updateJSON(11, testChatID, time.Now(), "/reload", false))
-	startRun(t, b)
 
 	waitFor(t, "two replies", func() bool { return len(api.sentTexts()) >= 2 })
 	// Let a few more polls happen; a replayed update would send more replies.
@@ -761,26 +892,71 @@ func TestRun_ProcessesUpdatesAndAdvancesOffset(t *testing.T) {
 	assert.NotNil(t, first.Body["timeout"])
 }
 
+func TestRun_DrainsPendingUpdatesOnFirstConnect(t *testing.T) {
+	// Updates delivered but not acknowledged before a restart (e.g. a
+	// self-deploy /deploy) must not run again.
+	api := newFakeAPI(t)
+	mgr := newMockServiceManager()
+	b := newTestBot(t, api, mgr, nil)
+	api.queueUpdate(updateJSON(20, testChatID, time.Now(), "/deploy app1", false))
+	api.queueUpdate(updateJSON(21, testChatID, time.Now(), "/deploy app1", false))
+
+	startRun(t, b)
+	<-b.Ready()
+	waitFor(t, "drained offset", func() bool {
+		for _, c := range api.callsTo("getUpdates") {
+			if off, _ := c.Body["offset"].(float64); off == 22 {
+				return true
+			}
+		}
+		return false
+	})
+	drain := api.callsTo("getUpdates")[0]
+	assert.Equal(t, float64(-1), drain.Body["offset"])
+	assert.Equal(t, float64(0), drain.Body["timeout"])
+	time.Sleep(30 * time.Millisecond)
+	assert.Empty(t, mgr.getLastOp(), "pending updates must not be executed")
+
+	api.queueUpdate(updateJSON(22, testChatID, time.Now(), "/status app1", false))
+	waitFor(t, "new update processed", func() bool { return mgr.getLastOp() == "status" })
+}
+
+func TestRun_DrainWithNoPendingUpdates(t *testing.T) {
+	api := newFakeAPI(t)
+	b := newTestBot(t, api, nil, nil)
+	startRun(t, b)
+	<-b.Ready()
+	api.queueUpdate(updateJSON(1, testChatID, time.Now(), "/status", false))
+	waitFor(t, "update processed", func() bool { return len(api.sentTexts()) == 1 })
+}
+
 func TestRun_OffsetSurvivesReconnect(t *testing.T) {
 	api := newFakeAPI(t)
 	b := newTestBot(t, api, nil, nil)
-	b.started = time.Now().Add(-time.Hour)
-	api.queueUpdate(updateJSON(5, testChatID, time.Now(), "/status", false))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { _ = b.runOnce(ctx); close(done) }()
+	<-b.Ready()
+	api.queueUpdate(updateJSON(5, testChatID, time.Now(), "/status", false))
+	sender, stopSender := context.WithCancel(context.Background())
+	defer stopSender()
+	go b.sendLoop(sender)
 	waitFor(t, "first reply", func() bool { return len(api.sentTexts()) == 1 })
 	cancel()
 	<-done
 
+	// Queued while disconnected. A second connect must not drain it (the
+	// drain is first-connect only) and must not replay update 5.
+	api.queueUpdate(updateJSON(6, testChatID, time.Now(), "/status", false))
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	done2 := make(chan struct{})
 	go func() { _ = b.runOnce(ctx2); close(done2) }()
-	time.Sleep(60 * time.Millisecond)
+	waitFor(t, "second reply", func() bool { return len(api.sentTexts()) == 2 })
+	time.Sleep(40 * time.Millisecond)
 	cancel2()
 	<-done2
-	assert.Len(t, api.sentTexts(), 1, "a second connect must not replay acknowledged updates")
+	assert.Len(t, api.sentTexts(), 2, "update 5 must not be replayed, update 6 must not be lost")
 }
 
 func TestPollLoop_BacksOffOnErrorsAndRecovers(t *testing.T) {
@@ -851,8 +1027,8 @@ func (s *syncBuffer) String() string {
 
 func TestRequestsGoToBotTokenPath(t *testing.T) {
 	api := newFakeAPI(t)
-	b := newTestBot(t, api, nil, nil)
-	b.PostMessage(context.Background(), "hi")
+	b := newSendingBot(t, api, nil, nil)
+	flush(t, b, api)
 	calls := api.callsTo("sendMessage")
 	require.Len(t, calls, 1)
 	assert.Equal(t, "/bot"+testToken+"/sendMessage", calls[0].Path)
@@ -869,9 +1045,10 @@ func TestNew_DefaultAPIURL(t *testing.T) {
 
 func TestPostMessage_SendsHTML(t *testing.T) {
 	api := newFakeAPI(t)
-	b := newTestBot(t, api, nil, nil)
+	b := newSendingBot(t, api, nil, nil)
 
 	b.PostMessage(context.Background(), "**hi** <there>")
+	waitFor(t, "send", func() bool { return len(api.callsTo("sendMessage")) == 1 })
 	calls := api.callsTo("sendMessage")
 	require.Len(t, calls, 1)
 	assert.Equal(t, float64(testChatID), calls[0].Body["chat_id"])
@@ -890,9 +1067,10 @@ func TestPostMessage_FallsBackToPlainTextOn400(t *testing.T) {
 		}
 		return 200, `{"ok":true,"result":{"message_id":1}}`
 	})
-	b := newTestBot(t, api, nil, nil)
+	b := newSendingBot(t, api, nil, nil)
 
 	b.PostMessage(context.Background(), "**hi** <there>")
+	waitFor(t, "fallback", func() bool { return len(api.callsTo("sendMessage")) == 2 })
 	calls := api.callsTo("sendMessage")
 	require.Len(t, calls, 2)
 	assert.Equal(t, "HTML", calls[0].Body["parse_mode"])
@@ -906,44 +1084,80 @@ func TestPostMessage_NoFallbackOtherErrors(t *testing.T) {
 	api.handle("sendMessage", func(apiCall) (int, string) {
 		return 403, `{"ok":false,"error_code":403,"description":"Forbidden: bot was kicked"}`
 	})
-	b := newTestBot(t, api, nil, nil)
+	b := newSendingBot(t, api, nil, nil)
 	b.PostMessage(context.Background(), "hi")
-	assert.Len(t, api.callsTo("sendMessage"), 1)
+	waitFor(t, "send", func() bool { return len(api.callsTo("sendMessage")) >= 1 })
+	b.PostMessage(context.Background(), "again")
+	waitFor(t, "second send", func() bool { return len(api.callsTo("sendMessage")) >= 2 })
+	assert.Len(t, api.callsTo("sendMessage"), 2, "one attempt per message")
+}
+
+func TestPostMessage_NoFallbackOnNon400EntityLookalike(t *testing.T) {
+	api := newFakeAPI(t)
+	api.handle("sendMessage", func(apiCall) (int, string) {
+		return 500, `{"ok":false,"error_code":500,"description":"can't parse entities"}`
+	})
+	b := newSendingBot(t, api, nil, nil)
+	b.PostMessage(context.Background(), "hi")
+	b.PostMessage(context.Background(), "again")
+	waitFor(t, "sends", func() bool { return len(api.callsTo("sendMessage")) >= 2 })
+	assert.Len(t, api.callsTo("sendMessage"), 2)
+}
+
+func TestPostMessage_Other400DoesNotFallBackAndLogsOnce(t *testing.T) {
+	api := newFakeAPI(t)
+	api.handle("sendMessage", func(apiCall) (int, string) {
+		return 400, `{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}`
+	})
+	b := newSendingBot(t, api, nil, nil)
+
+	var buf syncBuffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(orig)
+
+	b.PostMessage(context.Background(), "hi")
+	waitFor(t, "log", func() bool { return strings.Contains(buf.String(), "chat not found") })
+	time.Sleep(20 * time.Millisecond)
+	assert.Len(t, api.callsTo("sendMessage"), 1, "chat not found is not a formatting problem")
+	assert.Equal(t, 1, strings.Count(buf.String(), "chat not found"), "logged once")
 }
 
 func TestPostMessage_FallbackOnlyOnce(t *testing.T) {
 	api := newFakeAPI(t)
 	api.handle("sendMessage", func(apiCall) (int, string) {
-		return 400, `{"ok":false,"error_code":400,"description":"bad"}`
+		return 400, `{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities: unclosed tag"}`
 	})
-	b := newTestBot(t, api, nil, nil)
+	b := newSendingBot(t, api, nil, nil)
 	b.PostMessage(context.Background(), "hi")
+	waitFor(t, "fallback", func() bool { return len(api.callsTo("sendMessage")) >= 2 })
+	time.Sleep(20 * time.Millisecond)
 	assert.Len(t, api.callsTo("sendMessage"), 2)
 }
 
 func TestPostMessage_TruncatesLongText(t *testing.T) {
 	api := newFakeAPI(t)
-	b := newTestBot(t, api, nil, nil)
+	b := newSendingBot(t, api, nil, nil)
 
 	const tailMarker = "===TAIL==="
 	b.PostMessage(context.Background(), strings.Repeat("y", 10000)+tailMarker)
-	texts := api.sentTexts()
+	texts := flush(t, b, api)
 	require.Len(t, texts, 1)
-	assert.LessOrEqual(t, len([]rune(texts[0])), telegramMaxRunes)
+	assert.LessOrEqual(t, utf16Len(texts[0]), telegramMaxUTF16Units)
 	assert.Contains(t, texts[0], "truncated")
 	assert.True(t, strings.HasSuffix(texts[0], tailMarker))
 }
 
 func TestPostMessage_WorksBeforeReady(t *testing.T) {
 	api := newFakeAPI(t)
-	b := newTestBot(t, api, nil, nil)
+	b := newSendingBot(t, api, nil, nil)
 	select {
 	case <-b.Ready():
 		t.Fatal("not ready yet")
 	default:
 	}
 	b.PostMessage(context.Background(), "early")
-	assert.Equal(t, []string{"early"}, api.sentTexts())
+	assert.Equal(t, []string{"early"}, flush(t, b, api))
 	assert.Empty(t, api.callsTo("getMe"))
 }
 
@@ -953,7 +1167,7 @@ func TestErrorsNeverContainToken(t *testing.T) {
 	// A closed server makes every call fail with a *url.Error whose URL
 	// contains the token.
 	api := newFakeAPI(t)
-	b := newTestBot(t, api, nil, nil)
+	b := newSendingBot(t, api, nil, nil)
 	api.Close()
 
 	var buf syncBuffer
@@ -971,8 +1185,8 @@ func TestErrorsNeverContainToken(t *testing.T) {
 	assert.NotContains(t, err.Error(), "SECRET")
 
 	b.PostMessage(context.Background(), "hello")
+	waitFor(t, "send failure logged", func() bool { return strings.Contains(buf.String(), "sendMessage") })
 	assert.NotContains(t, buf.String(), "SECRET")
-	assert.NotEmpty(t, buf.String(), "failure should have been logged")
 }
 
 func TestAPIErrorsNeverContainToken(t *testing.T) {
