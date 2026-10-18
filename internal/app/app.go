@@ -16,6 +16,7 @@ import (
 	"github.com/shishberg/mezzaops/internal/matrix"
 	"github.com/shishberg/mezzaops/internal/mattermost"
 	"github.com/shishberg/mezzaops/internal/service"
+	"github.com/shishberg/mezzaops/internal/telegram"
 	"github.com/shishberg/mezzaops/internal/webhook"
 )
 
@@ -28,6 +29,7 @@ type App struct {
 	discordBot    *discord.Bot
 	mmBot         *mattermost.Bot
 	matrixBot     *matrix.Bot
+	telegramBot   *telegram.Bot
 	webhookSrv    *http.Server
 	dashboardSrv  *http.Server
 	cancel        context.CancelFunc
@@ -114,6 +116,18 @@ func New(configPath string, envPath string, templatesFS fs.FS) (*App, error) {
 		a.matrixBot = matrix.New(mxcfg, cfg.StateDir, a.manager)
 		a.matrixBot.SetConfirmHandler(a)
 		notifiers = append(notifiers, matrix.NewNotifier(a.matrixBot))
+	}
+
+	// Telegram.
+	if cfg.Telegram != nil && env.TelegramToken != "" {
+		tgcfg := telegram.Config{
+			Token:  env.TelegramToken,
+			ChatID: cfg.Telegram.ChatID,
+			APIURL: cfg.Telegram.APIURL,
+		}
+		a.telegramBot = telegram.New(tgcfg, a.manager)
+		a.telegramBot.SetConfirmHandler(a)
+		notifiers = append(notifiers, telegram.NewNotifier(a.telegramBot))
 	}
 
 	// Set the real notifier on the manager.
@@ -206,6 +220,14 @@ func (a *App) Run(ctx context.Context) error {
 		}()
 	}
 
+	if a.telegramBot != nil {
+		go func() {
+			if err := a.telegramBot.Run(ctx); err != nil {
+				log.Printf("telegram bot error: %v", err)
+			}
+		}()
+	}
+
 	// Wait for frontends to be ready before signalling the manager.
 	// Bounded by ReadinessTimeout (default 30s) so a chat server that's
 	// unreachable on boot (e.g. Tailscale MagicDNS not ready yet) cannot
@@ -237,6 +259,9 @@ func (a *App) waitForReady(ctx context.Context) {
 	}
 	if a.matrixBot != nil {
 		readyChs = append(readyChs, a.matrixBot.Ready())
+	}
+	if a.telegramBot != nil {
+		readyChs = append(readyChs, a.telegramBot.Ready())
 	}
 
 	waitForReadyChannels(ctx, readyChs, a.cfg.EffectiveReadinessTimeout(), a.manager.SignalReady)
@@ -336,6 +361,11 @@ func (a *App) HandlePush(event webhook.PushEvent) {
 				"Reply `%s confirm %s` to proceed.",
 				svcName, event.Repo, event.Branch, a.matrixBot.CommandPrefix(), svcName)
 			a.matrixBot.PostMessage(context.Background(), msg)
+		}
+		if a.telegramBot != nil {
+			msg := fmt.Sprintf("Deploy queued for **%s** (repo: %s, branch: %s). "+
+				"Reply `/confirm %s` to proceed.", svcName, event.Repo, event.Branch, svcName)
+			a.telegramBot.PostMessage(context.Background(), msg)
 		}
 		return
 	}
