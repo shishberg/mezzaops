@@ -1200,7 +1200,7 @@ func TestStatusOverview_Format(t *testing.T) {
 		"worker": {Status: "stopped"},
 	}
 
-	overview := formatStatusOverview(states)
+	overview := service.FormatStatusOverview(states)
 	assert.Contains(t, overview, "Service Status")
 	assert.Contains(t, overview, "web")
 	assert.Contains(t, overview, "running")
@@ -1210,7 +1210,7 @@ func TestStatusOverview_Format(t *testing.T) {
 }
 
 func TestStatusOverview_Empty(t *testing.T) {
-	overview := formatStatusOverview(map[string]service.ServiceState{})
+	overview := service.FormatStatusOverview(map[string]service.ServiceState{})
 	assert.Contains(t, overview, "No services")
 }
 
@@ -1233,7 +1233,7 @@ func TestStatusOverview_Sorted(t *testing.T) {
 		"mu":    {Status: "running"},
 	}
 
-	overview := formatStatusOverview(states)
+	overview := service.FormatStatusOverview(states)
 	lines := strings.Split(overview, "\n")
 
 	// Find lines with service names and verify they're sorted

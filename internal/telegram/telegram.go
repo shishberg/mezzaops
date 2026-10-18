@@ -15,7 +15,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -76,26 +75,6 @@ func ParseCommand(text, botUsername string) *Command {
 	return cmd
 }
 
-// ServiceManager is the slice of the manager API the Telegram frontend uses.
-// Duplicated from internal/matrix so the packages stay independent; extract
-// to internal/service if a fourth frontend wants the same shape.
-type ServiceManager interface {
-	Do(name, op string) string
-	RequestDeploy(name string) error
-	StartAll()
-	StopAll()
-	Reload() error
-	ServiceNames() []string
-	CountRunning() (int, int)
-	GetAllStates() map[string]service.ServiceState
-}
-
-// ConfirmHandler completes a deploy confirmation initiated by a webhook for a
-// service with require_confirmation: true.
-type ConfirmHandler interface {
-	Confirm(service string) bool
-}
-
 // Config holds everything telegram.New needs to construct a Bot. The token is
 // loaded from env, the rest from config.yaml.
 type Config struct {
@@ -131,8 +110,8 @@ var commandDescriptions = []struct{ command, description string }{
 // Bot is the Telegram frontend.
 type Bot struct {
 	cfg     Config
-	manager ServiceManager
-	confirm ConfirmHandler
+	manager service.ServiceManager
+	confirm service.ConfirmHandler
 	http    *http.Client
 
 	// started is when the Bot was constructed. Messages dated before it are
@@ -163,7 +142,7 @@ type Bot struct {
 // New constructs a Bot. No I/O is performed: validating the token and
 // starting the poll loop happen in Run, so a failure on boot (e.g. DNS not
 // ready yet) is retried rather than permanently disabling the frontend.
-func New(cfg Config, manager ServiceManager) *Bot {
+func New(cfg Config, manager service.ServiceManager) *Bot {
 	cfg.APIURL = strings.TrimRight(cfg.APIURL, "/")
 	if cfg.APIURL == "" {
 		cfg.APIURL = defaultAPIURL
@@ -181,7 +160,7 @@ func New(cfg Config, manager ServiceManager) *Bot {
 }
 
 // SetConfirmHandler installs the deploy-confirmation handler.
-func (b *Bot) SetConfirmHandler(ch ConfirmHandler) { b.confirm = ch }
+func (b *Bot) SetConfirmHandler(ch service.ConfirmHandler) { b.confirm = ch }
 
 // Ready closes once getMe has succeeded, so callers know the token is valid
 // and the bot is about to poll.
@@ -324,7 +303,7 @@ func (b *Bot) dispatchCommand(cmd *Command) string {
 	switch cmd.Action {
 	case "status":
 		if cmd.Service == "" {
-			return formatStatusOverview(b.manager.GetAllStates())
+			return service.FormatStatusOverview(b.manager.GetAllStates())
 		}
 		return b.manager.Do(cmd.Service, "status")
 
@@ -376,31 +355,6 @@ func (b *Bot) dispatchCommand(cmd *Command) string {
 // early.
 func defuseFences(s string) string {
 	return strings.ReplaceAll(s, "```", "``")
-}
-
-// formatStatusOverview formats service states as a markdown list, sorted by
-// service name so the output is deterministic.
-func formatStatusOverview(states map[string]service.ServiceState) string {
-	if len(states) == 0 {
-		return "No services configured."
-	}
-	names := make([]string, 0, len(states))
-	for name := range states {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	var sb strings.Builder
-	sb.WriteString("**Service Status**\n")
-	for _, name := range names {
-		state := states[name]
-		fmt.Fprintf(&sb, "- **%s**: %s", name, state.Status)
-		if state.LastResult != "" {
-			fmt.Fprintf(&sb, " (last: %s)", state.LastResult)
-		}
-		sb.WriteString("\n")
-	}
-	return sb.String()
 }
 
 // --- Bot API ---

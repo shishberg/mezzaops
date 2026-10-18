@@ -348,7 +348,7 @@ func updateJSON(id int, chatID int64, date time.Time, text string, isBot bool) m
 
 // newTestBot builds a Bot pointed at api with fast poll/backoff timings and
 // the bot username pre-populated so handlers can be exercised without Run.
-func newTestBot(t *testing.T, api *fakeAPI, mgr ServiceManager, ch ConfirmHandler) *Bot {
+func newTestBot(t *testing.T, api *fakeAPI, mgr service.ServiceManager, ch service.ConfirmHandler) *Bot {
 	t.Helper()
 	if mgr == nil {
 		mgr = newMockServiceManager()

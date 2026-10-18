@@ -249,7 +249,7 @@ func messageBody(t *testing.T, msg sentMessage) string {
 }
 
 // botForTest returns a Bot wired to the fake client and given mocks.
-func botForTest(t *testing.T, fake *fakeMatrixClient, mgr ServiceManager, ch ConfirmHandler) *Bot {
+func botForTest(t *testing.T, fake *fakeMatrixClient, mgr service.ServiceManager, ch service.ConfirmHandler) *Bot {
 	t.Helper()
 	return &Bot{
 		cfg: Config{
@@ -410,7 +410,7 @@ func TestStatusOverview_Format(t *testing.T) {
 		"web":    {Status: "running", LastResult: "success"},
 		"worker": {Status: "stopped"},
 	}
-	overview := formatStatusOverview(states)
+	overview := service.FormatStatusOverview(states)
 	assert.Contains(t, overview, "Service Status")
 	assert.Contains(t, overview, "web")
 	assert.Contains(t, overview, "running")
@@ -420,7 +420,7 @@ func TestStatusOverview_Format(t *testing.T) {
 }
 
 func TestStatusOverview_Empty(t *testing.T) {
-	overview := formatStatusOverview(map[string]service.ServiceState{})
+	overview := service.FormatStatusOverview(map[string]service.ServiceState{})
 	assert.Contains(t, overview, "No services")
 }
 
@@ -430,7 +430,7 @@ func TestStatusOverview_Sorted(t *testing.T) {
 		"alpha": {Status: "stopped"},
 		"mu":    {Status: "running"},
 	}
-	overview := formatStatusOverview(states)
+	overview := service.FormatStatusOverview(states)
 	lines := strings.Split(overview, "\n")
 	var svcLines []string
 	for _, line := range lines {

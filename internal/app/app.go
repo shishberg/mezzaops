@@ -375,7 +375,7 @@ func (a *App) HandlePush(event webhook.PushEvent) {
 	}
 }
 
-// Confirm implements mattermost.ConfirmHandler.
+// Confirm implements service.ConfirmHandler.
 func (a *App) Confirm(svc string) bool {
 	if !a.confirmations.Confirm(svc) {
 		return false

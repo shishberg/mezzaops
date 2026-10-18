@@ -11,7 +11,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 
@@ -51,26 +50,6 @@ func ParseCommand(message, prefix string) *Command {
 	return cmd
 }
 
-// ServiceManager is the slice of the manager API the Matrix frontend uses.
-// Duplicated from internal/mattermost so the two packages stay independent;
-// extract to internal/service if a third frontend wants the same shape.
-type ServiceManager interface {
-	Do(name, op string) string
-	RequestDeploy(name string) error
-	StartAll()
-	StopAll()
-	Reload() error
-	ServiceNames() []string
-	CountRunning() (int, int)
-	GetAllStates() map[string]service.ServiceState
-}
-
-// ConfirmHandler completes a deploy confirmation initiated by a webhook for a
-// service with require_confirmation: true.
-type ConfirmHandler interface {
-	Confirm(service string) bool
-}
-
 // Config holds everything matrix.New needs to construct a Bot. The four
 // secrets (UserID, DeviceID, AccessToken, PickleKey) are loaded from env, the
 // rest from config.yaml.
@@ -104,8 +83,8 @@ var validCommands = []string{
 // Bot is the Matrix frontend.
 type Bot struct {
 	cfg     Config
-	manager ServiceManager
-	confirm ConfirmHandler
+	manager service.ServiceManager
+	confirm service.ConfirmHandler
 
 	// client is the abstracted slice we call: tests pass a fake. realClient
 	// is the same *mautrix.Client (when not under test); we keep the typed
@@ -183,7 +162,7 @@ func resolveHomeserverURL(ctx context.Context, homeserver string, discover disco
 // a failure during discovery or NewClient no longer permanently disables
 // the frontend. stateDir is used to derive the default crypto database
 // path when cfg.CryptoDB is empty.
-func New(cfg Config, stateDir string, manager ServiceManager) *Bot {
+func New(cfg Config, stateDir string, manager service.ServiceManager) *Bot {
 	prefix := cfg.CommandPrefix
 	if prefix == "" {
 		prefix = "!mezzaops"
@@ -200,7 +179,7 @@ func New(cfg Config, stateDir string, manager ServiceManager) *Bot {
 }
 
 // SetConfirmHandler installs the deploy-confirmation handler.
-func (b *Bot) SetConfirmHandler(ch ConfirmHandler) { b.confirm = ch }
+func (b *Bot) SetConfirmHandler(ch service.ConfirmHandler) { b.confirm = ch }
 
 // CommandPrefix returns the normalised prefix the bot listens for, so callers
 // (e.g. the app's webhook confirmation prompt) can advertise the same string
@@ -485,7 +464,7 @@ func (b *Bot) dispatchCommand(cmd *Command) string {
 	switch strings.ToLower(cmd.Action) {
 	case "status":
 		if cmd.Service == "" {
-			return formatStatusOverview(b.manager.GetAllStates())
+			return service.FormatStatusOverview(b.manager.GetAllStates())
 		}
 		return b.manager.Do(cmd.Service, "status")
 
@@ -525,29 +504,4 @@ func (b *Bot) dispatchCommand(cmd *Command) string {
 		return fmt.Sprintf("Unknown command: %q. Valid commands: %s",
 			cmd.Action, strings.Join(validCommands, ", "))
 	}
-}
-
-// formatStatusOverview formats service states as a markdown list, sorted by
-// service name so the output is deterministic.
-func formatStatusOverview(states map[string]service.ServiceState) string {
-	if len(states) == 0 {
-		return "No services configured."
-	}
-	names := make([]string, 0, len(states))
-	for name := range states {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	var sb strings.Builder
-	sb.WriteString("**Service Status**\n")
-	for _, name := range names {
-		state := states[name]
-		fmt.Fprintf(&sb, "- **%s**: %s", name, state.Status)
-		if state.LastResult != "" {
-			fmt.Fprintf(&sb, " (last: %s)", state.LastResult)
-		}
-		sb.WriteString("\n")
-	}
-	return sb.String()
 }

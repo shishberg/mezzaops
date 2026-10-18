@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 
@@ -37,23 +36,6 @@ func ParseCommand(message string) *Command {
 		cmd.Service = fields[2]
 	}
 	return cmd
-}
-
-// ServiceManager is the interface the Mattermost frontend needs from the manager.
-type ServiceManager interface {
-	Do(name, op string) string
-	RequestDeploy(name string) error
-	StartAll()
-	StopAll()
-	Reload() error
-	ServiceNames() []string
-	CountRunning() (int, int)
-	GetAllStates() map[string]service.ServiceState
-}
-
-// ConfirmHandler handles deploy confirmations (implemented by App).
-type ConfirmHandler interface {
-	Confirm(service string) bool
 }
 
 // Config holds all configuration needed to connect to Mattermost.
@@ -112,8 +94,8 @@ var validCommands = []string{
 // Bot connects to Mattermost via the SDK and dispatches commands.
 type Bot struct {
 	cfg     Config
-	manager ServiceManager
-	confirm ConfirmHandler // may be nil
+	manager service.ServiceManager
+	confirm service.ConfirmHandler // may be nil
 	// userID and channelID are written by runOnce (resolveIdentity,
 	// resolveChannel) and read by PostMessage / event handlers. idMu
 	// protects them so a notification issued while runOnce is still
@@ -128,8 +110,8 @@ type Bot struct {
 	idMu      sync.Mutex
 }
 
-// New creates a new Bot from the given Config and ServiceManager.
-func New(cfg Config, manager ServiceManager) *Bot {
+// New creates a new Bot from the given Config and service.ServiceManager.
+func New(cfg Config, manager service.ServiceManager) *Bot {
 	client := model.NewAPIv4Client(cfg.URL)
 	client.SetToken(cfg.Token)
 
@@ -151,7 +133,7 @@ func New(cfg Config, manager ServiceManager) *Bot {
 }
 
 // SetConfirmHandler sets the handler for deploy confirmations.
-func (b *Bot) SetConfirmHandler(ch ConfirmHandler) {
+func (b *Bot) SetConfirmHandler(ch service.ConfirmHandler) {
 	b.confirm = ch
 }
 
@@ -376,33 +358,7 @@ func (b *Bot) dispatchCommand(cmd *Command) string {
 // handleStatusOverview builds a markdown overview of all service states.
 func (b *Bot) handleStatusOverview() string {
 	states := b.manager.GetAllStates()
-	return formatStatusOverview(states)
-}
-
-// formatStatusOverview formats service states as a markdown list.
-func formatStatusOverview(states map[string]service.ServiceState) string {
-	if len(states) == 0 {
-		return "No services configured."
-	}
-
-	// Sort names for deterministic output
-	names := make([]string, 0, len(states))
-	for name := range states {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	var sb strings.Builder
-	sb.WriteString("**Service Status**\n")
-	for _, name := range names {
-		state := states[name]
-		fmt.Fprintf(&sb, "- **%s**: %s", name, state.Status)
-		if state.LastResult != "" {
-			fmt.Fprintf(&sb, " (last: %s)", state.LastResult)
-		}
-		sb.WriteString("\n")
-	}
-	return sb.String()
+	return service.FormatStatusOverview(states)
 }
 
 // handleConfirm dispatches to the confirm handler if set.
