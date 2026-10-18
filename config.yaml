@@ -18,6 +18,10 @@ state_dir: "./state"
 #   command_prefix: "!mezzaops"          # optional; default "!mezzaops"
 #   crypto_db: ""                        # optional; default "<state_dir>/matrix-crypto.db"
 
+# telegram:
+#   chat_id: -1001234567890              # int64; group/supergroup IDs are negative
+#   api_url: ""                          # optional; default "https://api.telegram.org"
+
 # webhook:
 #   port: 8080
 

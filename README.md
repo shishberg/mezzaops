@@ -1,6 +1,6 @@
 # MezzaOps
 
-MezzaOps is a chat-ops process supervisor and deploy tool. It manages services via Discord slash commands, Mattermost `@mezzaops` mentions, GitHub webhooks, and a web dashboard — with a single config file controlling which frontends are active.
+MezzaOps is a chat-ops process supervisor and deploy tool. It manages services via Discord slash commands, Mattermost `@mezzaops` mentions, Matrix and Telegram chat commands, GitHub webhooks, and a web dashboard — with a single config file controlling which frontends are active.
 
 ## Quick start
 
@@ -40,6 +40,10 @@ matrix:
   command_prefix: "!mezzaops"
   crypto_db: ""                         # default: "<state_dir>/matrix-crypto.db"
 
+telegram:
+  chat_id: -1001234567890               # int64; group/supergroup IDs are negative
+  api_url: ""                           # optional; default "https://api.telegram.org" (set for a self-hosted Bot API server)
+
 webhook:
   port: 8080
 
@@ -52,7 +56,7 @@ ignored — this catches misplaced keys (e.g. a stray `process: { adopt: true }`
 block that was once hoped to be a global default). `process` and `adopt` are
 per-service fields, not top-level ones. The recognised top-level keys are
 `services_dir`, `log_dir`, `state_dir`, `discord`, `mattermost`, `matrix`,
-`webhook`, `dashboard`, `readiness_timeout`, and `start_on_boot`.
+`telegram`, `webhook`, `dashboard`, `readiness_timeout`, and `start_on_boot`.
 
 `readiness_timeout` (default 30s, parsed as a Go duration like `45s`) bounds
 how long the supervisor waits for the chat frontends to connect on boot
@@ -112,12 +116,26 @@ MATRIX_USER_ID=
 MATRIX_DEVICE_ID=
 MATRIX_ACCESS_TOKEN=
 MATRIX_PICKLE_KEY=
+TELEGRAM_TOKEN=
 ```
 
 The Matrix bot stores end-to-end-encryption keys in a SQLite database at
 `<state_dir>/matrix-crypto.db` (override with `matrix.crypto_db`). The pickle
 key encrypts that store; rotating it forces the bot to re-establish device
 identity and re-share room keys.
+
+To set up the Telegram bot:
+
+1. Create the bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and put the token in `TELEGRAM_TOKEN`.
+2. Add the bot to the group (or message it directly) that should control mezzaops.
+3. Find the chat ID: send any message in that chat, then open
+   `https://api.telegram.org/bot<token>/getUpdates` and read `message.chat.id`
+   (group and supergroup IDs are negative). Put it in `telegram.chat_id`.
+
+Only messages from that one chat are handled; everything else is ignored. The
+bot only needs `/` commands, so Telegram's privacy mode can stay on. The
+frontend is enabled when the `telegram` section is present and `TELEGRAM_TOKEN`
+is non-empty.
 
 ## Frontends
 
@@ -126,6 +144,7 @@ identity and re-share room keys.
 | **Discord** | `/ops start <svc>` slash commands | Full ops + deploy + presence status |
 | **Mattermost** | `@mezzaops start <svc>` mentions | Full ops + deploy + confirm |
 | **Matrix** | `!mezzaops start <svc>` (configurable prefix) in one configured room | Full ops + deploy + confirm; supports E2EE rooms |
+| **Telegram** | `/start_all`, `/restart <svc>` etc. (slash commands; `/cmd@botname` also works) in one configured chat | Full ops + deploy + confirm |
 | **Webhook** | `POST /webhook/github` push events | Auto-deploy on push |
 | **Dashboard** | `GET /` and `GET /api/status` | Read-only status table |
 | **CLI** | `mezzaops -i` | Interactive REPL for local testing |
@@ -144,7 +163,9 @@ Backend is selected per-service based on config fields:
 
 All frontends support: `start`, `stop`, `restart`, `status`, `logs`, `pull`, `deploy`, `reload`, `start-all`, `stop-all`.
 
-Mattermost and Matrix additionally support `confirm` (for services with `require_confirmation: true`).
+Mattermost, Matrix and Telegram additionally support `confirm` (for services with `require_confirmation: true`).
+
+In Telegram, commands are slash commands and `start-all` / `stop-all` are spelled `/start_all` / `/stop_all` (Telegram commands cannot contain `-`). The bot registers its command list with `setMyCommands` on connect so clients autocomplete them.
 
 ## Process adoption
 

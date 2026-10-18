@@ -460,7 +460,7 @@ func (b *Bot) call(ctx context.Context, method string, params, out any, timeout 
 	if err != nil {
 		return b.scrub(method, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
