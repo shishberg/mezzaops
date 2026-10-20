@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/shishberg/mezzaops/internal/reconnect"
@@ -104,11 +103,6 @@ func (r *realWSClient) GetListenError() *model.AppError {
 // wsConnectFunc creates a new WebSocket client connection.
 type wsConnectFunc func(url, token string) (wsClient, error)
 
-const (
-	initialReconnectDelay = 1 * time.Second
-	maxReconnectDelay     = 5 * time.Minute
-)
-
 // validCommands lists the commands accepted by the bot, used in error messages.
 var validCommands = []string{
 	"status", "start", "stop", "restart", "logs", "pull",
@@ -130,6 +124,7 @@ type Bot struct {
 	rest      restClient
 	connectWS wsConnectFunc
 	readyCh   chan struct{} // closed when the bot is connected and ready
+	readyOnce sync.Once
 	idMu      sync.Mutex
 }
 
@@ -163,44 +158,30 @@ func (b *Bot) SetConfirmHandler(ch ConfirmHandler) {
 // Run connects to Mattermost, resolves the channel, and listens for events
 // until ctx is cancelled.
 //
-// The initial REST setup (resolveIdentity + resolveChannel) is wrapped in a
-// reconnect loop with capped exponential backoff so a transient failure on
-// boot (e.g. Tailscale MagicDNS not ready yet) does not permanently disable
-// the frontend. Once the bot is connected, readyCh is closed; the
-// WebSocket listener takes over and uses its own internal backoff on
-// disconnect. readyCh is not re-closed on reconnect — the C3 bounded
-// readiness wait in app.go has already fired by then, and the gate is
-// past.
+// The whole connect path (resolveIdentity, resolveChannel, WebSocket
+// listen) runs inside reconnect.RunWithBackoff, which is the single backoff
+// policy: a failed initial connect (e.g. Tailscale MagicDNS not ready yet)
+// and a dropped WebSocket are both retried with capped exponential backoff.
+// Re-running the two REST lookups on each reconnect is cheap and also
+// revalidates the token and channel after an outage. readyCh is closed on
+// the first successful connect and not re-closed on later ones; by then
+// the C3 bounded readiness wait in app.go has already fired.
 func (b *Bot) Run(ctx context.Context) error {
-	return reconnect.RunWithBackoff(ctx, "mattermost", reconnect.Options{
-		InitialDelay:   1 * time.Second,
-		MaxDelay:       60 * time.Second,
-		Factor:         2.0,
-		JitterFraction: 0.2,
-		Logger: func(name string, attempt int, err error, nextDelay time.Duration) {
-			log.Printf("%s: connect attempt %d failed: %v; retrying in %s", name, attempt, err, nextDelay)
-		},
-	}, func(ctx context.Context) error {
+	return reconnect.RunWithBackoff(ctx, "mattermost", reconnect.Options{}, func(ctx context.Context) error {
 		if err := b.resolveIdentity(ctx); err != nil {
 			return fmt.Errorf("resolving bot identity: %w", err)
 		}
 		if err := b.resolveChannel(ctx); err != nil {
 			return fmt.Errorf("resolving channel: %w", err)
 		}
-		// Close readyCh once per successful connect. Safe to close multiple
-		// times via the recover: a closed-channel panic here means a
-		// retry reached here after a successful first connect, which is
-		// exactly when a subsequent retry's close would race.
 		b.markReady()
-		return b.listenWebSocket(ctx)
+		return b.connectAndListen(ctx)
 	})
 }
 
-// markReady closes readyCh exactly once. It is safe to call from multiple
-// retry attempts: subsequent calls are no-ops.
+// markReady closes readyCh exactly once; later calls are no-ops.
 func (b *Bot) markReady() {
-	defer func() { _ = recover() }()
-	close(b.readyCh)
+	b.readyOnce.Do(func() { close(b.readyCh) })
 }
 
 // Ready returns a channel that is closed when the bot has connected
@@ -273,26 +254,6 @@ func (b *Bot) resolveChannel(ctx context.Context) error {
 	b.channelID = ch.Id
 	b.idMu.Unlock()
 	return nil
-}
-
-// listenWebSocket connects and reconnects with exponential backoff until ctx
-// is cancelled.
-func (b *Bot) listenWebSocket(ctx context.Context) error {
-	delay := initialReconnectDelay
-	for {
-		err := b.connectAndListen(ctx)
-		if ctx.Err() != nil {
-			return nil
-		}
-
-		log.Printf("mattermost: websocket disconnected: %v, reconnecting in %v", err, delay)
-		select {
-		case <-time.After(delay):
-			delay = min(delay*2, maxReconnectDelay)
-		case <-ctx.Done():
-			return nil
-		}
-	}
 }
 
 // connectAndListen opens a single WebSocket connection and processes events

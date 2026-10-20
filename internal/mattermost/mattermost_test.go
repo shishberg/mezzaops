@@ -102,6 +102,8 @@ type mockRestClient struct {
 	// identityErrors makes the first N GetMe calls return an error, then
 	// the (N+1)-th call returns a valid user. Used by the C2 retry tests.
 	identityErrors int
+	// getMeCalls counts GetMe invocations.
+	getMeCalls int
 	// channelByName, when non-nil, is returned by GetChannelByNameForTeamName.
 	channelByName *model.Channel
 	// channelByNameErr makes GetChannelByNameForTeamName return an error.
@@ -111,6 +113,7 @@ type mockRestClient struct {
 func (m *mockRestClient) GetMe(_ context.Context, _ string) (*model.User, *model.Response, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.getMeCalls++
 	if m.identityErrors > 0 {
 		m.identityErrors--
 		return nil, &model.Response{}, fmt.Errorf("simulated identity lookup failure")
@@ -360,7 +363,11 @@ func stopRun(t *testing.T, cancel context.CancelFunc, done <-chan error) {
 	cancel()
 	select {
 	case err := <-done:
-		assert.NoError(t, err)
+		// RunWithBackoff reports cancellation as ctx.Err(), as in the
+		// other frontends.
+		if err != nil {
+			assert.ErrorIs(t, err, context.Canceled)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run did not exit after cancel")
 	}
@@ -382,6 +389,31 @@ func TestRun_ReconnectsAfterWebSocketDrop(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return connectCount.Load() >= 2
 	}, 5*time.Second, 50*time.Millisecond, "expected at least 2 connection attempts")
+	stopRun(t, cancel, done)
+}
+
+func TestRun_WebSocketDropRerunsRESTSetupViaBackoff(t *testing.T) {
+	// A dropped WebSocket must surface as an error to RunWithBackoff,
+	// which re-runs the whole connect path (including REST lookups). A
+	// nested websocket-only retry loop would call GetMe just once.
+	var connectCount atomic.Int32
+	bot := newRunBot(func(_, _ string) (wsClient, error) {
+		connectCount.Add(1)
+		ws := newMockWSClient()
+		go func() { ws.PingTimeoutChan() <- true }()
+		return ws, nil
+	})
+	rest := bot.rest.(*mockRestClient)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- bot.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		rest.mu.Lock()
+		defer rest.mu.Unlock()
+		return connectCount.Load() >= 2 && rest.getMeCalls >= 2
+	}, 5*time.Second, 50*time.Millisecond, "REST setup should re-run on websocket reconnect")
 	stopRun(t, cancel, done)
 }
 
