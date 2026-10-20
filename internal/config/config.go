@@ -116,9 +116,7 @@ func (s *ServiceConfig) ShouldAdopt() bool {
 // ShouldAutostart resolves the per-service autostart decision against
 // the global default. Per-service autostart overrides the global; if
 // neither is set, the default is false (preserve the pre-C1
-// behaviour). Returns the resolved autostart decision and whether the
-// per-service field was set (used to decide precedence in callers
-// that need to log a "global applied to" line).
+// behaviour). Returns the resolved autostart decision.
 func (s *ServiceConfig) ShouldAutostart(globalDefault bool) bool {
 	if s.Autostart != nil {
 		return *s.Autostart
