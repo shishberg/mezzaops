@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -386,5 +387,40 @@ func TestProcessBackend_TryAdoptStalePID(t *testing.T) {
 	}
 	if !strings.Contains(msg, "stale pid") {
 		t.Fatalf("TryAdopt with dead PID: got %q", msg)
+	}
+}
+
+func TestProcessBackend_PersistedProcessAlive(t *testing.T) {
+	child := exec.Command("sleep", "3600")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	pid := child.Process.Pid
+
+	var live processBackendState
+	if err := json.Unmarshal(orphanBackendState(t, pid), &live); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name  string
+		state *processBackendState
+		want  bool
+	}{
+		{"nil", nil, false},
+		{"matching create time", &live, true},
+		{"no timing data is unverifiable", &processBackendState{PID: pid, PGID: pid}, false},
+		{"create time mismatch", &processBackendState{PID: pid, PGID: pid, CreateTime: live.CreateTime + 100000}, false},
+		{"dead pid", &processBackendState{PID: 99999999, CreateTime: live.CreateTime}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", t.TempDir())
+			b.restoredState = c.state
+			if got := b.PersistedProcessAlive(); got != c.want {
+				t.Fatalf("PersistedProcessAlive: got %v, want %v", got, c.want)
+			}
+		})
 	}
 }

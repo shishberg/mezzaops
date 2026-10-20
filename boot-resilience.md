@@ -272,11 +272,14 @@ safer one for cold-boot recovery. Documented inline in
 
 ## Review fixes (post-implementation)
 
-- [x] **F2** — `Manager.Reload` now stops a changed service with an internal
-  stop op that leaves `DesiredStatus` alone, copies the old desired state to
-  the replacement, and restarts the replacement if the old service was
-  running. Toggling `autostart` on a running service and reloading leaves it
-  running with `desired_status: running`.
+- [x] **F2** — `Manager.Reload` stops a changed service with an internal stop
+  op that leaves `DesiredStatus` alone. The op captures "was running" and the
+  desired state inside the service loop at the moment it stops, so queued
+  operator ops cannot make the snapshot stale. If the stop fails, the old
+  service stays in place, no replacement is created, and the error is
+  returned from `Reload` (other services are still reloaded). The replacement
+  has the cold-boot startup flags cleared and is started if and only if the
+  old service was running; it carries over the old desired state.
 - [x] **F3** — `handleOp` start/restart record `DesiredStatus="running"` when
   the command is accepted, before the backend call, so a failed start still
   records intent.
@@ -285,7 +288,11 @@ safer one for cold-boot recovery. Documented inline in
   cold-boot autostart for a running service.
 - [x] **E** — With `adopt: false`, autostart no longer starts a second copy
   when the persisted pid is still alive (the child runs in its own process
-  group); it logs a warning instead.
+  group); it logs a warning instead. "Alive" requires a persisted create time
+  that matches the live process, so records without timing data are treated
+  as not alive (and logged as unverifiable). The orphan's record is kept in
+  later state saves while it stays alive, so the guard survives reloads and
+  further cold boots.
 - [x] **F** — `ProcessBackend.TryAdopt` returns `(adopted bool, msg string)`;
   the autostart decision branches on the bool, not a message prefix.
 - [x] **G** — `reconnect.RunWithBackoff` resets the delay to `InitialDelay`
@@ -294,9 +301,11 @@ safer one for cold-boot recovery. Documented inline in
 - [x] **H** — Frontend `markReady` uses `sync.Once`; frontends pass
   `reconnect.Options{}` (zero values equal the defaults); Mattermost
   WebSocket drops return an error and `RunWithBackoff` is the only retry
-  loop (REST identity/channel lookups are re-run on each reconnect).
+  loop (REST identity/channel lookups are re-run on each reconnect, and a test
+  asserts this).
 - [x] **I** — Removed the unreachable prior-client cleanup from Matrix
   `runOnce`.
 - [x] **J** — `knownTopLevelConfigKeys` is derived from `Config` yaml tags
-  via reflection, with a test that every tag is recognised.
+  via reflection, with a test that every tag is recognised. An inline map field would make
+  every key valid and disables the unknown-key warning.
 - [x] **K** — Corrected the `ShouldAutostart` doc comment.

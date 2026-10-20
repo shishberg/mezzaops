@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,7 @@ type ProcessBackend struct {
 	process *exec.Cmd
 	done    chan struct{} // closed when process exits
 
+	orphan         *processBackendState // live untracked process from a previous run (adopt: false)
 	restoredState  *processBackendState // set by RestoreBackendState
 	restoredStatus string               // status from the state file
 }
@@ -98,6 +100,7 @@ func (p *ProcessBackend) Start(ctx context.Context) error {
 	}
 
 	pid := cmd.Process.Pid
+	p.orphan = nil
 	p.pid = pid
 	p.pgid = pid
 	p.process = cmd
@@ -206,8 +209,15 @@ func (p *ProcessBackend) SaveBackendState() json.RawMessage {
 	pid := p.pid
 	pgid := p.pgid
 	logPath := p.logPath
+	orphan := p.orphan
 	p.mu.Unlock()
 
+	if pid == 0 && orphan != nil && processAliveAndVerified(p.name, *orphan) {
+		raw, err := json.Marshal(orphan)
+		if err == nil {
+			return raw
+		}
+	}
 	return saveBackendStateFromFields(pid, pgid, logPath)
 }
 
@@ -317,15 +327,49 @@ func (p *ProcessBackend) TryAdopt() (adopted bool, msg string) {
 	return true, fmt.Sprintf("adopted (pid %d)", ps.PID)
 }
 
-// PersistedProcessAlive reports whether the pid recorded in the restored
-// state still refers to the live process we originally started. It is used
+// PersistedProcessAlive reports whether the restored state refers to a
+// process that is still alive and verifiably the one we started. It is used
 // when adoption is disabled, to avoid starting a duplicate of a child that
-// outlived the previous manager.
+// outlived the previous manager. Without a recorded create time the pid
+// cannot be tied to our process, so it is reported as not alive.
 func (p *ProcessBackend) PersistedProcessAlive() bool {
-	if p.restoredState == nil || p.restoredState.PID == 0 {
+	if p.restoredState == nil {
 		return false
 	}
-	return IsAlive(p.restoredState.PID) && VerifyProcess(*p.restoredState)
+	return processAliveAndVerified(p.name, *p.restoredState)
+}
+
+// processAliveAndVerified reports whether ps.PID is alive and its create
+// time (and boot time, when recorded) match the persisted record.
+func processAliveAndVerified(name string, ps processBackendState) bool {
+	if ps.PID == 0 || !IsAlive(ps.PID) {
+		return false
+	}
+	if ps.CreateTime == 0 {
+		log.Printf("**%s**: pid %d is alive but the persisted state has no create time; cannot verify it is our process, treating as not alive", name, ps.PID)
+		return false
+	}
+	proc, err := process.NewProcess(int32(ps.PID))
+	if err != nil {
+		return false
+	}
+	ct, err := proc.CreateTime()
+	if err != nil || ct != ps.CreateTime {
+		return false
+	}
+	return VerifyProcess(ps)
+}
+
+// MarkOrphan records the restored process as a live orphan that this
+// backend does not manage. SaveBackendState keeps persisting its record
+// while it stays alive, so later saves and reloads still see it.
+func (p *ProcessBackend) MarkOrphan() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.restoredState != nil {
+		ps := *p.restoredState
+		p.orphan = &ps
+	}
 }
 
 // IsRunning returns whether the process is currently running (thread-safe).
