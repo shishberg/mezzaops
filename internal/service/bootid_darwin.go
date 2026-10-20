@@ -10,9 +10,3 @@ func bootID() string {
 	}
 	return id
 }
-
-// offsetVerification is off on macOS: CreateTime is the kernel's absolute
-// process start time and does not move when the clock is stepped, whereas
-// kern.boottime is adjusted, so an offset would be wrong. The exact
-// CreateTime comparison is used instead.
-var offsetVerification = false

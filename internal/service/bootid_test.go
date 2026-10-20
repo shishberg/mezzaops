@@ -1,37 +1,55 @@
 package service
 
 import (
+	"bytes"
+	"log"
+	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
 
 // resetBootIDCache forgets the cached boot ID.
 func resetBootIDCache() {
-	bootIDMu.Lock()
+	bootIDOnce = sync.Once{}
 	bootIDValue = ""
-	bootIDMu.Unlock()
 }
 
-func TestBootID_FailedReadIsNotCached(t *testing.T) {
+func TestBootID_ReadOnceEvenWhenEmpty(t *testing.T) {
 	var calls atomic.Int32
 	orig := bootIDRead
-	bootIDRead = func() string {
-		if calls.Add(1) == 1 {
-			return "" // first read fails
-		}
-		return "id-1"
-	}
+	bootIDRead = func() string { calls.Add(1); return "" } // unavailable
 	resetBootIDCache()
 	t.Cleanup(func() { bootIDRead = orig; resetBootIDCache() })
 
-	if got := cachedBootID(); got != "" {
-		t.Fatalf("first read: got %q", got)
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	for range 3 {
+		if got := cachedBootID(); got != "" {
+			t.Fatalf("got %q", got)
+		}
 	}
-	if got := cachedBootID(); got != "id-1" {
-		t.Fatalf("a failed read must be retried, got %q", got)
+	if calls.Load() != 1 {
+		t.Fatalf("boot ID read %d times, want once even when empty", calls.Load())
 	}
-	cachedBootID()
-	if calls.Load() != 2 {
-		t.Fatalf("a successful read must be cached: %d reads", calls.Load())
+	if n := strings.Count(buf.String(), "boot ID"); n != 1 {
+		t.Fatalf("an empty boot ID should be logged once, got %d:\n%s", n, buf.String())
+	}
+}
+
+func TestProcessStartID_RealLookupIsStable(t *testing.T) {
+	a, err := processStartID(os.Getpid())
+	if err != nil || a == 0 {
+		t.Fatalf("processStartID: %d, %v", a, err)
+	}
+	b, err := processStartID(os.Getpid())
+	if err != nil || a != b {
+		t.Fatalf("start ID must be stable: %d then %d (%v)", a, b, err)
+	}
+	if _, err := processStartID(99999999); err == nil {
+		t.Fatal("a missing process must be a lookup error")
 	}
 }

@@ -1,23 +1,28 @@
 package service
 
-import "sync"
+import (
+	"log"
+	"sync"
+)
 
 // bootIDRead reads the boot ID from the platform; tests may replace it.
 var bootIDRead = bootID
 
 var (
-	bootIDMu    sync.Mutex
+	bootIDOnce  sync.Once
 	bootIDValue string
 )
 
-// cachedBootID returns the platform boot ID. A successful (non-empty) read
-// is cached for the life of the process; a failed read is retried next time.
+// cachedBootID returns the platform boot ID, read once per process (even
+// when unavailable, in which case it is logged once). The Manager and the
+// process records all use this value.
 func cachedBootID() string {
-	bootIDMu.Lock()
-	defer bootIDMu.Unlock()
-	if bootIDValue == "" {
+	bootIDOnce.Do(func() {
 		bootIDValue = bootIDRead()
-	}
+		if bootIDValue == "" {
+			log.Printf("cannot read the host boot ID; adopt: false services that have run before will not be autostarted")
+		}
+	})
 	return bootIDValue
 }
 

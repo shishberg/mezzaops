@@ -23,10 +23,10 @@ type processBackendState struct {
 	BootTime   int64  `json:"boot_time,omitempty"`
 	CreateTime int64  `json:"create_time,omitempty"`
 	BootID     string `json:"boot_id,omitempty"`
-	// StartOffset is CreateTime - BootTime in seconds: when the process
-	// started relative to boot, which (on Linux) does not change if the
-	// wall clock is stepped. Zero means unknown.
-	StartOffset int64 `json:"start_offset,omitempty"`
+	// StartID is the exact process start identity (see processStartID):
+	// start ticks since boot on Linux, creation time on macOS. Together with
+	// BootID it identifies the process; zero means unknown (legacy record).
+	StartID int64 `json:"start_id,omitempty"`
 }
 
 // ProcessBackend manages a service as a child process with process adoption
@@ -235,8 +235,8 @@ func saveBackendStateFromFields(pid, pgid int, logPath string) json.RawMessage {
 			ps.CreateTime = ct
 		}
 	}
-	if offsetVerification && ps.CreateTime != 0 && ps.BootTime != 0 {
-		ps.StartOffset = ps.CreateTime/1000 - ps.BootTime
+	if id, err := processStartIDFn(pid); err == nil {
+		ps.StartID = id
 	}
 
 	data, err := json.Marshal(ps)

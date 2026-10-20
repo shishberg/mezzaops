@@ -2,7 +2,6 @@ package service
 
 import (
 	"syscall"
-	"time"
 
 	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shirou/gopsutil/v3/process"
@@ -12,19 +11,6 @@ import (
 // still count as the same boot, covering gopsutil's uptime-based jitter. It
 // is only the fallback when no boot ID is available on both sides.
 const bootTimeTolerance = 10
-
-// startOffsetTolerance is the slack (seconds) when comparing start offsets;
-// gopsutil's boot time jitters by about a second between reads.
-const startOffsetTolerance = 2
-
-// createTimeJitter is how far CreateTime may differ and still be the same
-// process: on Linux it is derived from a boot time that gopsutil recomputes
-// (now minus uptime) and so wobbles by about a second between reads.
-const createTimeJitter = 2 * time.Second
-
-// clockStepMinimum is how far CreateTime must differ before a matching start
-// offset is taken as evidence of a clock step rather than a different process.
-const clockStepMinimum = 60 * time.Second
 
 // sameBoot reports whether two host boot times (unix seconds) are the same
 // boot, allowing for jitter.
@@ -48,22 +34,28 @@ func IsAlive(pid int) bool {
 }
 
 // VerifyProcess checks that the PID in the state still refers to the same
-// process we originally started, by comparing boot time and process create time.
-// If both identity fields are zero (e.g. gopsutil failed during start),
-// returns true as graceful degradation -- we accept the PID rather than
-// incorrectly restarting a process we can't identify.
+// process we originally started.
+//
+// When the record and the host both have a boot ID, they must match and the
+// process start ID (start ticks since boot on Linux, creation time on
+// macOS) must be identical; this is exact and unaffected by wall-clock
+// steps. A legacy record (no boot ID or no start ID) falls back to the
+// original check: boot time within a small tolerance, then an exact
+// CreateTime comparison. A record with no identity data at all is accepted
+// (graceful degradation when gopsutil failed during start). Any lookup error
+// means the process is not verified.
 func VerifyProcess(ps processBackendState) bool {
-	// Prefer the boot ID, which is immune to clock steps; fall back to the
-	// boot time (with tolerance) when either side lacks one.
-	sameBootByID := false
 	if cur := bootIDFn(); ps.BootID != "" && cur != "" {
 		if ps.BootID != cur {
 			return false
 		}
-		sameBootByID = true
+		if ps.StartID != 0 {
+			id, err := processStartIDFn(ps.PID)
+			return err == nil && id == ps.StartID
+		}
 	} else if ps.BootTime != 0 {
 		bootTime, err := host.BootTime()
-		if err == nil && !sameBoot(int64(bootTime), ps.BootTime) {
+		if err != nil || !sameBoot(int64(bootTime), ps.BootTime) {
 			return false
 		}
 	}
@@ -73,34 +65,7 @@ func VerifyProcess(ps processBackendState) bool {
 			return false
 		}
 		createTime, err := p.CreateTime()
-		delta := createTime - ps.CreateTime
-		if delta < 0 {
-			delta = -delta
-		}
-		if err == nil && delta > createTimeJitter.Milliseconds() {
-			// A CreateTime match (within gopsutil's boot-time jitter) is
-			// accepted. A larger mismatch is normally PID reuse. The exception is a wall-clock step on
-			// the same boot (Linux, see offsetVerification): CreateTime
-			// moves by the size of the step but the start offset since
-			// boot does not. The offset alone is ambiguous for a process
-			// that merely started a few seconds apart, so it is trusted
-			// only when CreateTime differs by more than clockStepMinimum.
-			if !offsetVerification || !sameBootByID || ps.StartOffset == 0 {
-				return false
-			}
-			if delta <= clockStepMinimum.Milliseconds() {
-				return false
-			}
-			bt, berr := host.BootTime()
-			if berr != nil {
-				return false
-			}
-			d := createTime/1000 - int64(bt) - ps.StartOffset
-			if d < 0 {
-				d = -d
-			}
-			return d <= startOffsetTolerance
-		}
+		return err == nil && createTime == ps.CreateTime
 	}
 	return true
 }

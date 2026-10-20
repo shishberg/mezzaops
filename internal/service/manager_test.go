@@ -2293,21 +2293,6 @@ func TestNewManager_AdoptFalseAutostartsWhenNoStateFileExists(t *testing.T) {
 
 // --- boot-time tolerance ---
 
-func TestVerifyProcess_ToleratesBootTimeJitter(t *testing.T) {
-	bt, err := host.BootTime()
-	if err != nil {
-		t.Skip(err)
-	}
-	for _, delta := range []int64{-1, 1} {
-		if !VerifyProcess(processBackendState{PID: os.Getpid(), BootTime: int64(bt) + delta}) {
-			t.Errorf("boot time off by %d must still verify the same boot", delta)
-		}
-	}
-	if VerifyProcess(processBackendState{PID: os.Getpid(), BootTime: int64(bt) - 100}) {
-		t.Error("a different boot time must not verify")
-	}
-}
-
 func TestProcessBackend_TryAdoptRejectsNonPositivePid(t *testing.T) {
 	for _, pid := range []int{0, -1} {
 		b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", t.TempDir())
@@ -2765,100 +2750,6 @@ func TestRebootedSince(t *testing.T) {
 
 // --- review follow-ups: start offset, deploy gating, replacement decisions ---
 
-// liveStartOffset returns the current process's CreateTime (ms) and its
-// start offset (seconds since boot), as the backend would record them.
-func liveStartOffset(t *testing.T) (createTime, offset int64) {
-	t.Helper()
-	p, err := process.NewProcess(int32(os.Getpid()))
-	if err != nil {
-		t.Skip(err)
-	}
-	ct, err := p.CreateTime()
-	if err != nil {
-		t.Skip(err)
-	}
-	bt, err := host.BootTime()
-	if err != nil {
-		t.Skip(err)
-	}
-	return ct, ct/1000 - int64(bt)
-}
-
-// withOffsetVerification sets the platform switch for the test.
-func withOffsetVerification(t *testing.T, on bool) {
-	t.Helper()
-	orig := offsetVerification
-	offsetVerification = on
-	t.Cleanup(func() { offsetVerification = orig })
-}
-
-func TestVerifyProcess_StartOffsetSurvivesClockStep(t *testing.T) {
-	withOffsetVerification(t, true) // the Linux behaviour, exercised on any platform
-	withBootID(t, "boot-A")
-	ct, off := liveStartOffset(t)
-	pid := os.Getpid()
-
-	// Same boot, wall clock stepped by hours: CreateTime differs wildly but
-	// the offset since boot is unchanged.
-	shifted := processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3*3600*1000, StartOffset: off}
-	if !VerifyProcess(shifted) {
-		t.Error("same boot, offset within tolerance: must verify despite a shifted CreateTime")
-	}
-	within := processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3*3600*1000, StartOffset: off + 2}
-	if !VerifyProcess(within) {
-		t.Error("offset 2s away must still verify")
-	}
-	wrong := processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3*3600*1000, StartOffset: off + 100}
-	if VerifyProcess(wrong) {
-		t.Error("same boot, offset differs: must not verify")
-	}
-	// Without a matching boot ID the exact CreateTime check applies.
-	noID := processBackendState{PID: pid, CreateTime: ct + 3*3600*1000, StartOffset: off}
-	if VerifyProcess(noID) {
-		t.Error("no boot ID: a shifted CreateTime must not verify")
-	}
-	// No recorded offset: keep the exact CreateTime check.
-	noOff := processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3*3600*1000}
-	if VerifyProcess(noOff) {
-		t.Error("no offset: a shifted CreateTime must not verify")
-	}
-}
-
-func TestVerifyProcess_ExactCreateTimeWhenOffsetVerificationOff(t *testing.T) {
-	// The macOS behaviour: even with matching boot IDs and a matching
-	// offset, a CreateTime that differs must not verify.
-	withOffsetVerification(t, false)
-	withBootID(t, "boot-A")
-	ct, off := liveStartOffset(t)
-	pid := os.Getpid()
-	if VerifyProcess(processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3*3600*1000, StartOffset: off}) {
-		t.Error("offset verification off: a shifted CreateTime must not verify")
-	}
-	if !VerifyProcess(processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct, StartOffset: off + 100}) {
-		t.Error("offset verification off: the offset must be ignored when CreateTime matches")
-	}
-}
-
-func TestSaveBackendState_RecordsStartOffset(t *testing.T) {
-	withOffsetVerification(t, true)
-	child := exec.Command("sleep", "3600")
-	if err := child.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
-	raw := saveBackendStateFromFields(child.Process.Pid, child.Process.Pid, "")
-	var ps processBackendState
-	if err := json.Unmarshal(raw, &ps); err != nil {
-		t.Fatal(err)
-	}
-	if ps.CreateTime == 0 || ps.BootTime == 0 {
-		t.Skip("gopsutil gave no timing data")
-	}
-	if want := ps.CreateTime/1000 - ps.BootTime; ps.StartOffset < want-2 || ps.StartOffset > want+2 {
-		t.Fatalf("StartOffset %d, want about %d", ps.StartOffset, want)
-	}
-}
-
 func TestManager_DeployWaitsForReadinessAfterOperatorOp(t *testing.T) {
 	runs := filepath.Join(t.TempDir(), "runs")
 	m, _, _, write := pendingStartupManager(t, nil)
@@ -2999,23 +2890,6 @@ func TestManager_SaveStatePersistsLastRestart(t *testing.T) {
 	}
 }
 
-func TestBootID_ReadOnce(t *testing.T) {
-	// The default boot ID source caches its first read.
-	var calls atomic.Int32
-	origRaw := bootIDRead
-	bootIDRead = func() string { calls.Add(1); return "x" }
-	resetBootIDCache()
-	t.Cleanup(func() { bootIDRead = origRaw; resetBootIDCache() })
-	for range 5 {
-		if cachedBootID() != "x" {
-			t.Fatal("unexpected boot id")
-		}
-	}
-	if calls.Load() != 1 {
-		t.Fatalf("boot ID read %d times, want once", calls.Load())
-	}
-}
-
 // --- boot ID bookkeeping ---
 
 func TestNewManager_BootIDStampTouchesOnlyBootID(t *testing.T) {
@@ -3129,22 +3003,181 @@ func TestNewManager_ReplacingModeDoesNoStamping(t *testing.T) {
 	}
 }
 
-func TestVerifyProcess_CreateTimeCheckedFirstAndStepNeedsLargeDelta(t *testing.T) {
-	withOffsetVerification(t, true)
+// --- exact, clock-independent process identity ---
+
+// withStartID substitutes the process start ID lookup for the test.
+func withStartID(t *testing.T, fn func(pid int) (int64, error)) {
+	t.Helper()
+	orig := processStartIDFn
+	processStartIDFn = fn
+	t.Cleanup(func() { processStartIDFn = orig })
+}
+
+func TestVerifyProcess_SameBootIdenticalStartIDIsVerifiedDespiteClockStep(t *testing.T) {
 	withBootID(t, "boot-A")
-	ct, off := liveStartOffset(t)
+	withStartID(t, func(int) (int64, error) { return 123456, nil })
+	// CreateTime is derived from the wall clock; here it is hours off, as
+	// after a clock step on the same boot. The start ID is what counts.
+	ps := processBackendState{PID: os.Getpid(), BootID: "boot-A", StartID: 123456, CreateTime: 1}
+	if !VerifyProcess(ps) {
+		t.Fatal("same boot and identical start ID must verify regardless of CreateTime")
+	}
+}
+
+func TestVerifyProcess_SameBootDifferentStartIDIsNotVerified(t *testing.T) {
+	withBootID(t, "boot-A")
+	withStartID(t, func(int) (int64, error) { return 123457, nil })
+	ct := int64(0)
+	if p, err := process.NewProcess(int32(os.Getpid())); err == nil {
+		ct, _ = p.CreateTime()
+	}
+	ps := processBackendState{PID: os.Getpid(), BootID: "boot-A", StartID: 123456, CreateTime: ct}
+	if VerifyProcess(ps) {
+		t.Fatal("a different start ID is a different process, even if CreateTime matches")
+	}
+}
+
+func TestVerifyProcess_LookupErrorsAreNotVerified(t *testing.T) {
+	withBootID(t, "boot-A")
+	withStartID(t, func(int) (int64, error) { return 0, errors.New("no such process") })
+	if VerifyProcess(processBackendState{PID: os.Getpid(), BootID: "boot-A", StartID: 1}) {
+		t.Error("a start ID lookup error must not verify")
+	}
+	// Legacy path: CreateTime recorded but the process cannot be looked up.
+	if VerifyProcess(processBackendState{PID: 99999999, CreateTime: 1234}) {
+		t.Error("a CreateTime lookup error must not verify")
+	}
+}
+
+func TestVerifyProcess_LegacyRecordUsesExactCreateTime(t *testing.T) {
+	// No boot ID / start ID: main's identity check, with no tolerance.
+	withBootID(t, "boot-A")
+	p, err := process.NewProcess(int32(os.Getpid()))
+	if err != nil {
+		t.Skip(err)
+	}
+	ct, err := p.CreateTime()
+	if err != nil {
+		t.Skip(err)
+	}
 	pid := os.Getpid()
-	// Exact CreateTime wins even if the recorded offset is wrong.
-	if !VerifyProcess(processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct, StartOffset: off + 100}) {
-		t.Error("an exact CreateTime match must verify")
+	if !VerifyProcess(processBackendState{PID: pid, CreateTime: ct}) {
+		t.Error("exact CreateTime must verify")
 	}
-	// A few seconds apart with a matching offset is ambiguous (the signature
-	// of PID reuse without a clock step), so it must not verify.
-	if VerifyProcess(processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3000, StartOffset: off}) {
-		t.Error("a small CreateTime difference must not verify via the offset")
+	for _, delta := range []int64{-1000, -1, 1, 1000} {
+		if VerifyProcess(processBackendState{PID: pid, CreateTime: ct + delta}) {
+			t.Errorf("CreateTime off by %dms must not verify (exact comparison)", delta)
+		}
 	}
-	// Hours apart is the signature of a clock step.
-	if !VerifyProcess(processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3*3600*1000, StartOffset: off}) {
-		t.Error("a large CreateTime difference with a matching offset must verify")
+	// A boot ID on the record but no start ID is still a legacy record.
+	if VerifyProcess(processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 1000}) {
+		t.Error("no start ID: CreateTime must be compared exactly")
+	}
+}
+
+func TestSaveBackendState_RecordsStartIDAndBootID(t *testing.T) {
+	withBootID(t, "boot-A")
+	withStartID(t, func(int) (int64, error) { return 424242, nil })
+	child := exec.Command("sleep", "3600")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	var ps processBackendState
+	if err := json.Unmarshal(saveBackendStateFromFields(child.Process.Pid, child.Process.Pid, ""), &ps); err != nil {
+		t.Fatal(err)
+	}
+	if ps.StartID != 424242 || ps.BootID != "boot-A" {
+		t.Fatalf("record: %+v", ps)
+	}
+}
+
+func TestParseStartTicks(t *testing.T) {
+	// Field 22 counts from after the last ')' because comm may contain
+	// spaces and parentheses.
+	const tail = "S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 12345 67 18446744073709551615"
+	for name, comm := range map[string]string{
+		"plain":       "sleep",
+		"spaces":      "my svc",
+		"parentheses": "a) (b",
+		"nested":      "x (y) z)",
+	} {
+		stat := "4242 (" + comm + ") " + tail
+		got, err := parseStartTicks(stat)
+		if err != nil || got != 987654 {
+			t.Errorf("%s: parseStartTicks = %d, %v; want 987654", name, got, err)
+		}
+	}
+	for _, bad := range []string{"", "4242 (sleep", "4242 (sleep) S 1 2"} {
+		if _, err := parseStartTicks(bad); err == nil {
+			t.Errorf("parseStartTicks(%q) should fail", bad)
+		}
+	}
+}
+
+func TestStampBootID_NullFileDoesNotPanic(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "svc.json"), []byte("null"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := StampBootID(dir, "svc", "boot-A"); err != nil {
+		t.Fatal(err)
+	}
+	s, _, err := LoadState(dir, "svc")
+	if err != nil || s.BootID != "boot-A" {
+		t.Fatalf("after stamping a null file: %+v, %v", s, err)
+	}
+}
+
+func TestSaveState_RecordsCurrentBootIDWhenBackendRunning(t *testing.T) {
+	// A replacement that inherited an old boot ID, then a deploy that
+	// starts the process: the saved boot_id must be the current one.
+	withBootID(t, "boot-B")
+	cfg := testConfig(t)
+	m, err := NewManager(cfg, nil, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	if err := SaveState(cfg.StateDir, "svc1", State{Status: "stopped", BootID: "boot-A"}); err != nil {
+		t.Fatal(err)
+	}
+	svc := sleepService("svc1", t.TempDir())
+	svc.Deploy = []string{"echo deploying"}
+	ms := m.newManagedService(svc, false, modeReplacing)
+	m.mu.Lock()
+	m.services["svc1"] = ms
+	m.mu.Unlock()
+	m.startServiceLoop(ms)
+	m.SignalReady()
+
+	if err := m.RequestDeploy("svc1"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if st := m.GetAllStates()["svc1"]; st.LastResult == "success" && st.Status == "running" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("deploy did not finish")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	waitForPersistedBootID(t, cfg.StateDir, "svc1", "boot-B")
+}
+
+func waitForPersistedBootID(t *testing.T, dir, name, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s, _, err := LoadState(dir, name)
+		if err == nil && s.BootID == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("persisted boot_id for %s: got %q, want %q", name, s.BootID, want)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

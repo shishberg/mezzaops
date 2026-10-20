@@ -46,11 +46,16 @@ func SaveState(dir, name string, s State) error {
 	if err != nil {
 		return err
 	}
-	tmp := statePath(dir, name) + ".tmp"
+	return writeStateFile(statePath(dir, name), data)
+}
+
+// writeStateFile writes data to path atomically (temp file and rename).
+func writeStateFile(path string, data []byte) error {
+	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, statePath(dir, name))
+	return os.Rename(tmp, path)
 }
 
 // LoadState reads the state from a JSON file.
@@ -85,6 +90,9 @@ func StampBootID(dir, name, id string) error {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
 	}
+	if fields == nil { // the file holds JSON null
+		fields = map[string]json.RawMessage{}
+	}
 	var current string
 	if raw, ok := fields["boot_id"]; ok {
 		_ = json.Unmarshal(raw, &current)
@@ -101,9 +109,5 @@ func StampBootID(dir, name, id string) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writeStateFile(path, out)
 }

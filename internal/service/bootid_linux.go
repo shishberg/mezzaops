@@ -13,9 +13,3 @@ func bootID() string {
 	}
 	return strings.TrimSpace(string(data))
 }
-
-// offsetVerification enables verifying a process by its start offset since
-// boot when boot IDs match. On Linux gopsutil derives CreateTime and BootTime
-// from the same wall-clock-minus-uptime value, so the offset is unchanged by
-// a clock step while CreateTime itself is not.
-var offsetVerification = true

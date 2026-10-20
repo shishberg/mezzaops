@@ -28,9 +28,6 @@ type reloadSnapshot struct {
 	backendRunning bool   // the backend was running just before the stop
 	startupPending bool   // a cold-boot startup op had not run yet
 	desired        string // DesiredStatus at the moment of the stop
-	// recordedBootID is the boot ID in the state file, inherited by the
-	// replacement so Reload does not consume a pending reboot signal.
-	recordedBootID string
 }
 
 // startMode says why a managedService is being created, which decides
@@ -609,7 +606,7 @@ func (m *Manager) internalStop(ms *managedService, startupPending bool) (reloadS
 		return reloadSnapshot{}, fmt.Sprintf("stop failed: %v", err)
 	}
 	ms.stateMu.Lock()
-	snap := reloadSnapshot{backendRunning: backendRunning, startupPending: startupPending, desired: ms.state.DesiredStatus, recordedBootID: ms.recordedBootID}
+	snap := reloadSnapshot{backendRunning: backendRunning, startupPending: startupPending, desired: ms.state.DesiredStatus}
 	ms.stateMu.Unlock()
 	m.notifyEvent(ms.config.Name, "stopped")
 	return snap, "stopped"
@@ -787,8 +784,15 @@ func (m *Manager) saveServiceState(ms *managedService) {
 	if m.stateDir == "" {
 		return
 	}
-	// SaveBackendState may inspect processes; keep that outside stateMu.
+	// SaveBackendState and Status may inspect processes; keep them outside
+	// stateMu.
 	backendState := ms.backend.SaveBackendState()
+	liveStatus, statusErr := ms.backend.Status(m.ctx)
+	// Whenever the backend is running at save time its process belongs to
+	// this boot, whatever path started it, so record the current boot ID.
+	if statusErr == nil && liveStatus == "running" {
+		m.recordBoot(ms)
+	}
 	ms.stateMu.Lock()
 	state := State{
 		Status:        ms.state.Status,
@@ -808,8 +812,8 @@ func (m *Manager) saveServiceState(ms *managedService) {
 	// expressed intent must survive an unexpected process exit so C1
 	// autostart can distinguish "operator stopped" from "crashed".
 	if state.Status != "deploying" && state.Status != "failed" {
-		if status, err := ms.backend.Status(m.ctx); err == nil {
-			state.Status = status
+		if statusErr == nil {
+			state.Status = liveStatus
 		}
 	}
 
@@ -962,7 +966,6 @@ func (m *Manager) Reload() error {
 					log.Printf("**%s**: config changed; restarting after reload", svc.Name)
 				}
 				ms.state.DesiredStatus = snap.desired
-				ms.recordedBootID = snap.recordedBootID
 				m.mu.Lock()
 				m.services[svc.Name] = ms
 				existing.successor = ms
