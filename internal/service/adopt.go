@@ -72,12 +72,16 @@ func isGone(err error) bool {
 //     the start ID (start ticks since boot on Linux, creation time on macOS;
 //     exact and clock-independent) is looked up: equal is verified, different
 //     is a mismatch. If the lookup fails, a process that has exited is a
-//     mismatch; otherwise the CreateTime check below is tried.
+//     mismatch. Otherwise it is unknown on macOS (the CreateTime lookup would
+//     be the same call); on Linux the CreateTime check is tried, but because
+//     CreateTime moves when the clock is stepped it can then only verify the
+//     process, never reject it (a difference is unknown).
 //  5. If the record has a CreateTime it is looked up and compared with
 //     createTimeMatches (exact on macOS, legacyCreateTimeTolerance on Linux,
 //     where gopsutil recomputes the boot time and CreateTime wobbles by about a
-//     second). A match is verified, a difference a mismatch; a failed lookup
-//     is a mismatch if the process has exited and unknown if it is alive.
+//     second). A match is verified; a difference is a mismatch, except after a
+//     failed start ID lookup (see step 4); a failed lookup is a mismatch if
+//     the process has exited and unknown if it is alive.
 //  6. Otherwise no per-process comparison was possible: unknown.
 func verifyProcessResult(ps processBackendState) verifyResult {
 	if ps.PID <= 0 || !isAliveFn(ps.PID) {
@@ -100,7 +104,9 @@ func verifyProcessResult(ps processBackendState) verifyResult {
 		}
 	}
 
+	startIDApplied := false
 	if ps.StartID != 0 && sameBootID {
+		startIDApplied = true
 		id, err := processStartIDFn(ps.PID)
 		if err == nil {
 			if id == ps.StartID {
@@ -108,15 +114,22 @@ func verifyProcessResult(ps processBackendState) verifyResult {
 			}
 			return verifyMismatch
 		}
-		if isGone(err) || !isAliveFn(ps.PID) {
+		if goneAfter(ps.PID, err) {
 			return verifyMismatch
 		}
+		// Alive, but the start ID could not be read.
+		if startIDIsCreateTime {
+			// The CreateTime lookup would be the same call.
+			return verifyUnknown
+		}
+		// On Linux CreateTime moves when the clock is stepped, so below it
+		// can confirm the process but never reject it.
 	}
 
 	if ps.CreateTime != 0 {
 		live, err := createTimeFn(ps.PID)
 		if err != nil {
-			if isGone(err) || !isAliveFn(ps.PID) {
+			if goneAfter(ps.PID, err) {
 				return verifyMismatch
 			}
 			return verifyUnknown
@@ -124,9 +137,19 @@ func verifyProcessResult(ps processBackendState) verifyResult {
 		if createTimeMatches(live, ps.CreateTime, legacyCreateTimeTolerance) {
 			return verifyVerified
 		}
+		if startIDApplied {
+			return verifyUnknown
+		}
 		return verifyMismatch
 	}
 	return verifyUnknown
+}
+
+// goneAfter reports whether a failed lookup means the process no longer
+// exists: the error says so, or the pid is no longer alive. Otherwise the
+// process is alive and its identity simply could not be read.
+func goneAfter(pid int, err error) bool {
+	return isGone(err) || !isAliveFn(pid)
 }
 
 // createTimeMatches reports whether two creation times (ms) are within tol of

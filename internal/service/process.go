@@ -312,20 +312,19 @@ func (p *ProcessBackend) TryAdopt() (adoptOutcome, string) {
 		return adoptNo, "stopped (preserved from previous session)"
 	}
 
-	// No pid recorded: nothing to adopt. (kill(0, 0) would signal our own
-	// process group and report it alive.)
-	if ps.PID <= 0 {
-		return adoptNo, "no pid to adopt"
-	}
-
-	// PID is dead -- process crashed while we were down
-	if !isAliveFn(ps.PID) {
-		return adoptNo, fmt.Sprintf("stale pid %d (process dead)", ps.PID)
-	}
-
-	// PID is alive but belongs to a different process (reboot or PID reuse)
+	// verifyProcessResult treats a missing or dead pid as a mismatch; the
+	// checks below only choose the message.
 	switch verifyProcessResult(ps) {
 	case verifyMismatch:
+		switch {
+		case ps.PID <= 0:
+			// (kill(0, 0) would signal our own process group.)
+			return adoptNo, "no pid to adopt"
+		case !isAliveFn(ps.PID):
+			// Process crashed while we were down.
+			return adoptNo, fmt.Sprintf("stale pid %d (process dead)", ps.PID)
+		}
+		// Alive but a different process (reboot or PID reuse).
 		return adoptNo, fmt.Sprintf("pid %d reused by different process", ps.PID)
 	case verifyUnknown:
 		// Alive, but whether it is ours could not be determined. Neither

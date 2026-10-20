@@ -1291,7 +1291,7 @@ func (m *Manager) cleanOrphans() {
 		} else {
 			_ = json.Unmarshal(raw, &ps)
 		}
-		if ps.PID > 0 && ps.PGID > 0 && isAliveFn(ps.PID) && VerifyProcess(ps) {
+		if ps.PGID > 0 && VerifyProcess(ps) { // checks pid > 0 and alive
 			_ = killFn(-ps.PGID, syscall.SIGKILL)
 		}
 		RemoveState(m.stateDir, name)

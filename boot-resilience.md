@@ -383,18 +383,23 @@ record has been overwritten. Operator start and deploy are not guarded
   a mismatch; (2) a record with no identity fields at all is verified, as on
   main; (3) the boot-level check can only rule a process out: boot IDs both
   known and different, or (when they are not both known) a recorded boot time
-  that differs from a readable current one beyond a 10 second tolerance, is a
-  mismatch; (4) with a start ID and equal boot IDs, the start ID is looked up
-  (equal verified, different mismatch; a failed lookup is a mismatch if the
-  process exited, otherwise it falls through); (5) with a CreateTime, it is
-  looked up and compared (exact on macOS, 1000 ms on Linux where gopsutil
-  recomputes the boot time and CreateTime wobbles by about a second); a failed
-  lookup is a mismatch if the process exited and unknown if alive; (6)
-  otherwise no per-process comparison was possible: unknown. `TryAdopt` adopts
-  only on verified; on unknown it neither adopts nor lets autostart run
-  (logged once with the pid), so no duplicate is started for that run; nothing
-  is persisted for it. `cleanOrphans` kills only on verified. There are no jitter or
-  clock-step thresholds. `adopt: true` is unchanged: adopt if possible,
+  that differs from a readable current one by more than the 10 second
+  `sameBoot` tolerance, is a mismatch; (4) with a start ID and equal boot IDs,
+  the start ID is looked up (equal verified, different mismatch; a failed
+  lookup is a mismatch if the process exited; otherwise it is unknown on macOS,
+  where the CreateTime lookup would be the same call, and on Linux the
+  CreateTime is tried, which can only verify the process, never reject it,
+  because CreateTime moves when the clock is stepped: a difference stays
+  unknown); (5) with a CreateTime (and step 4 not applicable) it is looked up
+  and compared with `createTimeMatches`: exact on macOS, within 1000 ms on
+  Linux, where gopsutil recomputes the boot time so CreateTime wobbles by about
+  a second; a match is verified, a difference a mismatch, and a failed lookup
+  is a mismatch if the process exited and unknown if alive; (6) otherwise no
+  per-process comparison was possible: unknown. `TryAdopt` adopts only on
+  verified; on unknown it neither adopts nor lets autostart run (logged once
+  with the pid), so no duplicate is started for that run; nothing is persisted
+  for it. `cleanOrphans` kills only on verified (the liveness and pid checks
+  are step 1 of verification). `adopt: true` is unchanged: adopt if possible,
   otherwise autostart. There is no orphan tracking.
 - [x] **IsAlive guard** — `IsAlive(pid <= 0)` is false, since `kill(0, 0)` and
   `kill(-1, 0)` address whole process groups; this covers `TryAdopt`,
