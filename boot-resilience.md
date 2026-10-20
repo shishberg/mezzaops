@@ -273,13 +273,16 @@ safer one for cold-boot recovery. Documented inline in
 ## Review fixes (post-implementation)
 
 - [x] **F2** — `Manager.Reload` stops a changed service with an internal stop
-  op that leaves `DesiredStatus` alone. The op captures "was running" and the
-  desired state inside the service loop at the moment it stops, so queued
-  operator ops cannot make the snapshot stale. If the stop fails, the old
-  service stays in place, no replacement is created, and the error is
-  returned from `Reload` (other services are still reloaded). The replacement
-  has the cold-boot startup flags cleared and is started if and only if the
-  old service was running; it carries over the old desired state.
+  op that leaves `DesiredStatus` alone. The op runs inside the service loop,
+  captures "was running" and the desired state at the moment it stops, and
+  returns them in its reply (no stored field). The loop then retires: ops
+  queued behind the stop and later ops get "service was reloaded; retry", and
+  Reload cancels the old service's context so its goroutine exits and no
+  caller blocks. State is saved before an op's reply is sent. If the stop
+  fails, the old service stays in place, no replacement is created, and the
+  error is returned from `Reload` (other services still reload). The
+  replacement is created without cold-boot scheduling, is started if and only
+  if the old service was running, and carries over the old desired state.
 - [x] **F3** — `handleOp` start/restart record `DesiredStatus="running"` when
   the command is accepted, before the backend call, so a failed start still
   records intent.
@@ -288,11 +291,16 @@ safer one for cold-boot recovery. Documented inline in
   cold-boot autostart for a running service.
 - [x] **E** — With `adopt: false`, autostart no longer starts a second copy
   when the persisted pid is still alive (the child runs in its own process
-  group); it logs a warning instead. "Alive" requires a persisted create time
-  that matches the live process, so records without timing data are treated
-  as not alive (and logged as unverifiable). The orphan's record is kept in
-  later state saves while it stays alive, so the guard survives reloads and
-  further cold boots.
+  group); it logs a warning instead. The process is considered alive unless
+  the recorded boot time differs from the current one, or a recorded create
+  time does not match the live process; with no timing data recorded (gopsutil
+  can fail on darwin) it is assumed alive and the check is logged as
+  unverified. The orphan's record is kept in later state saves while it stays
+  alive, so the guard survives reloads and further cold boots. `Start`
+  (operator start/restart, deploy restart) refuses with an error while the
+  orphan is alive and leaves its record intact. `TryAdopt` adopts a live,
+  non-mismatching process whatever status was saved, so enabling `adopt` later
+  picks the orphan up instead of duplicating it.
 - [x] **F** — `ProcessBackend.TryAdopt` returns `(adopted bool, msg string)`;
   the autostart decision branches on the bool, not a message prefix.
 - [x] **G** — `reconnect.RunWithBackoff` resets the delay to `InitialDelay`
@@ -306,6 +314,7 @@ safer one for cold-boot recovery. Documented inline in
 - [x] **I** — Removed the unreachable prior-client cleanup from Matrix
   `runOnce`.
 - [x] **J** — `knownTopLevelConfigKeys` is derived from `Config` yaml tags
-  via reflection, with a test that every tag is recognised. An inline map field would make
-  every key valid and disables the unknown-key warning.
+  via reflection, with a test that every tag is recognised.
+- [x] **Shutdown logging** — `reconnect.RunWithBackoff` returns nil when ctx is
+  cancelled, so none of the three frontends logs an error on a clean shutdown.
 - [x] **K** — Corrected the `ShouldAutostart` doc comment.

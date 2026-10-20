@@ -410,7 +410,8 @@ func TestProcessBackend_PersistedProcessAlive(t *testing.T) {
 	}{
 		{"nil", nil, false},
 		{"matching create time", &live, true},
-		{"no timing data is unverifiable", &processBackendState{PID: pid, PGID: pid}, false},
+		{"no timing data falls back to alive", &processBackendState{PID: pid, PGID: pid}, true},
+		{"boot time mismatch is dead", &processBackendState{PID: pid, PGID: pid, BootTime: 1, CreateTime: live.CreateTime}, false},
 		{"create time mismatch", &processBackendState{PID: pid, PGID: pid, CreateTime: live.CreateTime + 100000}, false},
 		{"dead pid", &processBackendState{PID: 99999999, CreateTime: live.CreateTime}, false},
 	}
@@ -423,4 +424,31 @@ func TestProcessBackend_PersistedProcessAlive(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProcessBackend_StartRefusedWhileOrphanAliveThenAllowed(t *testing.T) {
+	child := exec.Command("sleep", "3600")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+
+	b := newTestBackend(t, []string{"sleep", "3600"}, "")
+	b.adopt = false
+	b.RestoreBackendState(orphanBackendState(t, child.Process.Pid))
+	b.MarkOrphan()
+
+	if err := b.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "still running") {
+		t.Fatalf("Start over live orphan: got %v", err)
+	}
+	if b.SaveBackendState() == nil {
+		t.Fatal("orphan record must be kept after a refused Start")
+	}
+
+	_ = child.Process.Kill()
+	_ = child.Wait()
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("Start after orphan exited: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Stop(context.Background()) })
 }

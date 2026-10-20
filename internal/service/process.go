@@ -67,6 +67,15 @@ func (p *ProcessBackend) Start(ctx context.Context) error {
 		return nil
 	}
 
+	// A live process left by a previous instance (adopt: false) must not
+	// be duplicated, and its persisted record must not be erased.
+	if p.orphan != nil {
+		if processAliveAndVerified(p.name, *p.orphan) {
+			return fmt.Errorf("previous instance pid %d is still running; stop it or enable adopt", p.orphan.PID)
+		}
+		p.orphan = nil
+	}
+
 	// Build the command
 	var cmd *exec.Cmd
 	if len(p.entrypoint) > 0 {
@@ -100,7 +109,6 @@ func (p *ProcessBackend) Start(ctx context.Context) error {
 	}
 
 	pid := cmd.Process.Pid
-	p.orphan = nil
 	p.pid = pid
 	p.pgid = pid
 	p.process = cmd
@@ -296,19 +304,25 @@ func (p *ProcessBackend) TryAdopt() (adopted bool, msg string) {
 
 	ps := *p.restoredState
 
-	// Desired state is stopped -- respect it
-	if p.restoredStatus == "stopped" {
-		return false, "stopped (preserved from previous session)"
-	}
-
-	// PID is dead -- process crashed while we were down
-	if !IsAlive(ps.PID) {
+	// A live process we started is adopted whatever status was saved: an
+	// adopt: false run saves "stopped" while its orphan is still alive.
+	stopped := p.restoredStatus == "stopped"
+	if ps.PID == 0 || !IsAlive(ps.PID) {
+		if stopped {
+			return false, "stopped (preserved from previous session)"
+		}
 		return false, fmt.Sprintf("stale pid %d (process dead)", ps.PID)
 	}
-
-	// PID is alive but belongs to a different process (reboot or PID reuse)
-	if !VerifyProcess(ps) {
+	identity := checkIdentity(ps)
+	if identity == identityMismatch {
+		if stopped {
+			return false, "stopped (preserved from previous session)"
+		}
+		// Alive but a different process (reboot or PID reuse)
 		return false, fmt.Sprintf("pid %d reused by different process", ps.PID)
+	}
+	if identity == identityUnverified {
+		log.Printf("**%s**: adopting pid %d without create-time verification", p.name, ps.PID)
 	}
 
 	// PID is alive and verified -- adopt it
@@ -328,10 +342,10 @@ func (p *ProcessBackend) TryAdopt() (adopted bool, msg string) {
 }
 
 // PersistedProcessAlive reports whether the restored state refers to a
-// process that is still alive and verifiably the one we started. It is used
-// when adoption is disabled, to avoid starting a duplicate of a child that
-// outlived the previous manager. Without a recorded create time the pid
-// cannot be tied to our process, so it is reported as not alive.
+// process that is still alive and is, as far as can be verified, the one we
+// started. It is used when adoption is disabled, to avoid starting a
+// duplicate of a child that outlived the previous manager. See
+// processAliveAndVerified for the rules.
 func (p *ProcessBackend) PersistedProcessAlive() bool {
 	if p.restoredState == nil {
 		return false
@@ -339,25 +353,22 @@ func (p *ProcessBackend) PersistedProcessAlive() bool {
 	return processAliveAndVerified(p.name, *p.restoredState)
 }
 
-// processAliveAndVerified reports whether ps.PID is alive and its create
-// time (and boot time, when recorded) match the persisted record.
+// processAliveAndVerified reports whether ps.PID is alive and not known to be
+// a different process: a recorded boot time must match the current one, and
+// a recorded create time must match the live process. When neither is
+// recorded (gopsutil can fail on darwin) the identity is unverified; to
+// avoid a duplicate it is then treated as alive, with a log line.
 func processAliveAndVerified(name string, ps processBackendState) bool {
 	if ps.PID == 0 || !IsAlive(ps.PID) {
 		return false
 	}
-	if ps.CreateTime == 0 {
-		log.Printf("**%s**: pid %d is alive but the persisted state has no create time; cannot verify it is our process, treating as not alive", name, ps.PID)
+	switch checkIdentity(ps) {
+	case identityMismatch:
 		return false
+	case identityUnverified:
+		log.Printf("**%s**: pid %d is alive but cannot be verified as our process (no create time recorded); assuming it is", name, ps.PID)
 	}
-	proc, err := process.NewProcess(int32(ps.PID))
-	if err != nil {
-		return false
-	}
-	ct, err := proc.CreateTime()
-	if err != nil || ct != ps.CreateTime {
-		return false
-	}
-	return VerifyProcess(ps)
+	return true
 }
 
 // MarkOrphan records the restored process as a live orphan that this
@@ -371,6 +382,10 @@ func (p *ProcessBackend) MarkOrphan() {
 		p.orphan = &ps
 	}
 }
+
+// processBackend lets wrappers embedding *ProcessBackend be recognised as
+// process-backed (see asProcessBackend).
+func (p *ProcessBackend) processBackend() *ProcessBackend { return p }
 
 // IsRunning returns whether the process is currently running (thread-safe).
 func (p *ProcessBackend) IsRunning() bool {
