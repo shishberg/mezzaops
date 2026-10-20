@@ -299,8 +299,9 @@ behaviour on main.
   reload). The same applies when a service is removed. The cold-boot startup op is a pending action in the
   service loop's single select, not a separate wait: ops are served in order
   the whole time, an operator start/stop/restart cancels the pending startup
-  op. A service that had a startup op holds its deploys until readiness fires,
-  even after an operator op cancelled the startup op, so a deploy's
+  op. Every service holds its deploys until the manager's readiness fires (a
+  Reload replacement included), even after an operator op cancelled the
+  startup op, so a deploy's
   notifications are not sent before frontends connect. Operator ops are
   answered before readiness (the reply goes straight to the requester), but
   their broadcast notifications may not reach frontends that have not
@@ -338,25 +339,36 @@ behaviour on main.
   before this branch, when `adopt: false` never started anything at boot. If
   either ID is unknown (an existing saved state without one, or the ID is
   unavailable, or no state dir is configured) it is likewise not autostarted.
-  The ID is read once per process and cached. A state file with no ID (or an
-  older one) gets the current ID written once at startup, unless a startup op
-  is pending (its own save records it), so the next reboot is detected; the
-  decision itself is unchanged. In a container the ID belongs to the host
+  The ID is read once per process; a successful read is cached and a failed
+  one is retried. Each service tracks `recordedBootID`, the value written to
+  its state file, and `saveServiceState` writes only that. It is set to the
+  current ID (a) after the cold-boot startup op runs, whether or not it
+  succeeds, (b) when an operator start/stop/restart is handled, and (c) at
+  construction in normal (non-replacing) mode when no startup op is pending,
+  where an existing file is updated by rewriting only its `boot_id` field and
+  nothing else. A Reload replacement inherits the old value through the
+  internal-stop snapshot and never stamps on its own, so Reload cannot consume
+  a pending reboot signal: a crash after a reload but before readiness still
+  detects the reboot. In a container the ID belongs to the host
   kernel: with persistent state, `adopt: false` services autostart only after
   a host reboot, not after a container restart, and if the ID cannot be read
-  they never autostart (logged).
+  they never autostart (logged), except a service with no state file, which
+  has never run here.
   `VerifyProcess` compares boot IDs when both sides have one and otherwise
-  falls back to the boot time with a 10 second tolerance. When the boot IDs
-  match, the process is verified by `start_offset` (CreateTime minus BootTime,
-  seconds since boot, recorded in the process record) with a 2 second
-  tolerance, if both records have one, because CreateTime is derived from the
-  wall clock and a clock step on the same boot would otherwise reject a genuine
-  child. This applies on Linux only (`offsetVerification` in `bootid_linux.go`):
-  gopsutil derives CreateTime and BootTime from the same boot time, so the
-  offset is stable across a step. On macOS (`bootid_darwin.go`) CreateTime is
-  the kernel's absolute process start time and does not move when the clock is
-  stepped, while `kern.boottime` is adjusted, so the offset would be wrong
-  there; the exact CreateTime comparison is used even when boot IDs match. `adopt: true` is
+  falls back to the boot time with a 10 second tolerance. A CreateTime that
+  matches within 2 seconds (gopsutil recomputes the Linux boot time, so it
+  wobbles) is the same process. A larger mismatch is PID reuse, except on
+  Linux with matching boot IDs: CreateTime is derived from the wall clock, so
+  a clock step moves it while `start_offset` (CreateTime minus BootTime,
+  seconds since boot, in the process record) does not. In that case the offset
+  is accepted (2 second tolerance) only when CreateTime differs by more than 60
+  seconds, the signature of a step; a smaller difference with a matching offset
+  is indistinguishable from a different process started seconds apart and is
+  rejected. This applies on Linux only (`offsetVerification` in
+  `bootid_linux.go`); on macOS (`bootid_darwin.go`) CreateTime is the kernel's
+  absolute process start time and does not move when the clock is stepped,
+  while `kern.boottime` is adjusted, so the offset would be wrong there and
+  CreateTime is compared directly. `adopt: true` is
   unchanged: adopt if possible, otherwise autostart. There is no orphan
   tracking.
 - [x] **IsAlive guard** — `IsAlive(pid <= 0)` is false, since `kill(0, 0)` and

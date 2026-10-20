@@ -77,7 +77,8 @@ kernel's per-boot UUID (`/proc/sys/kernel/random/boot_id` on Linux,
 `kern.bootsessionuuid` on macOS). In a container it belongs to the host
 kernel, so with persistent state `adopt: false` services autostart only after
 a host reboot, not after a container restart. If the boot ID cannot be read,
-`adopt: false` services are never autostarted (this is logged). If
+`adopt: false` services that have run before are never autostarted (this is
+logged); a service with no state file has never run here and still autostarts. If
 mezzaops itself restarts without a reboot, the previous child may still
 be running, so nothing is started and a log line says so.
 

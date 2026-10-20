@@ -356,6 +356,7 @@ func TestManager_RequestDeploy_Success(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Stop()
+	m.SignalReady() // deploys wait for the manager to be ready
 
 	// Start the service first so restart works
 	m.Do("testsvc", "start")
@@ -404,6 +405,7 @@ func TestManager_RequestDeploy_Failure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Stop()
+	m.SignalReady() // deploys wait for the manager to be ready
 
 	if err := m.RequestDeploy("testsvc"); err != nil {
 		t.Fatal(err)
@@ -692,6 +694,7 @@ func TestManager_DeployNoSteps(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Stop()
+	m.SignalReady() // deploys wait for the manager to be ready
 
 	// Start the service first so restart works
 	m.Do("testsvc", "start")
@@ -743,6 +746,7 @@ func TestManager_DeployRestartFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Stop()
+	m.SignalReady() // deploys wait for the manager to be ready
 
 	if err := m.RequestDeploy("badsvc"); err != nil {
 		t.Fatal(err)
@@ -857,6 +861,8 @@ func TestManager_DeployStateSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	m.SignalReady() // deploys wait for the manager to be ready
+
 	// Start and deploy
 	m.Do("testsvc", "start")
 	if err := m.RequestDeploy("testsvc"); err != nil {
@@ -933,6 +939,7 @@ func TestManager_OldFormatMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Stop()
+	m.SignalReady() // deploys wait for the manager to be ready
 
 	// The manager should have loaded the old-format state and the ProcessBackend
 	// should have migrated it via RestoreBackendState. The PID 99999999 is dead,
@@ -1012,6 +1019,7 @@ func TestManager_SelfDeploy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Stop()
+	m.SignalReady() // deploys wait for the manager to be ready
 
 	// Start the service first
 	m.Do("selfsvc", "start")
@@ -1074,6 +1082,7 @@ func TestManager_SelfDeploy_Failure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Stop()
+	m.SignalReady() // deploys wait for the manager to be ready
 
 	if err := m.RequestDeploy("selfsvc"); err != nil {
 		t.Fatal(err)
@@ -1774,6 +1783,7 @@ func TestManager_DeployRecordsRunningIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Stop()
+	m.SignalReady() // deploys wait for the manager to be ready
 
 	m.Do("testsvc", "start")
 	m.Do("testsvc", "stop")
@@ -2798,7 +2808,7 @@ func TestVerifyProcess_StartOffsetSurvivesClockStep(t *testing.T) {
 	if !VerifyProcess(within) {
 		t.Error("offset 2s away must still verify")
 	}
-	wrong := processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct, StartOffset: off + 100}
+	wrong := processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3*3600*1000, StartOffset: off + 100}
 	if VerifyProcess(wrong) {
 		t.Error("same boot, offset differs: must not verify")
 	}
@@ -2881,14 +2891,10 @@ func TestManager_DeployWaitsForReadinessAfterOperatorOp(t *testing.T) {
 }
 
 func TestManager_ReloadDisablingAutostartBeforeReadinessDoesNotStart(t *testing.T) {
-	m, _, _, write := pendingStartupManager(t, nil)
+	m, _, svcPath, _ := pendingStartupManager(t, nil)
 	// Same service, autostart now off.
-	servicesFile := "dir: /tmp\nautostart: false\nentrypoint:\n  - sleep\n  - \"3600\"\n"
-	_ = write
-	m.mu.Lock()
-	dir := m.servicesDir
-	m.mu.Unlock()
-	if err := os.WriteFile(filepath.Join(dir, "svc1.yaml"), []byte(servicesFile), 0644); err != nil {
+	data := "dir: /tmp\nautostart: false\nentrypoint:\n  - sleep\n  - \"3600\"\n"
+	if err := os.WriteFile(svcPath, []byte(data), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Reload(); err != nil {
@@ -2898,6 +2904,37 @@ func TestManager_ReloadDisablingAutostartBeforeReadinessDoesNotStart(t *testing.
 	time.Sleep(400 * time.Millisecond)
 	if got := m.Do("svc1", "status"); got != "stopped" {
 		t.Fatalf("the replacement started although the new config disables autostart: %q", got)
+	}
+}
+
+func TestManager_ReplacementDeployWaitsForManagerReadiness(t *testing.T) {
+	runs := filepath.Join(t.TempDir(), "runs")
+	m, _, svcPath, _ := pendingStartupManager(t, nil)
+	// Replace the service with one that has no startup op of its own.
+	data := "dir: /tmp\nautostart: false\nentrypoint:\n  - sleep\n  - \"3600\"\ndeploy:\n  - echo run >> " + runs + "\n"
+	if err := os.WriteFile(svcPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RequestDeploy("svc1"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if _, err := os.Stat(runs); err == nil {
+		t.Fatal("a replacement ran a deploy before the manager was ready")
+	}
+	m.SignalReady()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(runs); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("deploy never ran after readiness")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -2976,5 +3013,138 @@ func TestBootID_ReadOnce(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("boot ID read %d times, want once", calls.Load())
+	}
+}
+
+// --- boot ID bookkeeping ---
+
+func TestNewManager_BootIDStampTouchesOnlyBootID(t *testing.T) {
+	withBootID(t, "boot-A")
+	cfg := testConfig(t)
+	legacyBackend := json.RawMessage(`{"pid":99999999,"pgid":99999999,"log_path":"/x.log"}`)
+	if err := SaveState(cfg.StateDir, "testsvc", State{
+		Status: "failed", DesiredStatus: "running", FailedStep: "build", Backend: legacyBackend,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, _, _ := LoadState(cfg.StateDir, "testsvc")
+
+	yes, no := true, false
+	svc := autostartService("testsvc", t.TempDir(), &yes)
+	svc.Adopt = &no
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	after, _, err := LoadState(cfg.StateDir, "testsvc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.BootID != "boot-A" {
+		t.Fatalf("boot_id: got %q", after.BootID)
+	}
+	if after.Status != "failed" || after.FailedStep != "build" || after.DesiredStatus != "running" {
+		t.Fatalf("stamp changed other fields: %+v", after)
+	}
+	if string(after.Backend) != string(before.Backend) {
+		t.Fatalf("stamp changed the backend record: %s -> %s", before.Backend, after.Backend)
+	}
+}
+
+func TestManager_ReloadWhileStartupPendingKeepsRebootSignal(t *testing.T) {
+	// The host rebooted (file says boot-A, now boot-B), so an adopt:false
+	// autostart is pending. A reload and then a restart of mezzaops before
+	// readiness must still see the reboot.
+	withBootID(t, "boot-B")
+	servicesDir := t.TempDir()
+	svcPath := filepath.Join(servicesDir, "svc1.yaml")
+	write := func(extra string) {
+		data := "dir: /tmp\nadopt: false\nautostart: true\nentrypoint:\n  - sleep\n  - \"3600\"\n" + extra
+		if err := os.WriteFile(svcPath, []byte(data), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("")
+	cfg := testConfig(t)
+	cfg.ServicesDir = servicesDir
+	if err := SaveState(cfg.StateDir, "svc1", State{
+		Status: "running", DesiredStatus: "running", BootID: "boot-A",
+		Backend: json.RawMessage(`{"pid":99999999,"pgid":99999999}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	services, _ := config.LoadServices(servicesDir)
+	m, err := NewManager(cfg, services, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	write("branch: other\n")
+	if err := m.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	m.Stop() // mezzaops restarts before readiness
+
+	s, _, err := LoadState(cfg.StateDir, "svc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.BootID != "boot-A" {
+		t.Fatalf("an unrun startup op must not consume the reboot signal; file has %q", s.BootID)
+	}
+	services, _ = config.LoadServices(servicesDir)
+	m2, err := NewManager(cfg, services, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m2.Stop()
+	m2.SignalReady()
+	waitForStatus(t, m2, "svc1", "running")
+}
+
+func TestNewManager_ReplacingModeDoesNoStamping(t *testing.T) {
+	withBootID(t, "boot-B")
+	cfg := testConfig(t)
+	m, err := NewManager(cfg, nil, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	if err := SaveState(cfg.StateDir, "svc1", State{Status: "stopped", BootID: "boot-A"}); err != nil {
+		t.Fatal(err)
+	}
+
+	ms := m.newManagedService(sleepService("svc1", t.TempDir()), false, modeReplacing)
+	defer ms.cancel()
+	s, _, err := LoadState(cfg.StateDir, "svc1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.BootID != "boot-A" {
+		t.Fatalf("a replacement must not stamp the state, file has %q", s.BootID)
+	}
+	if ms.recordedBootID != "boot-A" {
+		t.Fatalf("recordedBootID: got %q, want the loaded value", ms.recordedBootID)
+	}
+}
+
+func TestVerifyProcess_CreateTimeCheckedFirstAndStepNeedsLargeDelta(t *testing.T) {
+	withOffsetVerification(t, true)
+	withBootID(t, "boot-A")
+	ct, off := liveStartOffset(t)
+	pid := os.Getpid()
+	// Exact CreateTime wins even if the recorded offset is wrong.
+	if !VerifyProcess(processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct, StartOffset: off + 100}) {
+		t.Error("an exact CreateTime match must verify")
+	}
+	// A few seconds apart with a matching offset is ambiguous (the signature
+	// of PID reuse without a clock step), so it must not verify.
+	if VerifyProcess(processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3000, StartOffset: off}) {
+		t.Error("a small CreateTime difference must not verify via the offset")
+	}
+	// Hours apart is the signature of a clock step.
+	if !VerifyProcess(processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3*3600*1000, StartOffset: off}) {
+		t.Error("a large CreateTime difference with a matching offset must verify")
 	}
 }

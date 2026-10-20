@@ -2,6 +2,7 @@ package service
 
 import (
 	"syscall"
+	"time"
 
 	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shirou/gopsutil/v3/process"
@@ -15,6 +16,15 @@ const bootTimeTolerance = 10
 // startOffsetTolerance is the slack (seconds) when comparing start offsets;
 // gopsutil's boot time jitters by about a second between reads.
 const startOffsetTolerance = 2
+
+// createTimeJitter is how far CreateTime may differ and still be the same
+// process: on Linux it is derived from a boot time that gopsutil recomputes
+// (now minus uptime) and so wobbles by about a second between reads.
+const createTimeJitter = 2 * time.Second
+
+// clockStepMinimum is how far CreateTime must differ before a matching start
+// offset is taken as evidence of a clock step rather than a different process.
+const clockStepMinimum = 60 * time.Second
 
 // sameBoot reports whether two host boot times (unix seconds) are the same
 // boot, allowing for jitter.
@@ -63,22 +73,33 @@ func VerifyProcess(ps processBackendState) bool {
 			return false
 		}
 		createTime, err := p.CreateTime()
-		if err == nil {
-			// CreateTime is derived from the wall clock, so a clock step
-			// on the same boot changes it. When the boot is known to be
-			// the same and an offset since boot was recorded, compare that.
-			if offsetVerification && sameBootByID && ps.StartOffset != 0 {
-				if bt, berr := host.BootTime(); berr == nil {
-					d := createTime/1000 - int64(bt) - ps.StartOffset
-					if d < 0 {
-						d = -d
-					}
-					return d <= startOffsetTolerance
-				}
-			}
-			if createTime != ps.CreateTime {
+		delta := createTime - ps.CreateTime
+		if delta < 0 {
+			delta = -delta
+		}
+		if err == nil && delta > createTimeJitter.Milliseconds() {
+			// A CreateTime match (within gopsutil's boot-time jitter) is
+			// accepted. A larger mismatch is normally PID reuse. The exception is a wall-clock step on
+			// the same boot (Linux, see offsetVerification): CreateTime
+			// moves by the size of the step but the start offset since
+			// boot does not. The offset alone is ambiguous for a process
+			// that merely started a few seconds apart, so it is trusted
+			// only when CreateTime differs by more than clockStepMinimum.
+			if !offsetVerification || !sameBootByID || ps.StartOffset == 0 {
 				return false
 			}
+			if delta <= clockStepMinimum.Milliseconds() {
+				return false
+			}
+			bt, berr := host.BootTime()
+			if berr != nil {
+				return false
+			}
+			d := createTime/1000 - int64(bt) - ps.StartOffset
+			if d < 0 {
+				d = -d
+			}
+			return d <= startOffsetTolerance
 		}
 	}
 	return true

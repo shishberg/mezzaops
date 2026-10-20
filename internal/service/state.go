@@ -71,3 +71,39 @@ func LoadState(dir, name string) (State, json.RawMessage, error) {
 func RemoveState(dir, name string) {
 	_ = os.Remove(statePath(dir, name))
 }
+
+// StampBootID sets only the boot_id field of an existing state file, leaving
+// every other field exactly as stored. It does nothing if the file is
+// missing or already has that ID.
+func StampBootID(dir, name, id string) error {
+	path := statePath(dir, name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	var current string
+	if raw, ok := fields["boot_id"]; ok {
+		_ = json.Unmarshal(raw, &current)
+	}
+	if current == id {
+		return nil
+	}
+	quoted, err := json.Marshal(id)
+	if err != nil {
+		return err
+	}
+	fields["boot_id"] = quoted
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}

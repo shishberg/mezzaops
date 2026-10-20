@@ -6,20 +6,19 @@ import "sync"
 var bootIDRead = bootID
 
 var (
-	bootIDOnce  sync.Once
+	bootIDMu    sync.Mutex
 	bootIDValue string
 )
 
-// cachedBootID returns the platform boot ID, read once per process.
+// cachedBootID returns the platform boot ID. A successful (non-empty) read
+// is cached for the life of the process; a failed read is retried next time.
 func cachedBootID() string {
-	bootIDOnce.Do(func() { bootIDValue = bootIDRead() })
+	bootIDMu.Lock()
+	defer bootIDMu.Unlock()
+	if bootIDValue == "" {
+		bootIDValue = bootIDRead()
+	}
 	return bootIDValue
-}
-
-// resetBootIDCache forgets the cached boot ID (for tests).
-func resetBootIDCache() {
-	bootIDOnce = sync.Once{}
-	bootIDValue = ""
 }
 
 // bootIDFn returns the current boot ID. A variable so tests can substitute

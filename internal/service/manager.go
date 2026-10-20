@@ -28,6 +28,9 @@ type reloadSnapshot struct {
 	backendRunning bool   // the backend was running just before the stop
 	startupPending bool   // a cold-boot startup op had not run yet
 	desired        string // DesiredStatus at the moment of the stop
+	// recordedBootID is the boot ID in the state file, inherited by the
+	// replacement so Reload does not consume a pending reboot signal.
+	recordedBootID string
 }
 
 // startMode says why a managedService is being created, which decides
@@ -88,6 +91,8 @@ type managedService struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+	// recordedBootID is the boot ID written to this service's state file.
+	recordedBootID string
 	// successor is the service Reload installed in place of this one; nil if
 	// it was removed. Set under Manager.mu.
 	successor *managedService
@@ -253,6 +258,7 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 	if err == nil {
 		hadState = true
 		persistedBootID = s.BootID
+		ms.recordedBootID = s.BootID
 		ms.state.LastDeploy = s.LastDeploy
 		ms.state.LastRestart = s.LastRestart
 		ms.state.LastResult = s.LastResult
@@ -279,12 +285,10 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 		// autostartOnReady (not just restartOnStartup) so the loop
 		// issues a "start" op rather than a "restart" — a cold-boot
 		// autostart should not look like a hot reload to the
-		// notifier (no "restarted" event, no LastRestart bump).
-
-		//
-		// With adopt: false a surviving child from the previous mezzaops
-		// would be duplicated, so autostart only after a host reboot
-		// (no child can have survived one); see rebootedSince.
+		// notifier (no "restarted" event, no LastRestart bump). With
+		// adopt: false a surviving child from the previous mezzaops would be
+		// duplicated, so autostart only after a host reboot (no child can
+		// have survived one); see rebootedSince.
 		if !adopted && !replacing && svc.ShouldAutostart(startOnBoot) {
 			if (persistedDesired != "stopped" || svc.AutostartForce) &&
 				(adopt || neverRan || gatePassed || m.rebootedSince(svc.Name, persistedBootID)) {
@@ -301,16 +305,30 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 		ms.restartOnStartup = true
 	}
 
-	// Record the current boot ID in a state file that lacks it or has an
-	// older one (an upgrade, or a reboot nothing has saved since), so the
-	// next reboot is detected. The decision above is unchanged. When a
-	// startup op is pending its own save records it, so a crash before it
-	// runs does not lose the reboot signal.
-	if hadState && m.stateDir != "" && m.bootID != "" && persistedBootID != m.bootID && !ms.restartOnStartup {
-		m.saveServiceState(ms)
+	// Boot ID bookkeeping (see recordedBootID): a normal construction with
+	// no startup op pending records the current boot ID, so the next reboot
+	// is detected. Only boot_id is rewritten in an existing file. A pending
+	// startup op records it itself when it runs, and a Reload replacement
+	// inherits the old value, so neither consumes the reboot signal early.
+	if mode == modeColdBoot && !ms.restartOnStartup && m.bootID != "" {
+		if hadState && persistedBootID != m.bootID {
+			if err := StampBootID(m.stateDir, svc.Name, m.bootID); err != nil {
+				log.Printf("**%s**: recording boot ID: %v", svc.Name, err)
+			}
+		}
+		ms.recordedBootID = m.bootID
 	}
 
 	return ms
+}
+
+// recordBoot marks the current boot ID as the one to write to this service's
+// state file. Called when the service's own activity (a cold-boot startup op
+// or an operator start/stop/restart) makes the boot's reboot signal consumed.
+func (m *Manager) recordBoot(ms *managedService) {
+	if m.bootID != "" {
+		ms.recordedBootID = m.bootID
+	}
 }
 
 // rebootedSince reports whether the host rebooted since the state recording
@@ -389,20 +407,19 @@ func (m *Manager) serviceLoop(ms *managedService) {
 
 	// The cold-boot startup op (see above) is a pending action: it runs
 	// when readiness fires, while opCh is served in order the whole time.
-	// readyC is nil (never ready in a select) once readiness has fired. A
-	// service that had a startup op also holds its deploys until then, as
-	// on main, so a deploy's notifications are not sent before the
-	// frontends are connected.
+	// readyC is nil (never ready in a select) once readiness has fired.
+	// Every service holds its deploys until the manager is ready, so a
+	// deploy's notifications are not sent before the frontends are
+	// connected (a Reload replacement included).
 	startupOp := ""
 	startupPending := false
-	var readyC <-chan struct{}
+	readyC := m.readyCh
 	if ms.restartOnStartup {
 		startupOp = "restart"
 		if ms.autostartOnReady {
 			startupOp = "start"
 		}
 		startupPending = true
-		readyC = m.readyCh
 	}
 
 	// handle runs one queued op.
@@ -414,6 +431,7 @@ func (m *Manager) serviceLoop(ms *managedService) {
 		// The operator's intent wins over a pending startup op.
 		if !op.internalStop && (op.op == "start" || op.op == "stop" || op.op == "restart") {
 			startupPending = false
+			m.recordBoot(ms)
 		}
 		var result string
 		if op.internalStop {
@@ -478,6 +496,7 @@ func (m *Manager) serviceLoop(ms *managedService) {
 				log.Printf("**%s**: cold-boot op %q (adopt: false / autostart)", ms.config.Name, startupOp)
 				result := m.handleOp(ms, startupOp)
 				log.Printf("**%s**: %s", ms.config.Name, result)
+				m.recordBoot(ms)
 				m.saveServiceState(ms)
 				if pb, ok := asProcessBackend(ms.backend); ok {
 					exitCh = pb.WaitForExit()
@@ -590,7 +609,7 @@ func (m *Manager) internalStop(ms *managedService, startupPending bool) (reloadS
 		return reloadSnapshot{}, fmt.Sprintf("stop failed: %v", err)
 	}
 	ms.stateMu.Lock()
-	snap := reloadSnapshot{backendRunning: backendRunning, startupPending: startupPending, desired: ms.state.DesiredStatus}
+	snap := reloadSnapshot{backendRunning: backendRunning, startupPending: startupPending, desired: ms.state.DesiredStatus, recordedBootID: ms.recordedBootID}
 	ms.stateMu.Unlock()
 	m.notifyEvent(ms.config.Name, "stopped")
 	return snap, "stopped"
@@ -780,7 +799,7 @@ func (m *Manager) saveServiceState(ms *managedService) {
 		LastOutput:    ms.state.LastOutput,
 		FailedStep:    ms.state.FailedStep,
 		Backend:       backendState,
-		BootID:        m.bootID,
+		BootID:        ms.recordedBootID,
 	}
 	ms.stateMu.Unlock()
 
@@ -943,6 +962,7 @@ func (m *Manager) Reload() error {
 					log.Printf("**%s**: config changed; restarting after reload", svc.Name)
 				}
 				ms.state.DesiredStatus = snap.desired
+				ms.recordedBootID = snap.recordedBootID
 				m.mu.Lock()
 				m.services[svc.Name] = ms
 				existing.successor = ms
