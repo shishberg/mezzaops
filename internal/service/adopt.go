@@ -60,9 +60,10 @@ const (
 	reasonDifferentProcess                // alive, but not the recorded process
 )
 
-// platformRules are the per-platform verification rules, as named fields so
-// impossible combinations cannot be written by accident. Production uses
-// hostRules; tests pass either value.
+// platformRules are the per-platform verification rules, as named fields. The
+// struct accepts any combination of the three bools; only rulesLinux and
+// rulesDarwin are used, and neither is ever reassigned. Production uses
+// hostRules; tests pass either value explicitly.
 type platformRules struct {
 	// startIDIsCreateTime: the start ID is the creation time, so a failed
 	// start ID lookup leaves nothing more to try and a record that already
@@ -85,24 +86,18 @@ var (
 	rulesDarwin = platformRules{startIDIsCreateTime: true, createTimeCanReject: true, bootTimeCanReject: true}
 )
 
-// verifyProcessResult checks a record against the live process using the
-// platform's rules (hostRules): startIDIsCreateTime, createTimeCanReject and
-// bootTimeCanReject.
-func verifyProcessResult(ps processBackendState) (verifyResult, mismatchReason) {
-	return verifyProcess(ps, hostRules, "")
-}
-
 // verifyProcess checks that the PID in the state still refers to the same
-// process we originally started. The two platform parameters are explicit so
-// tests can cover both values. The steps, in order:
+// process we originally started. rules are the platform's verification rules
+// (hostRules in production); serviceBootID is the boot ID in the service state
+// file, or "" if unknown. The steps, in order:
 //
 //  1. A non-positive pid, or one that is not alive, is a mismatch.
 //  2. A record with no identity fields at all (BootID, StartID, BootTime and
 //     CreateTime all zero) is verified, as on main.
-//  3. The boot-level check can only rule a process out. A legacy record has
-//     no boot ID of its own, so the service state file's boot ID
-//     (serviceBootID) stands in for it: if the host has rebooted since the
-//     file was written, no process in it can be alive. If the record's boot
+//  3. The boot-level check can only rule a process out. If the record has no
+//     boot ID of its own, a serviceBootID that differs from the current boot
+//     ID is a mismatch (the file was written under another boot, so no
+//     process recorded in it can be alive); a matching one proves nothing. If the record's boot
 //     ID and the current boot ID are both known and differ, it is a mismatch.
 //     If they are not both known, a recorded BootTime that differs (beyond
 //     sameBoot's tolerance) from a readable current boot time is a mismatch
@@ -149,14 +144,14 @@ func verifyProcess(ps processBackendState, rules platformRules, serviceBootID st
 				return verifyMismatch, reasonDifferentBoot
 			}
 			sameBootID, knownSameBoot = true, true
-		case serviceBootID != "":
-			// The service state file's boot ID stands in for a legacy record
-			// that has none: if the host has rebooted since the file was
-			// written, no process recorded in it can still be alive.
-			if serviceBootID != cur {
-				return verifyMismatch, reasonDifferentBoot
-			}
-			knownSameBoot = true
+		case serviceBootID != "" && serviceBootID != cur:
+			// The service state file's boot ID is the boot during which the
+			// file was last written, and any process recorded in it was
+			// started at or before that point. If it differs from the
+			// current boot, that process cannot be alive. A match proves
+			// nothing about the record (the file may have been re-stamped
+			// without rewriting it), so it is never used to confirm a boot.
+			return verifyMismatch, reasonDifferentBoot
 		}
 	}
 	if !knownSameBoot && ps.BootTime != 0 {
@@ -258,12 +253,4 @@ func isAliveFn(pid int) bool {
 		return (*f)(pid)
 	}
 	return IsAlive(pid)
-}
-
-// VerifyProcess reports whether the record is positively the live process.
-// An unknown result is not verified (cleanOrphans, for one, must not kill on
-// it).
-func VerifyProcess(ps processBackendState) bool {
-	result, _ := verifyProcessResult(ps)
-	return result == verifyVerified
 }

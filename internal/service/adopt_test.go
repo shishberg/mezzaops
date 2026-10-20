@@ -35,7 +35,7 @@ func TestVerifyProcessMatchingState(t *testing.T) {
 			ps.CreateTime = ct
 		}
 	}
-	if !VerifyProcess(ps) {
+	if !verifiedWith(ps, hostRules, "") {
 		t.Fatal("VerifyProcess should return true for current process state")
 	}
 }
@@ -47,7 +47,13 @@ func TestVerifyProcessWrongBootTime(t *testing.T) {
 		PGID:     pid,
 		BootTime: 1, // impossibly old boot time
 	}
-	if VerifyProcess(ps) {
+	if verifiedWith(ps, hostRules, "") {
 		t.Fatal("VerifyProcess should return false when boot time mismatches")
 	}
+}
+
+// verifiedWith reports whether a record is positively verified under rules.
+func verifiedWith(ps processBackendState, rules platformRules, serviceBootID string) bool {
+	result, _ := verifyProcess(ps, rules, serviceBootID)
+	return result == verifyVerified
 }

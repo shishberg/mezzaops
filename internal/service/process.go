@@ -34,7 +34,8 @@ type ProcessBackend struct {
 	entrypoint []string // explicit argv
 	cmd        string   // sh -c wrapper -- used if entrypoint is empty
 	logDir     string
-	adopt      bool // whether to attempt process adoption
+	adopt      bool          // whether to attempt process adoption
+	rules      platformRules // verification rules (hostRules unless the manager says otherwise)
 
 	mu      sync.Mutex
 	pid     int
@@ -55,6 +56,7 @@ func NewProcessBackend(name, dir string, entrypoint []string, cmd string, logDir
 		entrypoint: entrypoint,
 		cmd:        cmd,
 		logDir:     logDir,
+		rules:      hostRules,
 	}
 }
 
@@ -210,10 +212,10 @@ func (p *ProcessBackend) SaveBackendState() json.RawMessage {
 	logPath := p.logPath
 	p.mu.Unlock()
 
-	return saveBackendStateFromFields(pid, pgid, logPath)
+	return saveBackendStateFromFields(pid, pgid, logPath, p.rules)
 }
 
-func saveBackendStateFromFields(pid, pgid int, logPath string) json.RawMessage {
+func saveBackendStateFromFields(pid, pgid int, logPath string, rules platformRules) json.RawMessage {
 	if pid == 0 {
 		return nil
 	}
@@ -230,7 +232,7 @@ func saveBackendStateFromFields(pid, pgid int, logPath string) json.RawMessage {
 	if ct, err := createTimeFn(pid); err == nil {
 		ps.CreateTime = ct
 	}
-	if hostRules.startIDIsCreateTime {
+	if rules.startIDIsCreateTime {
 		ps.StartID = ps.CreateTime // already looked up above
 	} else if id, err := processStartIDFn(pid); err == nil {
 		ps.StartID = id
@@ -294,10 +296,11 @@ const (
 )
 
 // TryAdopt attempts to re-adopt a process from a previous session using
-// the restored state. serviceBootID is the boot ID in the service state file,
-// used for a legacy record that has none of its own. It reports the outcome (see adoptOutcome) and a
+// the restored state, under the given verification rules. serviceBootID is the
+// boot ID in the service state file; it can only rule out a record that has
+// no boot ID of its own. It reports the outcome (see adoptOutcome) and a
 // human-readable description of what happened.
-func (p *ProcessBackend) TryAdopt(serviceBootID string) (adoptOutcome, string) {
+func (p *ProcessBackend) TryAdopt(rules platformRules, serviceBootID string) (adoptOutcome, string) {
 	if !p.adopt {
 		return adoptNo, "adoption disabled"
 	}
@@ -313,7 +316,7 @@ func (p *ProcessBackend) TryAdopt(serviceBootID string) (adoptOutcome, string) {
 		return adoptNo, "stopped (preserved from previous session)"
 	}
 
-	result, reason := verifyProcess(ps, hostRules, serviceBootID)
+	result, reason := verifyProcess(ps, rules, serviceBootID)
 	switch result {
 	case verifyMismatch:
 		switch reason {

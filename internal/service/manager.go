@@ -118,6 +118,9 @@ type Manager struct {
 	// bootID is the host boot ID, read once when the manager is created.
 	bootID string
 
+	// rules are the process verification rules (hostRules in production).
+	rules platformRules
+
 	// For reload
 	servicesDir string
 	reloadMu    sync.Mutex // serializes Reload
@@ -144,12 +147,12 @@ type Manager struct {
 
 // NewManager creates a Manager for the given service configs.
 func NewManager(cfg *config.Config, services []config.ServiceConfig, notifier Notifier) (*Manager, error) {
-	return newManager(cfg, services, notifier, nil)
+	return newManager(cfg, services, notifier, nil, hostRules)
 }
 
 // newManager is NewManager with an optional backend factory (nil selects
 // backendForConfig).
-func newManager(cfg *config.Config, services []config.ServiceConfig, notifier Notifier, factory func(config.ServiceConfig) Backend) (*Manager, error) {
+func newManager(cfg *config.Config, services []config.ServiceConfig, notifier Notifier, factory func(config.ServiceConfig) Backend, rules platformRules) (*Manager, error) {
 	if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
 		return nil, fmt.Errorf("create log dir: %w", err)
 	}
@@ -181,6 +184,7 @@ func newManager(cfg *config.Config, services []config.ServiceConfig, notifier No
 		shutdownCh:  make(chan struct{}),
 	}
 	m.bootID = bootIDFn()
+	m.rules = rules
 	m.newBackend = factory
 	if m.newBackend == nil {
 		m.newBackend = m.backendForConfig
@@ -272,11 +276,14 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 	adoptedLegacy := false
 	if pb, ok := asProcessBackend(backend); ok {
 		pb.adopt = adopt
-		outcome, msg := pb.TryAdopt(persistedBootID)
+		pb.rules = m.rules
+		outcome, msg := pb.TryAdopt(m.rules, persistedBootID)
 		adopted := outcome == adoptYes
-		// Only a legacy record (no boot ID or start ID) is worth re-persisting.
+		// Only a legacy record (written without a boot ID) is worth
+		// re-persisting, and only if a boot ID is available to add. A missing
+		// start ID is not legacy: the lookup may simply fail on this host.
 		adoptedLegacy = adopted && pb.restoredState != nil &&
-			(pb.restoredState.BootID == "" || pb.restoredState.StartID == 0)
+			pb.restoredState.BootID == "" && m.bootID != ""
 		log.Printf("**%s**: %s", svc.Name, msg)
 
 		// C1: if adoption did not result in a running process and
@@ -309,14 +316,14 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 		ms.restartOnStartup = true
 	}
 
-	// A process adopted from a legacy record (written without a boot ID or
-	// start ID) is re-persisted straight away, so its record is rewritten with
-	// the current boot ID and start ID. That save also records the boot ID, so
-	// the stamp below is skipped.
+	// A process adopted from a legacy record (written without a boot ID) is
+	// re-persisted straight away, so its record is rewritten with the current
+	// boot ID and start ID. The stamp below is skipped only if that save
+	// recorded the boot ID.
 	repersisted := false
 	if adoptedLegacy && m.stateDir != "" {
 		m.saveServiceState(ms)
-		repersisted = true
+		repersisted = ms.recordedBootID == m.bootID
 	}
 
 	// Boot ID bookkeeping (see recordedBootID): a normal construction with
@@ -1308,8 +1315,10 @@ func (m *Manager) cleanOrphans() {
 		}
 		// Kill only a positively verified process (verification checks the pid
 		// is positive and alive); the state file's boot ID covers legacy records.
-		if result, _ := verifyProcess(ps, hostRules, wrapper.BootID); ps.PGID > 0 && result == verifyVerified {
-			_ = killFn(-ps.PGID, syscall.SIGKILL)
+		if ps.PGID > 0 {
+			if result, _ := verifyProcess(ps, m.rules, wrapper.BootID); result == verifyVerified {
+				_ = killFn(-ps.PGID, syscall.SIGKILL)
+			}
 		}
 		RemoveState(m.stateDir, name)
 	}
