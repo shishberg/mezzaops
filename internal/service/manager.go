@@ -286,7 +286,9 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 		// adopt: false a surviving child from the previous mezzaops would be
 		// duplicated, so autostart only after a host reboot (no child can
 		// have survived one); see rebootedSince.
-		if !adopted && !replacing && svc.ShouldAutostart(startOnBoot) {
+		if pb.IdentityUnknown() {
+			log.Printf("**%s**: not autostarting: a process from the previous run is alive but could not be verified", svc.Name)
+		} else if !adopted && !replacing && svc.ShouldAutostart(startOnBoot) {
 			if (persistedDesired != "stopped" || svc.AutostartForce) &&
 				(adopt || neverRan || gatePassed || m.rebootedSince(svc.Name, persistedBootID)) {
 				ms.autostartOnReady = true
@@ -787,7 +789,18 @@ func (m *Manager) saveServiceState(ms *managedService) {
 	// SaveBackendState and Status may inspect processes; keep them outside
 	// stateMu.
 	backendState := ms.backend.SaveBackendState()
-	liveStatus, statusErr := ms.backend.Status(m.ctx)
+	// Status is needed for the live status of a normal save and, for a
+	// process backend (where it is cheap), for the boot ID rule below.
+	ms.stateMu.Lock()
+	curStatus := ms.state.Status
+	ms.stateMu.Unlock()
+	needLive := curStatus != "deploying" && curStatus != "failed"
+	_, isProcess := asProcessBackend(ms.backend)
+	var liveStatus string
+	statusErr := errors.New("status not queried")
+	if needLive || isProcess {
+		liveStatus, statusErr = ms.backend.Status(m.ctx)
+	}
 	// Whenever the backend is running at save time its process belongs to
 	// this boot, whatever path started it, so record the current boot ID.
 	if statusErr == nil && liveStatus == "running" {
@@ -811,10 +824,8 @@ func (m *Manager) saveServiceState(ms *managedService) {
 	// We only overwrite Status, never DesiredStatus — the operator's last
 	// expressed intent must survive an unexpected process exit so C1
 	// autostart can distinguish "operator stopped" from "crashed".
-	if state.Status != "deploying" && state.Status != "failed" {
-		if statusErr == nil {
-			state.Status = liveStatus
-		}
+	if needLive && statusErr == nil {
+		state.Status = liveStatus
 	}
 
 	if err := SaveState(m.stateDir, ms.config.Name, state); err != nil {

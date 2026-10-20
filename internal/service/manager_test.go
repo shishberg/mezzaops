@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -3087,7 +3089,11 @@ func TestSaveBackendState_RecordsStartIDAndBootID(t *testing.T) {
 	if err := json.Unmarshal(saveBackendStateFromFields(child.Process.Pid, child.Process.Pid, ""), &ps); err != nil {
 		t.Fatal(err)
 	}
-	if ps.StartID != 424242 || ps.BootID != "boot-A" {
+	wantStart := int64(424242)
+	if startIDIsCreateTime {
+		wantStart = ps.CreateTime // no second lookup where the start ID is CreateTime
+	}
+	if ps.StartID != wantStart || ps.BootID != "boot-A" {
 		t.Fatalf("record: %+v", ps)
 	}
 }
@@ -3181,3 +3187,162 @@ func waitForPersistedBootID(t *testing.T, dir, name, want string) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// --- review follow-ups: legacy tolerance, three-state verification ---
+
+func TestVerifyProcess_LegacyCreateTimeTolerancePerPlatform(t *testing.T) {
+	withBootID(t, "boot-A")
+	p, err := process.NewProcess(int32(os.Getpid()))
+	if err != nil {
+		t.Skip(err)
+	}
+	ct, err := p.CreateTime()
+	if err != nil {
+		t.Skip(err)
+	}
+	pid := os.Getpid()
+	tol := int64(legacyCreateTimeTolerance)
+	for _, d := range []int64{-tol, tol} {
+		if !VerifyProcess(processBackendState{PID: pid, CreateTime: ct + d}) {
+			t.Errorf("legacy CreateTime off by %dms is within the platform tolerance and must verify", d)
+		}
+	}
+	for _, d := range []int64{-tol - 1, tol + 1} {
+		if VerifyProcess(processBackendState{PID: pid, CreateTime: ct + d}) {
+			t.Errorf("legacy CreateTime off by %dms is beyond the platform tolerance and must not verify", d)
+		}
+	}
+}
+
+func TestLegacyCreateTimeTolerance_Values(t *testing.T) {
+	if runtime.GOOS == "linux" && legacyCreateTimeTolerance != 1000 {
+		t.Errorf("Linux tolerance: got %d, want 1000", legacyCreateTimeTolerance)
+	}
+	if runtime.GOOS == "darwin" && legacyCreateTimeTolerance != 0 {
+		t.Errorf("darwin must compare CreateTime exactly, got tolerance %d", legacyCreateTimeTolerance)
+	}
+}
+
+func TestSameBoot(t *testing.T) {
+	const boot = int64(1_700_000_000)
+	for _, d := range []int64{-1, 0, 1, bootTimeTolerance, -bootTimeTolerance} {
+		if !sameBoot(boot, boot+d) {
+			t.Errorf("boot times %d apart are the same boot", d)
+		}
+	}
+	for _, d := range []int64{bootTimeTolerance + 1, -bootTimeTolerance - 1, 3600, -86400} {
+		if sameBoot(boot, boot+d) {
+			t.Errorf("boot times %d apart are different boots", d)
+		}
+	}
+}
+
+func TestVerifyProcessResult_ThreeStates(t *testing.T) {
+	withBootID(t, "boot-A")
+	pid := os.Getpid()
+
+	withStartID(t, func(int) (int64, error) { return 7, nil })
+	if got := verifyProcessResult(processBackendState{PID: pid, BootID: "boot-A", StartID: 7}); got != verifyVerified {
+		t.Errorf("identical start ID: got %v, want verified", got)
+	}
+	if got := verifyProcessResult(processBackendState{PID: pid, BootID: "boot-A", StartID: 8}); got != verifyMismatch {
+		t.Errorf("different start ID: got %v, want mismatch", got)
+	}
+	if got := verifyProcessResult(processBackendState{PID: pid, BootID: "boot-OLD", StartID: 7}); got != verifyMismatch {
+		t.Errorf("different boot: got %v, want mismatch", got)
+	}
+	// The pid is alive but the lookup failed: unknown, not a mismatch.
+	withStartID(t, func(int) (int64, error) { return 0, errors.New("permission denied") })
+	if got := verifyProcessResult(processBackendState{PID: pid, BootID: "boot-A", StartID: 7}); got != verifyUnknown {
+		t.Errorf("lookup failure: got %v, want unknown", got)
+	}
+	// A vanished process is a mismatch.
+	withStartID(t, func(int) (int64, error) { return 0, fs.ErrNotExist })
+	if got := verifyProcessResult(processBackendState{PID: pid, BootID: "boot-A", StartID: 7}); got != verifyMismatch {
+		t.Errorf("process gone: got %v, want mismatch", got)
+	}
+	// No identity data at all: accepted, as on main.
+	if got := verifyProcessResult(processBackendState{PID: pid}); got != verifyVerified {
+		t.Errorf("no identity data: got %v, want verified", got)
+	}
+}
+
+func TestNewManager_UnknownIdentityIsNeitherAdoptedNorAutostarted(t *testing.T) {
+	withBootID(t, "boot-A")
+	withStartID(t, func(int) (int64, error) { return 0, errors.New("permission denied") })
+	cfg := testConfig(t)
+
+	child := exec.Command("sleep", "3600")
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	raw, _ := json.Marshal(processBackendState{PID: child.Process.Pid, PGID: child.Process.Pid, BootID: "boot-A", StartID: 5})
+	if err := SaveState(cfg.StateDir, "testsvc", State{Status: "running", DesiredStatus: "running", Backend: raw, BootID: "boot-A"}); err != nil {
+		t.Fatal(err)
+	}
+	yes := true
+	svc := autostartService("testsvc", t.TempDir(), &yes) // adopt defaults to true
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	m.SignalReady()
+	time.Sleep(400 * time.Millisecond)
+	if got := m.Do("testsvc", "status"); got != "stopped" {
+		t.Fatalf("an alive pid with unknown identity must be neither adopted nor autostarted: %q", got)
+	}
+}
+
+func TestSaveBackendState_StartIDReusesCreateTimeWhereItIsTheStartID(t *testing.T) {
+	var calls atomic.Int32
+	withStartID(t, func(int) (int64, error) { calls.Add(1); return 424242, nil })
+	child := exec.Command("sleep", "3600")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	var ps processBackendState
+	if err := json.Unmarshal(saveBackendStateFromFields(child.Process.Pid, child.Process.Pid, ""), &ps); err != nil {
+		t.Fatal(err)
+	}
+	if startIDIsCreateTime {
+		if calls.Load() != 0 || ps.StartID != ps.CreateTime {
+			t.Fatalf("start ID should reuse CreateTime without a second lookup: calls=%d %+v", calls.Load(), ps)
+		}
+	} else if ps.StartID != 424242 {
+		t.Fatalf("start ID: %+v", ps)
+	}
+}
+
+func TestSaveState_SkipsStatusLookupForNonProcessBackendWhileDeploying(t *testing.T) {
+	var calls atomic.Int32
+	fake := &countingStatusBackend{calls: &calls}
+	m := &Manager{stateDir: t.TempDir(), ctx: context.Background(), bootID: "b"}
+	ms := &managedService{config: config.ServiceConfig{Name: "svc"}, backend: fake}
+	ms.state.Status = "deploying"
+	m.saveServiceState(ms)
+	if calls.Load() != 0 {
+		t.Fatalf("Status queried %d times for a non-process backend while deploying", calls.Load())
+	}
+	ms.state.Status = "stopped"
+	m.saveServiceState(ms)
+	if calls.Load() != 1 {
+		t.Fatalf("Status should be queried once for a normal save, got %d", calls.Load())
+	}
+}
+
+type countingStatusBackend struct{ calls *atomic.Int32 }
+
+func (c *countingStatusBackend) Start(context.Context) error   { return nil }
+func (c *countingStatusBackend) Stop(context.Context) error    { return nil }
+func (c *countingStatusBackend) Restart(context.Context) error { return nil }
+func (c *countingStatusBackend) Status(context.Context) (string, error) {
+	c.calls.Add(1)
+	return "stopped", nil
+}
+func (c *countingStatusBackend) Logs(context.Context, int) (string, error) { return "", nil }
+func (c *countingStatusBackend) SaveBackendState() json.RawMessage         { return nil }
+func (c *countingStatusBackend) RestoreBackendState(json.RawMessage)       {}

@@ -13,3 +13,8 @@ func bootID() string {
 	}
 	return strings.TrimSpace(string(data))
 }
+
+// legacyCreateTimeTolerance is how far (ms) a legacy record's CreateTime may
+// differ from the live one: gopsutil derives the Linux value from a boot time
+// it recomputes from /proc/uptime on every read, so it can shift by 1s.
+const legacyCreateTimeTolerance = 1000

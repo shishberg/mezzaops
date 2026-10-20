@@ -15,3 +15,7 @@ func processStartID(pid int) (int64, error) {
 	}
 	return parseStartTicks(string(data))
 }
+
+// startIDIsCreateTime reports whether the start ID is the creation time, so a
+// record that already has CreateTime need not look the process up again.
+const startIDIsCreateTime = false

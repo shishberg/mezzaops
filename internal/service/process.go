@@ -39,6 +39,8 @@ type ProcessBackend struct {
 	logDir     string
 	adopt      bool // whether to attempt process adoption
 
+	identityUnknown bool // set by TryAdopt: alive pid, identity could not be verified
+
 	mu      sync.Mutex
 	pid     int
 	pgid    int
@@ -235,7 +237,9 @@ func saveBackendStateFromFields(pid, pgid int, logPath string) json.RawMessage {
 			ps.CreateTime = ct
 		}
 	}
-	if id, err := processStartIDFn(pid); err == nil {
+	if startIDIsCreateTime {
+		ps.StartID = ps.CreateTime // already looked up above
+	} else if id, err := processStartIDFn(pid); err == nil {
 		ps.StartID = id
 	}
 
@@ -312,8 +316,14 @@ func (p *ProcessBackend) TryAdopt() (adopted bool, msg string) {
 	}
 
 	// PID is alive but belongs to a different process (reboot or PID reuse)
-	if !VerifyProcess(ps) {
+	switch verifyProcessResult(ps) {
+	case verifyMismatch:
 		return false, fmt.Sprintf("pid %d reused by different process", ps.PID)
+	case verifyUnknown:
+		// Alive, but whether it is ours could not be determined. Neither
+		// adopt it nor let autostart start a duplicate.
+		p.identityUnknown = true
+		return false, fmt.Sprintf("pid %d is alive but its identity could not be verified; not adopting it and not autostarting", ps.PID)
 	}
 
 	// PID is alive and verified -- adopt it
@@ -331,6 +341,10 @@ func (p *ProcessBackend) TryAdopt() (adopted bool, msg string) {
 
 	return true, fmt.Sprintf("adopted (pid %d)", ps.PID)
 }
+
+// IdentityUnknown reports whether TryAdopt found a live process whose
+// identity could not be verified.
+func (p *ProcessBackend) IdentityUnknown() bool { return p.identityUnknown }
 
 // processBackend lets wrappers embedding *ProcessBackend be recognised as
 // process-backed (see asProcessBackend).

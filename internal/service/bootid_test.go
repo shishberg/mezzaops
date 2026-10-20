@@ -12,6 +12,8 @@ import (
 
 // resetBootIDCache forgets the cached boot ID.
 func resetBootIDCache() {
+	bootIDMu.Lock()
+	defer bootIDMu.Unlock()
 	bootIDOnce = sync.Once{}
 	bootIDValue = ""
 }
@@ -35,7 +37,7 @@ func TestBootID_ReadOnceEvenWhenEmpty(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatalf("boot ID read %d times, want once even when empty", calls.Load())
 	}
-	if n := strings.Count(buf.String(), "boot ID"); n != 1 {
+	if n := strings.Count(buf.String(), "cannot read the host boot ID"); n != 1 {
 		t.Fatalf("an empty boot ID should be logged once, got %d:\n%s", n, buf.String())
 	}
 }

@@ -358,6 +358,10 @@ behaviour on main.
   `adopt: false` services autostart only after a host reboot, not after a
   container restart, and if the ID cannot be read they never autostart
   (logged), except a service with no state file, which has never run here.
+  Accepted trade-offs: an empty boot ID is cached for the life of the process,
+  a replacement whose predecessor's save failed loads its boot ID from
+  whatever the file holds, and the boot ID is recorded from three places (the
+  startup op / operator ops, normal construction, and the save-time rule).
   Process identity is exact and independent of the wall clock. The process
   record carries the boot ID and a start ID (`processStartID`): on Linux the
   process start time in clock ticks since boot (field 22 of `/proc/<pid>/stat`,
@@ -365,9 +369,17 @@ behaviour on main.
   and parentheses); on macOS the creation time, which the kernel records as an
   absolute time and a clock step does not move. `VerifyProcess` accepts a
   process when the boot IDs match and the start IDs are identical. A legacy
-  record (no boot ID or no start ID) falls back to main's check: boot time
-  within a 10 second tolerance (gopsutil recomputes it, so it wobbles), then an
-  exact `CreateTime` comparison. Any lookup error means "not verified". There
+  record (no boot ID or no start ID) falls back to main's approach: boot time
+  within a 10 second tolerance (gopsutil recomputes it), then a `CreateTime`
+  comparison that is exact on macOS and, on Linux, allows 1000 ms because
+  gopsutil derives the Linux value from a boot time it recomputes from
+  `/proc/uptime` on every read, so records written by main can shift by a
+  second. The result is three-state: verified, mismatch (a different process
+  or gone), or unknown (the pid is alive but a lookup failed). `TryAdopt`
+  adopts only on verified; on unknown it neither adopts nor lets autostart run
+  (logged with the pid), so no duplicate is started; `cleanOrphans` kills only
+  on verified. A record with no identity data at all is accepted, as on main.
+  There
   are no jitter or clock-step thresholds. `adopt: true` is
   unchanged: adopt if possible, otherwise autostart. There is no orphan
   tracking.

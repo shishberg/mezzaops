@@ -9,6 +9,7 @@ import (
 var bootIDRead = bootID
 
 var (
+	bootIDMu    sync.Mutex // guards bootIDOnce and bootIDValue
 	bootIDOnce  sync.Once
 	bootIDValue string
 )
@@ -17,6 +18,8 @@ var (
 // when unavailable, in which case it is logged once). The Manager and the
 // process records all use this value.
 func cachedBootID() string {
+	bootIDMu.Lock()
+	defer bootIDMu.Unlock()
 	bootIDOnce.Do(func() {
 		bootIDValue = bootIDRead()
 		if bootIDValue == "" {
