@@ -1,4 +1,4 @@
-//go:build linux || darwin || freebsd || netbsd || openbsd || dragonfly
+//go:build linux || darwin
 
 package service
 
@@ -19,11 +19,8 @@ import (
 // releases the lock automatically, so a crashed instance does not leave
 // a stale lock that needs manual cleanup.
 //
-// This file is restricted to OSes whose syscall package exposes Flock.
-// Solaris and AIX do not have flock(2); they have POSIX fcntl locks
-// instead. A separate flock_solaris.go (or similar) would handle them.
-// For now, the no-op stub in lock_other_unix.go covers the gap, and
-// C5 is a Linux-only guarantee in the production deployment.
+// Only Linux and macOS are supported platforms; on any other OS the
+// package intentionally fails to build rather than skipping the lock.
 func acquireStateLock(stateDir string) (*os.File, error) {
 	if err := os.MkdirAll(stateDir, 0755); err != nil {
 		return nil, fmt.Errorf("creating state dir for lock: %w", err)
