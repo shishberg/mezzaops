@@ -230,7 +230,7 @@ func saveBackendStateFromFields(pid, pgid int, logPath string) json.RawMessage {
 	if ct, err := createTimeFn(pid); err == nil {
 		ps.CreateTime = ct
 	}
-	if startIDIsCreateTime {
+	if hostRules.startIDIsCreateTime() {
 		ps.StartID = ps.CreateTime // already looked up above
 	} else if id, err := processStartIDFn(pid); err == nil {
 		ps.StartID = id
@@ -323,8 +323,10 @@ func (p *ProcessBackend) TryAdopt() (adoptOutcome, string) {
 		case reasonDead:
 			// Process crashed while we were down.
 			return adoptNo, fmt.Sprintf("stale pid %d (process dead)", ps.PID)
+		case reasonDifferentBoot:
+			return adoptNo, fmt.Sprintf("pid %d is from a previous boot", ps.PID)
 		}
-		// Alive, but a different boot or a different process (reboot or PID reuse).
+		// Alive, but a different process (PID reuse).
 		return adoptNo, fmt.Sprintf("pid %d reused by different process", ps.PID)
 	case verifyUnknown:
 		// Alive, but whether it is ours could not be determined. Neither

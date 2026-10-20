@@ -269,10 +269,12 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 	// On startup: adopt existing state, mark for restart, or
 	// autostart on cold boot.
 	adopt := svc.ShouldAdopt()
+	adoptedNow := false
 	if pb, ok := asProcessBackend(backend); ok {
 		pb.adopt = adopt
 		outcome, msg := pb.TryAdopt()
 		adopted := outcome == adoptYes
+		adoptedNow = adopted
 		log.Printf("**%s**: %s", svc.Name, msg)
 
 		// C1: if adoption did not result in a running process and
@@ -303,6 +305,14 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 		}
 	} else if !adopt && !replacing {
 		ms.restartOnStartup = true
+	}
+
+	// A process adopted at startup is re-persisted straight away, so its
+	// backend record is rewritten with the current boot ID and start ID. A
+	// record written by an older build (legacy) then exists only for services
+	// that were not running at upgrade time.
+	if adoptedNow && m.stateDir != "" {
+		m.saveServiceState(ms)
 	}
 
 	// Boot ID bookkeeping (see recordedBootID): a normal construction with

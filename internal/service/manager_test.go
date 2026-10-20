@@ -3037,7 +3037,7 @@ func TestSaveBackendState_RecordsStartIDAndBootID(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantStart := int64(424242)
-	if startIDIsCreateTime {
+	if hostRules.startIDIsCreateTime() {
 		wantStart = ps.CreateTime // no second lookup where the start ID is CreateTime
 	}
 	if ps.StartID != wantStart || ps.BootID != "boot-A" {
@@ -3179,10 +3179,10 @@ func TestVerifyProcessResult_ThreeStates(t *testing.T) {
 	if got, _ := verifyProcessResult(processBackendState{PID: pid, BootID: "boot-A", StartID: 7}); got != verifyUnknown {
 		t.Errorf("lookup failure: got %v, want unknown", got)
 	}
-	// A vanished process is a mismatch.
+	// A gone-looking error on a live pid (hidepid, pid namespaces) is unknown.
 	withStartID(t, func(int) (int64, error) { return 0, fs.ErrNotExist })
-	if got, _ := verifyProcessResult(processBackendState{PID: pid, BootID: "boot-A", StartID: 7}); got != verifyMismatch {
-		t.Errorf("process gone: got %v, want mismatch", got)
+	if got, _ := verifyProcessResult(processBackendState{PID: pid, BootID: "boot-A", StartID: 7}); got != verifyUnknown {
+		t.Errorf("ENOENT on a live pid: got %v, want unknown", got)
 	}
 	// No identity data at all: accepted, as on main.
 	if got, _ := verifyProcessResult(processBackendState{PID: pid}); got != verifyVerified {
@@ -3202,7 +3202,7 @@ func TestSaveBackendState_StartIDReusesCreateTimeWhereItIsTheStartID(t *testing.
 	if err := json.Unmarshal(saveBackendStateFromFields(child.Process.Pid, child.Process.Pid, ""), &ps); err != nil {
 		t.Fatal(err)
 	}
-	if startIDIsCreateTime {
+	if hostRules.startIDIsCreateTime() {
 		if calls.Load() != 0 || ps.StartID != ps.CreateTime {
 			t.Fatalf("start ID should reuse CreateTime without a second lookup: calls=%d %+v", calls.Load(), ps)
 		}
@@ -3302,10 +3302,10 @@ func TestVerifyProcessResult_BootTimeErrorFallsThroughToCreateTime(t *testing.T)
 		t.Errorf("boot time unreadable, CreateTime matches: got %v, want verified", got)
 	}
 	rec.CreateTime = 6000
-	if got, _ := verifyProcess(rec, false, true); got != verifyMismatch { // macOS rules: CreateTime is absolute
+	if got, _ := verifyProcess(rec, rulesDarwin); got != verifyMismatch { // macOS rules: CreateTime is absolute
 		t.Errorf("boot time unreadable, CreateTime differs: got %v, want mismatch", got)
 	}
-	if got, _ := verifyProcess(rec, false, false); got != verifyUnknown { // Linux rules
+	if got, _ := verifyProcess(rec, rulesLinux); got != verifyUnknown { // Linux rules
 		t.Errorf("boot time unreadable, CreateTime differs (Linux): got %v, want unknown", got)
 	}
 }
@@ -3411,10 +3411,10 @@ func TestVerifyProcessResult_BootIDMatchWithoutStartIDUsesCreateTime(t *testing.
 	withStartID(t, func(int) (int64, error) { t.Fatal("no start ID recorded: must not look one up"); return 0, nil })
 	withCreateTime(t, func(int) (int64, error) { return 1_700_000_000_000, nil })
 	// Far enough off to be a mismatch on every platform.
-	if got, _ := verifyProcess(processBackendState{PID: 1234, BootID: "boot-A", CreateTime: 1_700_000_005_000}, false, true); got != verifyMismatch {
+	if got, _ := verifyProcess(processBackendState{PID: 1234, BootID: "boot-A", CreateTime: 1_700_000_005_000}, rulesDarwin); got != verifyMismatch {
 		t.Errorf("CreateTime mismatch (macOS rules): got %v, want mismatch", got)
 	}
-	if got, _ := verifyProcess(processBackendState{PID: 1234, BootID: "boot-A", CreateTime: 1_700_000_005_000}, false, false); got != verifyUnknown {
+	if got, _ := verifyProcess(processBackendState{PID: 1234, BootID: "boot-A", CreateTime: 1_700_000_005_000}, rulesLinux); got != verifyUnknown {
 		t.Errorf("CreateTime difference (Linux rules): got %v, want unknown", got)
 	}
 	if got, _ := verifyProcessResult(processBackendState{PID: 1234, BootID: "boot-A", CreateTime: 1_700_000_000_000}); got != verifyVerified {
@@ -3478,7 +3478,7 @@ func TestVerifyProcessResult_Algorithm(t *testing.T) {
 		{"non-positive pid", processBackendState{PID: 0, CreateTime: live}, "", true, nil, nil, false, verifyMismatch},
 		{"no identity fields", processBackendState{PID: 10}, "boot-A", true, nil, nil, false, verifyVerified},
 		{"boot ID differs", processBackendState{PID: 10, BootID: "boot-OLD", StartID: 7}, "boot-A", true, nil, nil, false, verifyMismatch},
-		{"boot time differs", processBackendState{PID: 10, BootTime: bt - 500, CreateTime: live}, "", true, nil, nil, false, verifyMismatch},
+
 		{"boot ID matches only", processBackendState{PID: 10, BootID: "boot-A"}, "boot-A", true, nil, nil, false, verifyUnknown},
 		{"start ID equal", processBackendState{PID: 10, BootID: "boot-A", StartID: 7}, "boot-A", true,
 			func(int) (int64, error) { return 7, nil }, nil, false, verifyVerified},
@@ -3486,8 +3486,9 @@ func TestVerifyProcessResult_Algorithm(t *testing.T) {
 			func(int) (int64, error) { return 8, nil }, func(int) (int64, error) { return live, nil }, false, verifyMismatch},
 		{"start ID lookup fails, nothing else", processBackendState{PID: 10, BootID: "boot-A", StartID: 7}, "boot-A", true,
 			func(int) (int64, error) { return 0, errLookup }, nil, false, verifyUnknown},
-		{"start ID lookup says gone", processBackendState{PID: 10, BootID: "boot-A", StartID: 7, CreateTime: live}, "boot-A", true,
-			func(int) (int64, error) { return 0, fs.ErrNotExist }, func(int) (int64, error) { return live, nil }, false, verifyMismatch},
+		{"start ID lookup says ENOENT but the pid is alive (hidepid, pid namespace): CreateTime decides",
+			processBackendState{PID: 10, BootID: "boot-A", StartID: 7, CreateTime: live}, "boot-A", true,
+			func(int) (int64, error) { return 0, fs.ErrNotExist }, func(int) (int64, error) { return live, nil }, false, verifyVerified},
 		{"CreateTime differs (macOS: absolute, so a mismatch)", processBackendState{PID: 10, CreateTime: live + 5000}, "", true, nil,
 			func(int) (int64, error) { return live, nil }, true, verifyMismatch},
 		{"CreateTime differs (Linux: moves with the clock, so unknown)", processBackendState{PID: 10, CreateTime: live + 5000}, "", true, nil,
@@ -3498,9 +3499,13 @@ func TestVerifyProcessResult_Algorithm(t *testing.T) {
 		{"legacy record, boot IDs equal, no start ID, CreateTime differs: macOS mismatch",
 			processBackendState{PID: 10, BootID: "boot-A", CreateTime: live + 5000}, "boot-A", true, nil,
 			func(int) (int64, error) { return live, nil }, true, verifyMismatch},
-		{"darwin: start ID lookup reports the process gone",
+		{"darwin: start ID lookup says ENOENT but the pid is alive: unknown",
 			processBackendState{PID: 10, BootID: "boot-A", StartID: 7, CreateTime: live}, "boot-A", true,
-			func(int) (int64, error) { return 0, fs.ErrNotExist }, nil, true, verifyMismatch},
+			func(int) (int64, error) { return 0, fs.ErrNotExist }, nil, true, verifyUnknown},
+		{"boot time differs, no boot ID: Linux unknown (BootTime moves with the clock)",
+			processBackendState{PID: 10, BootTime: bt - 500, CreateTime: live}, "", true, nil, nil, false, verifyUnknown},
+		{"boot time differs, no boot ID: darwin mismatch",
+			processBackendState{PID: 10, BootTime: bt - 500, CreateTime: live}, "", true, nil, nil, true, verifyMismatch},
 		{"boot ID unreadable, start ID + CreateTime match: verified",
 			processBackendState{PID: 10, BootID: "boot-A", StartID: 7, CreateTime: live}, "", true, nil,
 			func(int) (int64, error) { return live, nil }, false, verifyVerified},
@@ -3540,7 +3545,11 @@ func TestVerifyProcessResult_Algorithm(t *testing.T) {
 			} else {
 				withCreateTime(t, func(int) (int64, error) { t.Error("unexpected CreateTime lookup"); return 0, nil })
 			}
-			if got, _ := verifyProcess(c.rec, c.darwin, c.darwin); got != c.want {
+			rules := rulesLinux
+			if c.darwin {
+				rules = rulesDarwin
+			}
+			if got, _ := verifyProcess(c.rec, rules); got != c.want {
 				t.Errorf("got %v, want %v", got, c.want)
 			}
 		})
@@ -3572,41 +3581,141 @@ func TestVerifyProcessResult_ProcessExitingMidCheckIsMismatch(t *testing.T) {
 		aliveOnce(t, 10)
 		withStartID(t, func(int) (int64, error) { return 0, lookupErr })
 		withCreateTime(t, func(int) (int64, error) { t.Error("must not fall through once the process is gone"); return 0, nil })
-		if got, _ := verifyProcess(processBackendState{PID: 10, BootID: "boot-A", StartID: 7, CreateTime: 1}, false, false); got != verifyMismatch {
+		if got, _ := verifyProcess(processBackendState{PID: 10, BootID: "boot-A", StartID: 7, CreateTime: 1}, rulesLinux); got != verifyMismatch {
 			t.Errorf("got %v, want mismatch", got)
 		}
 	})
 	t.Run("CreateTime path", func(t *testing.T) {
 		aliveOnce(t, 10)
 		withCreateTime(t, func(int) (int64, error) { return 0, lookupErr })
-		if got, _ := verifyProcess(processBackendState{PID: 10, CreateTime: 1}, false, false); got != verifyMismatch {
+		if got, _ := verifyProcess(processBackendState{PID: 10, CreateTime: 1}, rulesLinux); got != verifyMismatch {
 			t.Errorf("got %v, want mismatch", got)
 		}
 	})
 	t.Run("still alive means unknown", func(t *testing.T) {
 		withAlive(t, true)
 		withCreateTime(t, func(int) (int64, error) { return 0, lookupErr })
-		if got, _ := verifyProcess(processBackendState{PID: 10, CreateTime: 1}, false, false); got != verifyUnknown {
+		if got, _ := verifyProcess(processBackendState{PID: 10, CreateTime: 1}, rulesLinux); got != verifyUnknown {
 			t.Errorf("got %v, want unknown", got)
 		}
 	})
 }
 
 func TestVerifyProcess_MismatchReasons(t *testing.T) {
+	const bt = int64(1_700_000_000)
 	withBootID(t, "boot-A")
-	withStartID(t, func(int) (int64, error) { return 8, nil })
+	withBootTime(t, func() (int64, error) { return bt, nil })
+	lookupErr := errors.New("lookup failed")
+
+	reason := func(name string, ps processBackendState, rules platformRules, want mismatchReason) {
+		t.Helper()
+		got, r := verifyProcess(ps, rules)
+		if got != verifyMismatch || r != want {
+			t.Errorf("%s: got %v/%v, want mismatch/%v", name, got, r, want)
+		}
+	}
+
 	withAlive(t, true)
-	if _, r := verifyProcess(processBackendState{PID: 0, CreateTime: 1}, false, false); r != reasonBadPID {
-		t.Errorf("pid 0: reason %v", r)
-	}
-	if _, r := verifyProcess(processBackendState{PID: 10, BootID: "boot-OLD", StartID: 7}, false, false); r != reasonDifferentBoot {
-		t.Errorf("different boot: reason %v", r)
-	}
-	if _, r := verifyProcess(processBackendState{PID: 10, BootID: "boot-A", StartID: 7}, false, false); r != reasonDifferentProcess {
-		t.Errorf("different start ID: reason %v", r)
-	}
+	reason("non-positive pid", processBackendState{PID: 0, CreateTime: 1}, rulesLinux, reasonBadPID)
+	reason("different boot (boot ID)", processBackendState{PID: 10, BootID: "boot-OLD", StartID: 7}, rulesLinux, reasonDifferentBoot)
+	reason("different boot (boot time, macOS)", processBackendState{PID: 10, BootTime: bt - 500, CreateTime: 1}, rulesDarwin, reasonDifferentBoot)
+	withStartID(t, func(int) (int64, error) { return 8, nil })
+	reason("different process (start ID)", processBackendState{PID: 10, BootID: "boot-A", StartID: 7}, rulesLinux, reasonDifferentProcess)
+	withCreateTime(t, func(int) (int64, error) { return 9_000, nil })
+	reason("different process (CreateTime, macOS)", processBackendState{PID: 10, CreateTime: 1_000}, rulesDarwin, reasonDifferentProcess)
+
 	withAlive(t, false)
-	if _, r := verifyProcess(processBackendState{PID: 10, CreateTime: 1}, false, false); r != reasonDead {
-		t.Errorf("dead pid: reason %v", r)
+	reason("dead pid", processBackendState{PID: 10, CreateTime: 1}, rulesLinux, reasonDead)
+
+	// Gone after a failed lookup: alive for the first check, then not.
+	aliveOnce(t, 10)
+	withStartID(t, func(int) (int64, error) { return 0, lookupErr })
+	reason("gone after a failed start ID lookup", processBackendState{PID: 10, BootID: "boot-A", StartID: 7, CreateTime: 1}, rulesLinux, reasonDead)
+	aliveOnce(t, 10)
+	withCreateTime(t, func(int) (int64, error) { return 0, lookupErr })
+	reason("gone after a failed CreateTime lookup", processBackendState{PID: 10, CreateTime: 1}, rulesLinux, reasonDead)
+}
+
+func TestVerifyProcess_GoneLookingErrorOnLivePidIsUnknown(t *testing.T) {
+	withBootID(t, "boot-A")
+	withAlive(t, true)
+	withStartID(t, func(int) (int64, error) { return 0, fs.ErrNotExist })
+	withCreateTime(t, func(int) (int64, error) { return 0, fs.ErrNotExist })
+	for _, rules := range []platformRules{rulesLinux, rulesDarwin} {
+		if got, _ := verifyProcess(processBackendState{PID: 10, BootID: "boot-A", StartID: 7}, rules); got != verifyUnknown {
+			t.Errorf("rules %v: ENOENT on a live pid (start ID): got %v, want unknown", rules, got)
+		}
+		if got, _ := verifyProcess(processBackendState{PID: 10, CreateTime: 1}, rules); got != verifyUnknown {
+			t.Errorf("rules %v: ENOENT on a live pid (CreateTime): got %v, want unknown", rules, got)
+		}
+	}
+	// Not alive means dead.
+	withAlive(t, false)
+	if got, r := verifyProcess(processBackendState{PID: 10, CreateTime: 1}, rulesLinux); got != verifyMismatch || r != reasonDead {
+		t.Errorf("dead pid: %v/%v", got, r)
+	}
+}
+
+func TestTryAdopt_MessagePerMismatchReason(t *testing.T) {
+	withBootID(t, "boot-A")
+	withAlive(t, true)
+	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", t.TempDir())
+	b.adopt = true
+	b.restoredStatus = "running"
+	b.restoredState = &processBackendState{PID: 10, BootID: "boot-OLD", StartID: 7}
+	if outcome, msg := b.TryAdopt(); outcome != adoptNo || !strings.Contains(msg, "previous boot") {
+		t.Errorf("different boot: %v %q", outcome, msg)
+	}
+	withStartID(t, func(int) (int64, error) { return 8, nil })
+	b.restoredState = &processBackendState{PID: 10, BootID: "boot-A", StartID: 7}
+	if outcome, msg := b.TryAdopt(); outcome != adoptNo || !strings.Contains(msg, "reused by different process") {
+		t.Errorf("different process: %v %q", outcome, msg)
+	}
+}
+
+func TestNewManager_AdoptedProcessIsRepersistedWithCurrentIdentity(t *testing.T) {
+	// A legacy record (no boot ID, no start ID) for a live child.
+	withBootID(t, "")
+	withStartID(t, func(int) (int64, error) { return 0, errors.New("n/a") })
+	cfg := testConfig(t)
+	child := exec.Command("sleep", "3600")
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	legacy := saveBackendStateFromFields(child.Process.Pid, child.Process.Pid, "")
+	var rec processBackendState
+	if err := json.Unmarshal(legacy, &rec); err != nil || rec.BootID != "" {
+		t.Fatalf("expected a legacy record without boot_id: %s (%v)", legacy, err)
+	}
+	if err := SaveState(cfg.StateDir, "testsvc", State{Status: "running", DesiredStatus: "running", Backend: legacy}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now the current build: a boot ID is available and start IDs resolve.
+	withBootID(t, "boot-A")
+	withStartID(t, func(int) (int64, error) { return 99, nil })
+	svc := autostartService("testsvc", t.TempDir(), nil)
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	if got := m.Do("testsvc", "status"); got != "running" {
+		t.Fatalf("the legacy record should be adopted: %q", got)
+	}
+	_, raw, err := LoadState(cfg.StateDir, "testsvc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved struct {
+		Backend processBackendState `json:"backend"`
+	}
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.Backend.BootID != "boot-A" || saved.Backend.StartID == 0 {
+		t.Fatalf("adoption should rewrite the record with boot_id and start_id: %+v", saved.Backend)
 	}
 }

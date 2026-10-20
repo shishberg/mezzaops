@@ -283,6 +283,13 @@ retained, so a later restart may autostart if the lookup succeeds or the
 record has been overwritten. Operator start and deploy are not guarded
 (pre-existing).
 
+Accepted trade-offs of the verification rules: when the boot ID cannot be read,
+a reused pid on Linux gives unknown; an unknown result recurs on every start
+until an operator starts the service (Start writes a new record, and the log
+names the pid); and comparing the start offset (time since boot) for legacy
+records was considered and rejected, because after a reboot the same pid at a
+similar offset is plausible.
+
 ## Review fixes (post-implementation)
 
 - [x] **F2** — `Manager.Reload` is serialized by a mutex and stops a changed
@@ -384,11 +391,14 @@ record has been overwritten. Operator start and deploy are not guarded
   at all is verified, as on main; (3) the boot-level check can only rule a
   process out: boot IDs both known and different, or (when they are not both
   known) a recorded boot time that differs from a readable current one by more
-  than the 10 second `sameBoot` tolerance, is a mismatch; (4) with a start ID
+  than the 10 second `sameBoot` tolerance is a mismatch on macOS and unknown on
+  Linux, where BootTime moves with the wall clock like CreateTime; (4) with a
+  start ID
   and equal boot IDs, the start ID is looked up (equal verified, different
-  mismatch; a failed lookup is a mismatch if the process exited, otherwise
-  unknown on macOS, where the CreateTime lookup would be the same call, and on
-  Linux the CreateTime check is tried); (5) with a CreateTime, one shared
+  mismatch; a failed lookup is a mismatch only if the pid is no longer alive,
+  and an ENOENT-looking error for a live pid, as under hidepid or a pid
+  namespace, is not; otherwise it is unknown on macOS, where the CreateTime
+  lookup would be the same call, and on Linux the CreateTime check is tried); (5) with a CreateTime, one shared
   helper looks it up and compares with `createTimeMatches` (exact on macOS,
   within 1000 ms on Linux, where gopsutil recomputes the boot time so
   CreateTime wobbles by about a second): a match is verified; a difference is a
@@ -396,8 +406,12 @@ record has been overwritten. Operator start and deploy are not guarded
   absolute) and unknown on Linux, where CreateTime moves when the clock is
   stepped; a failed lookup is a mismatch if the process exited and unknown if
   alive; (6) otherwise no per-process comparison was possible: unknown. The
-  platform rules (`startIDIsCreateTime`, `createTimeCanReject`) are consts
-  passed as parameters, so tests cover both values. Deliberate trade-off: on
+  platform rules are one `platformRules` value (`hostRules`, a const per
+  platform) passed as a parameter, so tests cover both without mutating
+  globals. A process adopted at startup is re-persisted immediately, so its
+  record is rewritten with the current boot ID and start ID (legacy records
+  then remain only for services that were not running at upgrade time). A
+  different boot has its own `TryAdopt` message ("from a previous boot"). Deliberate trade-off: on
   Linux a legacy record (no start ID) whose pid was reused on the same boot is
   unknown, so the service is not autostarted that run (and this is logged)
   rather than risking a duplicate; records with a start ID detect pid reuse

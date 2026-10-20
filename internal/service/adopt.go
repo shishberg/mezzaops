@@ -1,8 +1,6 @@
 package service
 
 import (
-	"errors"
-	"io/fs"
 	"sync/atomic"
 	"syscall"
 
@@ -51,11 +49,6 @@ const (
 	verifyUnknown
 )
 
-// isGone reports whether err means the process no longer exists.
-func isGone(err error) bool {
-	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, process.ErrorProcessNotRunning)
-}
-
 // mismatchReason says why verifyMismatch was returned.
 type mismatchReason int
 
@@ -67,10 +60,34 @@ const (
 	reasonDifferentProcess                // alive, but not the recorded process
 )
 
+// platformRules selects the per-platform verification rules as one value, so
+// impossible combinations cannot be expressed. Production uses hostRules;
+// tests pass either value.
+type platformRules int
+
+const (
+	rulesLinux  platformRules = iota // CreateTime and BootTime move with the wall clock
+	rulesDarwin                      // CreateTime and BootTime are absolute
+)
+
+// startIDIsCreateTime reports whether the start ID is the creation time, so a
+// failed start ID lookup leaves nothing more to try and a record that already
+// has CreateTime need not look the process up again.
+func (r platformRules) startIDIsCreateTime() bool { return r == rulesDarwin }
+
+// createTimeCanReject reports whether a CreateTime difference proves a
+// different process. On Linux it does not: a clock step moves CreateTime.
+func (r platformRules) createTimeCanReject() bool { return r == rulesDarwin }
+
+// bootTimeCanReject reports whether a BootTime difference proves a different
+// boot when no boot ID is available. On Linux it does not: BootTime is now
+// minus uptime, so a clock step moves it.
+func (r platformRules) bootTimeCanReject() bool { return r == rulesDarwin }
+
 // verifyProcessResult checks a record against the live process using the
 // platform's rules (startIDIsCreateTime, createTimeCanReject).
 func verifyProcessResult(ps processBackendState) (verifyResult, mismatchReason) {
-	return verifyProcess(ps, startIDIsCreateTime, createTimeCanReject)
+	return verifyProcess(ps, hostRules)
 }
 
 // verifyProcess checks that the PID in the state still refers to the same
@@ -83,14 +100,15 @@ func verifyProcessResult(ps processBackendState) (verifyResult, mismatchReason) 
 //  3. The boot-level check can only rule a process out. If the record's boot
 //     ID and the current boot ID are both known and differ, it is a mismatch.
 //     If they are not both known, a recorded BootTime that differs (beyond
-//     sameBoot's tolerance) from a readable current boot time is a mismatch.
-//     (With matching boot IDs the boot time is not consulted: it is derived
-//     from the wall clock and moves when the clock is stepped.)
+//     sameBoot's tolerance) from a readable current boot time is a mismatch
+//     where bootTimeCanReject (macOS) and unknown on Linux, where BootTime
+//     moves with the wall clock. (With matching boot IDs the boot time is not
+//     consulted.)
 //  4. If the record has a StartID and the boot IDs are both known and equal,
 //     the start ID (start ticks since boot on Linux, creation time on macOS;
 //     exact and clock-independent) is looked up: equal is verified, different
-//     is a mismatch. If the lookup fails, a process that has exited is a
-//     mismatch; otherwise it is unknown on macOS (startIDIsCreateTime: the
+//     is a mismatch. If the lookup fails, a process that is no longer alive is
+//     a mismatch; otherwise it is unknown on macOS (startIDIsCreateTime: the
 //     CreateTime lookup would be the same call) and on Linux step 5 is tried.
 //  5. If the record has a CreateTime it is looked up and compared with
 //     createTimeMatches (exact on macOS, legacyCreateTimeTolerance on Linux).
@@ -105,7 +123,7 @@ func verifyProcessResult(ps processBackendState) (verifyResult, mismatchReason) 
 // the same boot is unknown, not a mismatch, so the service is not autostarted
 // that run (and this is logged) rather than risking a duplicate. Records with
 // a start ID detect pid reuse exactly.
-func verifyProcess(ps processBackendState, startIDIsCT, ctCanReject bool) (verifyResult, mismatchReason) {
+func verifyProcess(ps processBackendState, rules platformRules) (verifyResult, mismatchReason) {
 	if ps.PID <= 0 {
 		return verifyMismatch, reasonBadPID
 	}
@@ -125,7 +143,12 @@ func verifyProcess(ps processBackendState, startIDIsCT, ctCanReject bool) (verif
 		sameBootID = true
 	} else if ps.BootTime != 0 {
 		if bt, err := bootTimeFn(); err == nil && !sameBoot(bt, ps.BootTime) {
-			return verifyMismatch, reasonDifferentBoot
+			if rules.bootTimeCanReject() {
+				return verifyMismatch, reasonDifferentBoot
+			}
+			// Linux: BootTime moves with the wall clock, so the same boot
+			// can look different after a clock step.
+			return verifyUnknown, reasonNone
 		}
 	}
 
@@ -137,25 +160,25 @@ func verifyProcess(ps processBackendState, startIDIsCT, ctCanReject bool) (verif
 			}
 			return verifyMismatch, reasonDifferentProcess
 		}
-		if goneAfter(ps.PID, err) {
+		if goneAfter(ps.PID) {
 			return verifyMismatch, reasonDead
 		}
-		if startIDIsCT {
+		if rules.startIDIsCreateTime() {
 			return verifyUnknown, reasonNone
 		}
 	}
 
 	if ps.CreateTime != 0 {
-		return checkCreateTime(ps, ctCanReject)
+		return checkCreateTime(ps, rules)
 	}
 	return verifyUnknown, reasonNone
 }
 
 // checkCreateTime compares the record's CreateTime with the live one.
-func checkCreateTime(ps processBackendState, canReject bool) (verifyResult, mismatchReason) {
+func checkCreateTime(ps processBackendState, rules platformRules) (verifyResult, mismatchReason) {
 	live, err := createTimeFn(ps.PID)
 	if err != nil {
-		if goneAfter(ps.PID, err) {
+		if goneAfter(ps.PID) {
 			return verifyMismatch, reasonDead
 		}
 		return verifyUnknown, reasonNone
@@ -163,7 +186,7 @@ func checkCreateTime(ps processBackendState, canReject bool) (verifyResult, mism
 	switch {
 	case createTimeMatches(live, ps.CreateTime, legacyCreateTimeTolerance):
 		return verifyVerified, reasonNone
-	case canReject:
+	case rules.createTimeCanReject():
 		return verifyMismatch, reasonDifferentProcess
 	default:
 		return verifyUnknown, reasonNone
@@ -171,10 +194,11 @@ func checkCreateTime(ps processBackendState, canReject bool) (verifyResult, mism
 }
 
 // goneAfter reports whether a failed lookup means the process no longer
-// exists: the error says so, or the pid is no longer alive. Otherwise the
-// process is alive and its identity simply could not be read.
-func goneAfter(pid int, err error) bool {
-	return isGone(err) || !isAliveFn(pid)
+// exists. Only "the pid is no longer alive" counts: an error that merely looks
+// like "gone" (ENOENT under hidepid or in another pid namespace) for a pid
+// that is alive leaves the identity unknown.
+func goneAfter(pid int) bool {
+	return !isAliveFn(pid)
 }
 
 // createTimeMatches reports whether two creation times (ms) are within tol of
