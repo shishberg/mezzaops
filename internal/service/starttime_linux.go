@@ -20,4 +20,4 @@ func processStartID(pid int) (int64, error) {
 // and BootTime are derived from the wall clock, so a clock step on the same
 // boot moves them for the very same process; they can confirm a process but a
 // difference proves nothing.
-const hostRules = rulesLinux
+var hostRules = rulesLinux

@@ -389,7 +389,11 @@ similar offset is plausible.
   mismatch carries a reason, and `verifyProcess` follows these steps: (1) a
   non-positive or dead pid is a mismatch; (2) a record with no identity fields
   at all is verified, as on main; (3) the boot-level check can only rule a
-  process out: boot IDs both known and different, or (when they are not both
+  process out: boot IDs both known and different (a legacy record has none of
+  its own, so the service state file's `boot_id` stands in for it: if the host
+  has rebooted since that file was written, no process in it can be alive, which
+  keeps first-reboot-after-upgrade autostart working on Linux; it is not used
+  for the start ID check), or (when they are not both
   known) a recorded boot time that differs from a readable current one by more
   than the 10 second `sameBoot` tolerance is a mismatch on macOS and unknown on
   Linux, where BootTime moves with the wall clock like CreateTime; (4) with a
@@ -406,11 +410,14 @@ similar offset is plausible.
   absolute) and unknown on Linux, where CreateTime moves when the clock is
   stepped; a failed lookup is a mismatch if the process exited and unknown if
   alive; (6) otherwise no per-process comparison was possible: unknown. The
-  platform rules are one `platformRules` value (`hostRules`, a const per
-  platform) passed as a parameter, so tests cover both without mutating
-  globals. A process adopted at startup is re-persisted immediately, so its
-  record is rewritten with the current boot ID and start ID (legacy records
-  then remain only for services that were not running at upgrade time). A
+  platform rules are one `platformRules` struct of three named bools
+  (`startIDIsCreateTime`, `createTimeCanReject`, `bootTimeCanReject`;
+  `rulesLinux`, `rulesDarwin`; `hostRules` for the platform) passed as a
+  parameter, so tests cover both without mutating
+  globals. A process adopted at startup from a legacy record (no boot ID or no start ID)
+  is re-persisted immediately, so its record is rewritten with the current boot
+  ID and start ID (legacy records then remain only for services that were not
+  running at upgrade time); a current record is not rewritten. A
   different boot has its own `TryAdopt` message ("from a previous boot"). Deliberate trade-off: on
   Linux a legacy record (no start ID) whose pid was reused on the same boot is
   unknown, so the service is not autostarted that run (and this is logged)

@@ -230,7 +230,7 @@ func saveBackendStateFromFields(pid, pgid int, logPath string) json.RawMessage {
 	if ct, err := createTimeFn(pid); err == nil {
 		ps.CreateTime = ct
 	}
-	if hostRules.startIDIsCreateTime() {
+	if hostRules.startIDIsCreateTime {
 		ps.StartID = ps.CreateTime // already looked up above
 	} else if id, err := processStartIDFn(pid); err == nil {
 		ps.StartID = id
@@ -294,9 +294,10 @@ const (
 )
 
 // TryAdopt attempts to re-adopt a process from a previous session using
-// the restored state. It reports the outcome (see adoptOutcome) and a
+// the restored state. serviceBootID is the boot ID in the service state file,
+// used for a legacy record that has none of its own. It reports the outcome (see adoptOutcome) and a
 // human-readable description of what happened.
-func (p *ProcessBackend) TryAdopt() (adoptOutcome, string) {
+func (p *ProcessBackend) TryAdopt(serviceBootID string) (adoptOutcome, string) {
 	if !p.adopt {
 		return adoptNo, "adoption disabled"
 	}
@@ -312,7 +313,7 @@ func (p *ProcessBackend) TryAdopt() (adoptOutcome, string) {
 		return adoptNo, "stopped (preserved from previous session)"
 	}
 
-	result, reason := verifyProcessResult(ps)
+	result, reason := verifyProcess(ps, hostRules, serviceBootID)
 	switch result {
 	case verifyMismatch:
 		switch reason {

@@ -60,34 +60,36 @@ const (
 	reasonDifferentProcess                // alive, but not the recorded process
 )
 
-// platformRules selects the per-platform verification rules as one value, so
-// impossible combinations cannot be expressed. Production uses hostRules;
-// tests pass either value.
-type platformRules int
+// platformRules are the per-platform verification rules, as named fields so
+// impossible combinations cannot be written by accident. Production uses
+// hostRules; tests pass either value.
+type platformRules struct {
+	// startIDIsCreateTime: the start ID is the creation time, so a failed
+	// start ID lookup leaves nothing more to try and a record that already
+	// has CreateTime need not look the process up again.
+	startIDIsCreateTime bool
+	// createTimeCanReject: a CreateTime difference proves a different
+	// process. On Linux it does not: a clock step moves CreateTime.
+	createTimeCanReject bool
+	// bootTimeCanReject: a BootTime difference (no boot ID available) proves
+	// a different boot. On Linux it does not: BootTime is now minus uptime,
+	// so a clock step moves it.
+	bootTimeCanReject bool
+}
 
-const (
-	rulesLinux  platformRules = iota // CreateTime and BootTime move with the wall clock
-	rulesDarwin                      // CreateTime and BootTime are absolute
+var (
+	// rulesLinux: CreateTime and BootTime are derived from the wall clock.
+	rulesLinux = platformRules{}
+	// rulesDarwin: the start ID is CreateTime and CreateTime and BootTime
+	// are absolute kernel values.
+	rulesDarwin = platformRules{startIDIsCreateTime: true, createTimeCanReject: true, bootTimeCanReject: true}
 )
 
-// startIDIsCreateTime reports whether the start ID is the creation time, so a
-// failed start ID lookup leaves nothing more to try and a record that already
-// has CreateTime need not look the process up again.
-func (r platformRules) startIDIsCreateTime() bool { return r == rulesDarwin }
-
-// createTimeCanReject reports whether a CreateTime difference proves a
-// different process. On Linux it does not: a clock step moves CreateTime.
-func (r platformRules) createTimeCanReject() bool { return r == rulesDarwin }
-
-// bootTimeCanReject reports whether a BootTime difference proves a different
-// boot when no boot ID is available. On Linux it does not: BootTime is now
-// minus uptime, so a clock step moves it.
-func (r platformRules) bootTimeCanReject() bool { return r == rulesDarwin }
-
 // verifyProcessResult checks a record against the live process using the
-// platform's rules (startIDIsCreateTime, createTimeCanReject).
+// platform's rules (hostRules): startIDIsCreateTime, createTimeCanReject and
+// bootTimeCanReject.
 func verifyProcessResult(ps processBackendState) (verifyResult, mismatchReason) {
-	return verifyProcess(ps, hostRules)
+	return verifyProcess(ps, hostRules, "")
 }
 
 // verifyProcess checks that the PID in the state still refers to the same
@@ -97,7 +99,10 @@ func verifyProcessResult(ps processBackendState) (verifyResult, mismatchReason) 
 //  1. A non-positive pid, or one that is not alive, is a mismatch.
 //  2. A record with no identity fields at all (BootID, StartID, BootTime and
 //     CreateTime all zero) is verified, as on main.
-//  3. The boot-level check can only rule a process out. If the record's boot
+//  3. The boot-level check can only rule a process out. A legacy record has
+//     no boot ID of its own, so the service state file's boot ID
+//     (serviceBootID) stands in for it: if the host has rebooted since the
+//     file was written, no process in it can be alive. If the record's boot
 //     ID and the current boot ID are both known and differ, it is a mismatch.
 //     If they are not both known, a recorded BootTime that differs (beyond
 //     sameBoot's tolerance) from a readable current boot time is a mismatch
@@ -123,7 +128,7 @@ func verifyProcessResult(ps processBackendState) (verifyResult, mismatchReason) 
 // the same boot is unknown, not a mismatch, so the service is not autostarted
 // that run (and this is logged) rather than risking a duplicate. Records with
 // a start ID detect pid reuse exactly.
-func verifyProcess(ps processBackendState, rules platformRules) (verifyResult, mismatchReason) {
+func verifyProcess(ps processBackendState, rules platformRules, serviceBootID string) (verifyResult, mismatchReason) {
 	if ps.PID <= 0 {
 		return verifyMismatch, reasonBadPID
 	}
@@ -135,15 +140,28 @@ func verifyProcess(ps processBackendState, rules platformRules) (verifyResult, m
 	}
 
 	cur := bootIDFn()
-	sameBootID := false
-	if ps.BootID != "" && cur != "" {
-		if ps.BootID != cur {
-			return verifyMismatch, reasonDifferentBoot
+	sameBootID := false // the record's own boot ID matches (needed for the start ID)
+	knownSameBoot := false
+	if cur != "" {
+		switch {
+		case ps.BootID != "":
+			if ps.BootID != cur {
+				return verifyMismatch, reasonDifferentBoot
+			}
+			sameBootID, knownSameBoot = true, true
+		case serviceBootID != "":
+			// The service state file's boot ID stands in for a legacy record
+			// that has none: if the host has rebooted since the file was
+			// written, no process recorded in it can still be alive.
+			if serviceBootID != cur {
+				return verifyMismatch, reasonDifferentBoot
+			}
+			knownSameBoot = true
 		}
-		sameBootID = true
-	} else if ps.BootTime != 0 {
+	}
+	if !knownSameBoot && ps.BootTime != 0 {
 		if bt, err := bootTimeFn(); err == nil && !sameBoot(bt, ps.BootTime) {
-			if rules.bootTimeCanReject() {
+			if rules.bootTimeCanReject {
 				return verifyMismatch, reasonDifferentBoot
 			}
 			// Linux: BootTime moves with the wall clock, so the same boot
@@ -163,7 +181,7 @@ func verifyProcess(ps processBackendState, rules platformRules) (verifyResult, m
 		if goneAfter(ps.PID) {
 			return verifyMismatch, reasonDead
 		}
-		if rules.startIDIsCreateTime() {
+		if rules.startIDIsCreateTime {
 			return verifyUnknown, reasonNone
 		}
 	}
@@ -186,7 +204,7 @@ func checkCreateTime(ps processBackendState, rules platformRules) (verifyResult,
 	switch {
 	case createTimeMatches(live, ps.CreateTime, legacyCreateTimeTolerance):
 		return verifyVerified, reasonNone
-	case rules.createTimeCanReject():
+	case rules.createTimeCanReject:
 		return verifyMismatch, reasonDifferentProcess
 	default:
 		return verifyUnknown, reasonNone

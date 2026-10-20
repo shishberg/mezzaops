@@ -269,12 +269,14 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 	// On startup: adopt existing state, mark for restart, or
 	// autostart on cold boot.
 	adopt := svc.ShouldAdopt()
-	adoptedNow := false
+	adoptedLegacy := false
 	if pb, ok := asProcessBackend(backend); ok {
 		pb.adopt = adopt
-		outcome, msg := pb.TryAdopt()
+		outcome, msg := pb.TryAdopt(persistedBootID)
 		adopted := outcome == adoptYes
-		adoptedNow = adopted
+		// Only a legacy record (no boot ID or start ID) is worth re-persisting.
+		adoptedLegacy = adopted && pb.restoredState != nil &&
+			(pb.restoredState.BootID == "" || pb.restoredState.StartID == 0)
 		log.Printf("**%s**: %s", svc.Name, msg)
 
 		// C1: if adoption did not result in a running process and
@@ -307,12 +309,14 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 		ms.restartOnStartup = true
 	}
 
-	// A process adopted at startup is re-persisted straight away, so its
-	// backend record is rewritten with the current boot ID and start ID. A
-	// record written by an older build (legacy) then exists only for services
-	// that were not running at upgrade time.
-	if adoptedNow && m.stateDir != "" {
+	// A process adopted from a legacy record (written without a boot ID or
+	// start ID) is re-persisted straight away, so its record is rewritten with
+	// the current boot ID and start ID. That save also records the boot ID, so
+	// the stamp below is skipped.
+	repersisted := false
+	if adoptedLegacy && m.stateDir != "" {
 		m.saveServiceState(ms)
+		repersisted = true
 	}
 
 	// Boot ID bookkeeping (see recordedBootID): a normal construction with
@@ -320,7 +324,7 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 	// is detected. Only boot_id is rewritten in an existing file. A pending
 	// startup op records it itself when it runs, and a Reload replacement
 	// inherits the old value, so neither consumes the reboot signal early.
-	if mode == modeColdBoot && !ms.restartOnStartup && m.bootID != "" {
+	if mode == modeColdBoot && !ms.restartOnStartup && !repersisted && m.bootID != "" {
 		if hadState && persistedBootID != m.bootID {
 			if err := StampBootID(m.stateDir, svc.Name, m.bootID); err != nil {
 				log.Printf("**%s**: recording boot ID: %v", svc.Name, err)
@@ -1295,13 +1299,16 @@ func (m *Manager) cleanOrphans() {
 		var ps processBackendState
 		var wrapper struct {
 			Backend json.RawMessage `json:"backend"`
+			BootID  string          `json:"boot_id"`
 		}
 		if err := json.Unmarshal(raw, &wrapper); err == nil && len(wrapper.Backend) > 0 {
 			_ = json.Unmarshal(wrapper.Backend, &ps)
 		} else {
 			_ = json.Unmarshal(raw, &ps)
 		}
-		if ps.PGID > 0 && VerifyProcess(ps) { // checks pid > 0 and alive
+		// Kill only a positively verified process (verification checks the pid
+		// is positive and alive); the state file's boot ID covers legacy records.
+		if result, _ := verifyProcess(ps, hostRules, wrapper.BootID); ps.PGID > 0 && result == verifyVerified {
 			_ = killFn(-ps.PGID, syscall.SIGKILL)
 		}
 		RemoveState(m.stateDir, name)
