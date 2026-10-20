@@ -299,14 +299,21 @@ behaviour on main.
   reload). The same applies when a service is removed. The cold-boot startup op is a pending action in the
   service loop's single select, not a separate wait: ops are served in order
   the whole time, an operator start/stop/restart cancels the pending startup
-  op, and a deploy waits behind it as on main. The internal stop reports
-  "was running" as the backend running or a startup op still pending, so a
-  replacement created before readiness still gets its cold-boot start; a
-  failed internal stop leaves the loop live and the startup op pending. A
+  op. A service that had a startup op holds its deploys until readiness fires,
+  even after an operator op cancelled the startup op, so a deploy's
+  notifications are not sent before frontends connect. Operator ops are
+  answered before readiness (the reply goes straight to the requester), but
+  their broadcast notifications may not reach frontends that have not
+  connected yet. The internal stop reports separately whether the backend was
+  running and whether a startup op was still pending. A replacement for a
+  running backend is started; if only a
+  startup op was pending, the replacement makes its own cold-boot decision from
+  the new config (the boot-ID gate already passed for the old service), and any
+  start still waits for readiness; a failed internal stop leaves the loop live and the startup op pending. A
   deploy is forwarded to the specific replacement recorded at swap time, never
-  to a later service with the same name. The replacement is created without cold-boot scheduling, is
-  started if and only if the old service was running, and carries over the
-  old desired state.
+  to a later service with the same name. The replacement carries over the old
+  desired state, and has no cold-boot scheduling of its own unless only a
+  startup op was pending.
 - [x] **F3** — `handleOp` start/restart record `DesiredStatus="running"` when
   the command is accepted, before the backend call, so a failed start still
   records intent.
@@ -331,8 +338,24 @@ behaviour on main.
   before this branch, when `adopt: false` never started anything at boot. If
   either ID is unknown (an existing saved state without one, or the ID is
   unavailable, or no state dir is configured) it is likewise not autostarted.
+  The ID is read once per process and cached. A state file with no ID (or an
+  older one) gets the current ID written once at startup, unless a startup op
+  is pending (its own save records it), so the next reboot is detected; the
+  decision itself is unchanged. In a container the ID belongs to the host
+  kernel: with persistent state, `adopt: false` services autostart only after
+  a host reboot, not after a container restart, and if the ID cannot be read
+  they never autostart (logged).
   `VerifyProcess` compares boot IDs when both sides have one and otherwise
-  falls back to the boot time with a 10 second tolerance. `adopt: true` is
+  falls back to the boot time with a 10 second tolerance. When the boot IDs
+  match, the process is verified by `start_offset` (CreateTime minus BootTime,
+  seconds since boot, recorded in the process record) with a 2 second
+  tolerance, if both records have one, because CreateTime is derived from the
+  wall clock and a clock step on the same boot would otherwise reject a genuine
+  child. On Linux gopsutil derives both from the same boot time, so the offset
+  is stable across a step. On macOS CreateTime is the kernel's absolute process
+  start time while `kern.boottime` can be adjusted when the clock is set, so
+  the offset is not guaranteed to be stable there; macOS machines normally have
+  an RTC, so steps are rare, but this is not claimed to be safe. `adopt: true` is
   unchanged: adopt if possible, otherwise autostart. There is no orphan
   tracking.
 - [x] **IsAlive guard** — `IsAlive(pid <= 0)` is false, since `kill(0, 0)` and

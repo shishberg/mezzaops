@@ -12,6 +12,10 @@ import (
 // is only the fallback when no boot ID is available on both sides.
 const bootTimeTolerance = 10
 
+// startOffsetTolerance is the slack (seconds) when comparing start offsets;
+// gopsutil's boot time jitters by about a second between reads.
+const startOffsetTolerance = 2
+
 // sameBoot reports whether two host boot times (unix seconds) are the same
 // boot, allowing for jitter.
 func sameBoot(a, b int64) bool {
@@ -41,10 +45,12 @@ func IsAlive(pid int) bool {
 func VerifyProcess(ps processBackendState) bool {
 	// Prefer the boot ID, which is immune to clock steps; fall back to the
 	// boot time (with tolerance) when either side lacks one.
+	sameBootByID := false
 	if cur := bootIDFn(); ps.BootID != "" && cur != "" {
 		if ps.BootID != cur {
 			return false
 		}
+		sameBootByID = true
 	} else if ps.BootTime != 0 {
 		bootTime, err := host.BootTime()
 		if err == nil && !sameBoot(int64(bootTime), ps.BootTime) {
@@ -57,8 +63,22 @@ func VerifyProcess(ps processBackendState) bool {
 			return false
 		}
 		createTime, err := p.CreateTime()
-		if err == nil && createTime != ps.CreateTime {
-			return false
+		if err == nil {
+			// CreateTime is derived from the wall clock, so a clock step
+			// on the same boot changes it. When the boot is known to be
+			// the same and an offset since boot was recorded, compare that.
+			if sameBootByID && ps.StartOffset != 0 {
+				if bt, berr := host.BootTime(); berr == nil {
+					d := createTime/1000 - int64(bt) - ps.StartOffset
+					if d < 0 {
+						d = -d
+					}
+					return d <= startOffsetTolerance
+				}
+			}
+			if createTime != ps.CreateTime {
+				return false
+			}
 		}
 	}
 	return true

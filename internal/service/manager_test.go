@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/shirou/gopsutil/v3/host"
+	"github.com/shirou/gopsutil/v3/process"
 	"github.com/shishberg/mezzaops/internal/config"
 	"github.com/stretchr/testify/assert"
 )
@@ -2135,7 +2136,7 @@ func TestManager_OpsQueuedBehindInternalStopAreRejected(t *testing.T) {
 	if got := <-first.result; got != "stopped" {
 		t.Fatalf("internal stop: %q", got)
 	}
-	if !snap.wasRunning {
+	if !snap.backendRunning {
 		t.Fatal("snapshot should record the service was running")
 	}
 	if got := <-second.result; got != reloadedMsg {
@@ -2749,5 +2750,206 @@ func TestRebootedSince(t *testing.T) {
 		if got := m.rebootedSince("svc", c.saved); got != c.want {
 			t.Errorf("%s: rebootedSince = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// --- review follow-ups: start offset, deploy gating, replacement decisions ---
+
+// liveStartOffset returns the current process's CreateTime (ms) and its
+// start offset (seconds since boot), as the backend would record them.
+func liveStartOffset(t *testing.T) (createTime, offset int64) {
+	t.Helper()
+	p, err := process.NewProcess(int32(os.Getpid()))
+	if err != nil {
+		t.Skip(err)
+	}
+	ct, err := p.CreateTime()
+	if err != nil {
+		t.Skip(err)
+	}
+	bt, err := host.BootTime()
+	if err != nil {
+		t.Skip(err)
+	}
+	return ct, ct/1000 - int64(bt)
+}
+
+func TestVerifyProcess_StartOffsetSurvivesClockStep(t *testing.T) {
+	withBootID(t, "boot-A")
+	ct, off := liveStartOffset(t)
+	pid := os.Getpid()
+
+	// Same boot, wall clock stepped by hours: CreateTime differs wildly but
+	// the offset since boot is unchanged.
+	shifted := processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3*3600*1000, StartOffset: off}
+	if !VerifyProcess(shifted) {
+		t.Error("same boot, offset within tolerance: must verify despite a shifted CreateTime")
+	}
+	within := processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3*3600*1000, StartOffset: off + 2}
+	if !VerifyProcess(within) {
+		t.Error("offset 2s away must still verify")
+	}
+	wrong := processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct, StartOffset: off + 100}
+	if VerifyProcess(wrong) {
+		t.Error("same boot, offset differs: must not verify")
+	}
+	// Without a matching boot ID the exact CreateTime check applies.
+	noID := processBackendState{PID: pid, CreateTime: ct + 3*3600*1000, StartOffset: off}
+	if VerifyProcess(noID) {
+		t.Error("no boot ID: a shifted CreateTime must not verify")
+	}
+	// No recorded offset: keep the exact CreateTime check.
+	noOff := processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3*3600*1000}
+	if VerifyProcess(noOff) {
+		t.Error("no offset: a shifted CreateTime must not verify")
+	}
+}
+
+func TestSaveBackendState_RecordsStartOffset(t *testing.T) {
+	child := exec.Command("sleep", "3600")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	raw := saveBackendStateFromFields(child.Process.Pid, child.Process.Pid, "")
+	var ps processBackendState
+	if err := json.Unmarshal(raw, &ps); err != nil {
+		t.Fatal(err)
+	}
+	if ps.CreateTime == 0 || ps.BootTime == 0 {
+		t.Skip("gopsutil gave no timing data")
+	}
+	if want := ps.CreateTime/1000 - ps.BootTime; ps.StartOffset < want-2 || ps.StartOffset > want+2 {
+		t.Fatalf("StartOffset %d, want about %d", ps.StartOffset, want)
+	}
+}
+
+func TestManager_DeployWaitsForReadinessAfterOperatorOp(t *testing.T) {
+	runs := filepath.Join(t.TempDir(), "runs")
+	m, _, _, write := pendingStartupManager(t, nil)
+	write("deploy:\n  - echo run >> " + runs + "\n")
+	if err := m.Reload(); err != nil { // pick up the deploy steps (still pre-readiness)
+		t.Fatal(err)
+	}
+
+	if got := m.Do("svc1", "stop"); got != "stopped" {
+		t.Fatalf("stop before readiness: %q", got)
+	}
+	if err := m.RequestDeploy("svc1"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if _, err := os.Stat(runs); err == nil {
+		t.Fatal("a deploy ran before readiness (its notifications would be lost)")
+	}
+	m.SignalReady()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(runs); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("deploy never ran after readiness")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestManager_ReloadDisablingAutostartBeforeReadinessDoesNotStart(t *testing.T) {
+	m, _, _, write := pendingStartupManager(t, nil)
+	// Same service, autostart now off.
+	servicesFile := "dir: /tmp\nautostart: false\nentrypoint:\n  - sleep\n  - \"3600\"\n"
+	_ = write
+	m.mu.Lock()
+	dir := m.servicesDir
+	m.mu.Unlock()
+	if err := os.WriteFile(filepath.Join(dir, "svc1.yaml"), []byte(servicesFile), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	m.SignalReady()
+	time.Sleep(400 * time.Millisecond)
+	if got := m.Do("svc1", "status"); got != "stopped" {
+		t.Fatalf("the replacement started although the new config disables autostart: %q", got)
+	}
+}
+
+func TestNewManager_LegacyStateGetsBootIDStamped(t *testing.T) {
+	withBootID(t, "boot-A")
+	cfg := testConfig(t)
+	// A legacy state file: no boot_id.
+	if err := SaveState(cfg.StateDir, "testsvc", State{
+		Status: "running", DesiredStatus: "running",
+		Backend: json.RawMessage(`{"pid":99999999,"pgid":99999999}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	yes, no := true, false
+	svc := autostartService("testsvc", t.TempDir(), &yes)
+	svc.Adopt = &no
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.SignalReady()
+	time.Sleep(300 * time.Millisecond)
+	if got := m.Do("testsvc", "status"); !strings.Contains(got, "stopped") {
+		t.Fatalf("legacy state without a boot ID must not autostart now: %q", got)
+	}
+	m.Stop()
+	s, _, err := LoadState(cfg.StateDir, "testsvc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.BootID != "boot-A" {
+		t.Fatalf("startup should record the current boot ID, got %q", s.BootID)
+	}
+
+	// Next time the host has rebooted: the stamped state detects it.
+	withBootID(t, "boot-B")
+	m2, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m2.Stop()
+	m2.SignalReady()
+	waitForStatus(t, m2, "testsvc", "running")
+}
+
+func TestManager_SaveStatePersistsLastRestart(t *testing.T) {
+	cfg := testConfig(t)
+	m, err := NewManager(cfg, []config.ServiceConfig{sleepService("svc", t.TempDir())}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	m.Do("svc", "start")
+	m.Do("svc", "restart")
+	s, _, err := LoadState(cfg.StateDir, "svc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.LastRestart.IsZero() {
+		t.Fatal("LastRestart was not persisted")
+	}
+}
+
+func TestBootID_ReadOnce(t *testing.T) {
+	// The default boot ID source caches its first read.
+	var calls atomic.Int32
+	origRaw := bootIDRead
+	bootIDRead = func() string { calls.Add(1); return "x" }
+	resetBootIDCache()
+	t.Cleanup(func() { bootIDRead = origRaw; resetBootIDCache() })
+	for range 5 {
+		if cachedBootID() != "x" {
+			t.Fatal("unexpected boot id")
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("boot ID read %d times, want once", calls.Load())
 	}
 }

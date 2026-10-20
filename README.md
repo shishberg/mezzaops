@@ -72,7 +72,12 @@ last command.
 
 A service with `adopt: false` is autostarted only after a host reboot
 (the boot ID recorded in its state differs from the current one), or
-when it has no state file yet (it has never run here). If
+when it has no state file yet (it has never run here). The boot ID is the
+kernel's per-boot UUID (`/proc/sys/kernel/random/boot_id` on Linux,
+`kern.bootsessionuuid` on macOS). In a container it belongs to the host
+kernel, so with persistent state `adopt: false` services autostart only after
+a host reboot, not after a container restart. If the boot ID cannot be read,
+`adopt: false` services are never autostarted (this is logged). If
 mezzaops itself restarts without a reboot, the previous child may still
 be running, so nothing is started and a log line says so.
 
