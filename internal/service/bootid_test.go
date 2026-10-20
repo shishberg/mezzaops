@@ -5,7 +5,6 @@ import (
 	"log"
 	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -14,7 +13,7 @@ import (
 func resetBootIDCache() {
 	bootIDMu.Lock()
 	defer bootIDMu.Unlock()
-	bootIDOnce = sync.Once{}
+	bootIDLoaded = false
 	bootIDValue = ""
 }
 

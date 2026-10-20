@@ -274,8 +274,11 @@ safer one for cold-boot recovery. Documented inline in
 
 After a mezzaops restart without a host reboot, an `adopt: false` service is
 not autostarted, but an untracked surviving child is not guarded against a
-duplicate start by an operator start or a deploy. This is pre-existing
-behaviour on main.
+duplicate start by an operator start or a deploy. The same holds for a live
+process whose identity could not be verified (the "unknown" case below): it is
+not adopted and not autostarted over, and its record is kept in saved state so
+each restart re-evaluates it, but an operator start or deploy can still start a
+second copy. This is pre-existing behaviour on main.
 
 ## Review fixes (post-implementation)
 
@@ -358,7 +361,9 @@ behaviour on main.
   `adopt: false` services autostart only after a host reboot, not after a
   container restart, and if the ID cannot be read they never autostart
   (logged), except a service with no state file, which has never run here.
-  Accepted trade-offs: an empty boot ID is cached for the life of the process,
+  The boot-ID gate and the save-time boot-ID rule only matter for process
+  backends; systemctl and launchctl backends are unaffected. Accepted
+  trade-offs: an empty boot ID is cached for the life of the process,
   a replacement whose predecessor's save failed loads its boot ID from
   whatever the file holds, and the boot ID is recorded from three places (the
   startup op / operator ops, normal construction, and the save-time rule).
@@ -377,7 +382,11 @@ behaviour on main.
   second. The result is three-state: verified, mismatch (a different process
   or gone), or unknown (the pid is alive but a lookup failed). `TryAdopt`
   adopts only on verified; on unknown it neither adopts nor lets autostart run
-  (logged with the pid), so no duplicate is started; `cleanOrphans` kills only
+  (logged with the pid), so no duplicate is started; the unverified record is
+  kept in later saves, marked `unverified` so that it is re-evaluated even though the service status saved with it is "stopped", (until the backend starts a process) so each
+  restart re-evaluates it; a lookup that fails because the process exited in
+  the meantime is a mismatch; on the legacy path an unreadable boot time skips
+  that check and the CreateTime comparison decides. `cleanOrphans` kills only
   on verified. A record with no identity data at all is accepted, as on main.
   There
   are no jitter or clock-step thresholds. `adopt: true` is
@@ -387,8 +396,9 @@ behaviour on main.
   `kill(-1, 0)` address whole process groups; this covers `TryAdopt`,
   `cleanOrphans`, `isRunning` and `pollAlive`, and `cleanOrphans` also needs
   `PID > 0` and `PGID > 0`.
-- [x] **F** — `ProcessBackend.TryAdopt` returns `(adopted bool, msg string)`;
-  the autostart decision branches on the bool, not a message prefix. A record
+- [x] **F** — `ProcessBackend.TryAdopt` returns `(outcome, msg string)`;
+  the autostart decision branches on the outcome, not a message prefix. `TryAdopt` now returns a three-state outcome
+  (adopted, not adopted, identity unknown) rather than a bool. A record
   with a non-positive pid is never adopted.
 - [x] **G** — `reconnect.RunWithBackoff` resets the delay to `InitialDelay`
   when an attempt ran for at least `MaxDelay` before failing; its doc comment

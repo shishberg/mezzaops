@@ -9,9 +9,9 @@ import (
 var bootIDRead = bootID
 
 var (
-	bootIDMu    sync.Mutex // guards bootIDOnce and bootIDValue
-	bootIDOnce  sync.Once
-	bootIDValue string
+	bootIDMu     sync.Mutex // guards bootIDLoaded and bootIDValue
+	bootIDLoaded bool
+	bootIDValue  string
 )
 
 // cachedBootID returns the platform boot ID, read once per process (even
@@ -20,12 +20,13 @@ var (
 func cachedBootID() string {
 	bootIDMu.Lock()
 	defer bootIDMu.Unlock()
-	bootIDOnce.Do(func() {
+	if !bootIDLoaded {
 		bootIDValue = bootIDRead()
+		bootIDLoaded = true
 		if bootIDValue == "" {
 			log.Printf("cannot read the host boot ID; adopt: false services that have run before will not be autostarted")
 		}
-	})
+	}
 	return bootIDValue
 }
 

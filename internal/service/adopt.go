@@ -70,6 +70,15 @@ func isGone(err error) bool {
 // process that still exists is verifyUnknown; a vanished process is a
 // mismatch.
 func verifyProcessResult(ps processBackendState) verifyResult {
+	// lookupFailed classifies a failed lookup: if the process has since
+	// exited it is gone (mismatch); otherwise its identity is unknown.
+	lookupFailed := func(err error) verifyResult {
+		if isGone(err) || !isAliveFn(ps.PID) {
+			return verifyMismatch
+		}
+		return verifyUnknown
+	}
+
 	if cur := bootIDFn(); ps.BootID != "" && cur != "" {
 		if ps.BootID != cur {
 			return verifyMismatch
@@ -79,35 +88,23 @@ func verifyProcessResult(ps processBackendState) verifyResult {
 			switch {
 			case err == nil && id == ps.StartID:
 				return verifyVerified
-			case err == nil, isGone(err):
+			case err == nil:
 				return verifyMismatch
 			default:
-				return verifyUnknown
+				return lookupFailed(err)
 			}
 		}
 	} else if ps.BootTime != 0 {
-		bootTime, err := host.BootTime()
-		if err != nil {
-			return verifyUnknown
-		}
-		if !sameBoot(int64(bootTime), ps.BootTime) {
+		// If the boot time cannot be read, skip this check and rely on the
+		// CreateTime comparison below.
+		if bootTime, err := bootTimeFn(); err == nil && !sameBoot(bootTime, ps.BootTime) {
 			return verifyMismatch
 		}
 	}
 	if ps.CreateTime != 0 {
-		p, err := process.NewProcess(int32(ps.PID))
+		createTime, err := createTimeFn(ps.PID)
 		if err != nil {
-			if isGone(err) {
-				return verifyMismatch
-			}
-			return verifyUnknown
-		}
-		createTime, err := p.CreateTime()
-		if err != nil {
-			if isGone(err) {
-				return verifyMismatch
-			}
-			return verifyUnknown
+			return lookupFailed(err)
 		}
 		delta := createTime - ps.CreateTime
 		if delta < 0 {
@@ -119,6 +116,26 @@ func verifyProcessResult(ps processBackendState) verifyResult {
 	}
 	return verifyVerified
 }
+
+// Seams for the platform lookups, so tests can drive verification
+// deterministically.
+var (
+	// createTimeFn returns the process creation time in milliseconds.
+	createTimeFn = func(pid int) (int64, error) {
+		p, err := process.NewProcess(int32(pid))
+		if err != nil {
+			return 0, err
+		}
+		return p.CreateTime()
+	}
+	// bootTimeFn returns the host boot time in unix seconds.
+	bootTimeFn = func() (int64, error) {
+		bt, err := host.BootTime()
+		return int64(bt), err
+	}
+	// isAliveFn reports whether a pid exists.
+	isAliveFn = IsAlive
+)
 
 // VerifyProcess reports whether the record is positively the live process.
 // An unknown result is not verified (cleanOrphans, for one, must not kill on

@@ -195,8 +195,8 @@ func TestProcessBackend_TryAdoptDisabled(t *testing.T) {
 	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", logDir)
 	b.adopt = false
 
-	adopted, msg := b.TryAdopt()
-	if adopted {
+	outcome, msg := b.TryAdopt()
+	if outcome == adoptYes {
 		t.Fatalf("TryAdopt reported adopted=true: %q", msg)
 	}
 	if !strings.Contains(msg, "adoption disabled") {
@@ -210,8 +210,8 @@ func TestProcessBackend_TryAdoptNoRestoredState(t *testing.T) {
 	b.adopt = true
 
 	// No RestoreBackendState called, so restoredState is nil
-	adopted, msg := b.TryAdopt()
-	if adopted {
+	outcome, msg := b.TryAdopt()
+	if outcome == adoptYes {
 		t.Fatalf("TryAdopt reported adopted=true: %q", msg)
 	}
 	if !strings.Contains(msg, "no state to adopt") {
@@ -359,8 +359,8 @@ func TestProcessBackend_TryAdoptStopped(t *testing.T) {
 	b.restoredState = &processBackendState{}
 	b.restoredStatus = "stopped"
 
-	adopted, msg := b.TryAdopt()
-	if adopted {
+	outcome, msg := b.TryAdopt()
+	if outcome == adoptYes {
 		t.Fatalf("TryAdopt reported adopted=true: %q", msg)
 	}
 	if !strings.Contains(msg, "stopped") {
@@ -380,8 +380,8 @@ func TestProcessBackend_TryAdoptStalePID(t *testing.T) {
 	}
 	b.restoredStatus = "running"
 
-	adopted, msg := b.TryAdopt()
-	if adopted {
+	outcome, msg := b.TryAdopt()
+	if outcome == adoptYes {
 		t.Fatalf("TryAdopt reported adopted=true: %q", msg)
 	}
 	if !strings.Contains(msg, "stale pid") {

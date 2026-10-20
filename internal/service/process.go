@@ -10,9 +10,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/shirou/gopsutil/v3/host"
-	"github.com/shirou/gopsutil/v3/process"
 )
 
 // processBackendState holds the backend-specific state for a ProcessBackend.
@@ -27,6 +24,10 @@ type processBackendState struct {
 	// start ticks since boot on Linux, creation time on macOS. Together with
 	// BootID it identifies the process; zero means unknown (legacy record).
 	StartID int64 `json:"start_id,omitempty"`
+	// Unverified marks a record kept for a live process whose identity could
+	// not be verified (see TryAdopt). It is re-evaluated even though the
+	// service status saved with it is "stopped".
+	Unverified bool `json:"unverified,omitempty"`
 }
 
 // ProcessBackend manages a service as a child process with process adoption
@@ -39,7 +40,10 @@ type ProcessBackend struct {
 	logDir     string
 	adopt      bool // whether to attempt process adoption
 
-	identityUnknown bool // set by TryAdopt: alive pid, identity could not be verified
+	// unknownRecord is the restored record of a live process whose identity
+	// could not be verified. While no process is tracked, SaveBackendState
+	// keeps returning it so each restart re-evaluates it. Cleared by Start.
+	unknownRecord *processBackendState
 
 	mu      sync.Mutex
 	pid     int
@@ -105,6 +109,7 @@ func (p *ProcessBackend) Start(ctx context.Context) error {
 	}
 
 	pid := cmd.Process.Pid
+	p.unknownRecord = nil
 	p.pid = pid
 	p.pgid = pid
 	p.process = cmd
@@ -213,8 +218,16 @@ func (p *ProcessBackend) SaveBackendState() json.RawMessage {
 	pid := p.pid
 	pgid := p.pgid
 	logPath := p.logPath
+	unknown := p.unknownRecord
 	p.mu.Unlock()
 
+	// A live process whose identity could not be verified is not tracked,
+	// but its record is kept unchanged so every restart re-evaluates it.
+	if pid == 0 && unknown != nil {
+		if data, err := json.Marshal(unknown); err == nil {
+			return data
+		}
+	}
 	return saveBackendStateFromFields(pid, pgid, logPath)
 }
 
@@ -228,14 +241,12 @@ func saveBackendStateFromFields(pid, pgid int, logPath string) json.RawMessage {
 		PGID:    pgid,
 		LogPath: logPath,
 	}
-	if bootTime, err := host.BootTime(); err == nil {
-		ps.BootTime = int64(bootTime)
+	if bootTime, err := bootTimeFn(); err == nil {
+		ps.BootTime = bootTime
 	}
 	ps.BootID = bootIDFn()
-	if proc, err := process.NewProcess(int32(pid)); err == nil {
-		if ct, err := proc.CreateTime(); err == nil {
-			ps.CreateTime = ct
-		}
+	if ct, err := createTimeFn(pid); err == nil {
+		ps.CreateTime = ct
 	}
 	if startIDIsCreateTime {
 		ps.StartID = ps.CreateTime // already looked up above
@@ -285,45 +296,65 @@ func (p *ProcessBackend) RestoreBackendState(fullStateJSON json.RawMessage) {
 	p.restoredState = &ps
 }
 
+// adoptOutcome is the result of TryAdopt.
+type adoptOutcome int
+
+const (
+	// adoptNo: nothing was adopted (adoption disabled, stale or reused pid,
+	// stopped, or no state); the caller may autostart.
+	adoptNo adoptOutcome = iota
+	// adoptYes: a live process was adopted.
+	adoptYes
+	// adoptUnknown: a live process exists but its identity could not be
+	// verified; it was not adopted and the caller must not autostart.
+	adoptUnknown
+)
+
 // TryAdopt attempts to re-adopt a process from a previous session using
-// the restored state. It reports whether a live process was adopted and a
+// the restored state. It reports the outcome (see adoptOutcome) and a
 // human-readable description of what happened.
-func (p *ProcessBackend) TryAdopt() (adopted bool, msg string) {
+func (p *ProcessBackend) TryAdopt() (adoptOutcome, string) {
 	if !p.adopt {
-		return false, "adoption disabled"
+		return adoptNo, "adoption disabled"
 	}
 
 	if p.restoredState == nil {
-		return false, "no state to adopt"
+		return adoptNo, "no state to adopt"
 	}
 
 	ps := *p.restoredState
 
-	// Desired state is stopped -- respect it
-	if p.restoredStatus == "stopped" {
-		return false, "stopped (preserved from previous session)"
+	// Desired state is stopped -- respect it (but a record kept for an
+	// unverified live process is re-evaluated: its status is "stopped"
+	// only because nothing is tracked).
+	if p.restoredStatus == "stopped" && !ps.Unverified {
+		return adoptNo, "stopped (preserved from previous session)"
 	}
 
 	// No pid recorded: nothing to adopt. (kill(0, 0) would signal our own
 	// process group and report it alive.)
 	if ps.PID <= 0 {
-		return false, "no pid to adopt"
+		return adoptNo, "no pid to adopt"
 	}
 
 	// PID is dead -- process crashed while we were down
 	if !IsAlive(ps.PID) {
-		return false, fmt.Sprintf("stale pid %d (process dead)", ps.PID)
+		return adoptNo, fmt.Sprintf("stale pid %d (process dead)", ps.PID)
 	}
 
 	// PID is alive but belongs to a different process (reboot or PID reuse)
 	switch verifyProcessResult(ps) {
 	case verifyMismatch:
-		return false, fmt.Sprintf("pid %d reused by different process", ps.PID)
+		return adoptNo, fmt.Sprintf("pid %d reused by different process", ps.PID)
 	case verifyUnknown:
 		// Alive, but whether it is ours could not be determined. Neither
 		// adopt it nor let autostart start a duplicate.
-		p.identityUnknown = true
-		return false, fmt.Sprintf("pid %d is alive but its identity could not be verified; not adopting it and not autostarting", ps.PID)
+		p.mu.Lock()
+		rec := ps
+		rec.Unverified = true
+		p.unknownRecord = &rec
+		p.mu.Unlock()
+		return adoptUnknown, fmt.Sprintf("pid %d is alive but its identity could not be verified; not adopting it and not autostarting", ps.PID)
 	}
 
 	// PID is alive and verified -- adopt it
@@ -339,12 +370,8 @@ func (p *ProcessBackend) TryAdopt() (adopted bool, msg string) {
 	// Poll since we can't cmd.Wait() on a process we didn't spawn
 	go p.pollAlive(ps.PID, done)
 
-	return true, fmt.Sprintf("adopted (pid %d)", ps.PID)
+	return adoptYes, fmt.Sprintf("adopted (pid %d)", ps.PID)
 }
-
-// IdentityUnknown reports whether TryAdopt found a live process whose
-// identity could not be verified.
-func (p *ProcessBackend) IdentityUnknown() bool { return p.identityUnknown }
 
 // processBackend lets wrappers embedding *ProcessBackend be recognised as
 // process-backed (see asProcessBackend).

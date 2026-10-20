@@ -271,7 +271,8 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 	adopt := svc.ShouldAdopt()
 	if pb, ok := asProcessBackend(backend); ok {
 		pb.adopt = adopt
-		adopted, msg := pb.TryAdopt()
+		outcome, msg := pb.TryAdopt()
+		adopted := outcome == adoptYes
 		log.Printf("**%s**: %s", svc.Name, msg)
 
 		// C1: if adoption did not result in a running process and
@@ -286,7 +287,7 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 		// adopt: false a surviving child from the previous mezzaops would be
 		// duplicated, so autostart only after a host reboot (no child can
 		// have survived one); see rebootedSince.
-		if pb.IdentityUnknown() {
+		if outcome == adoptUnknown {
 			log.Printf("**%s**: not autostarting: a process from the previous run is alive but could not be verified", svc.Name)
 		} else if !adopted && !replacing && svc.ShouldAutostart(startOnBoot) {
 			if (persistedDesired != "stopped" || svc.AutostartForce) &&
@@ -789,12 +790,19 @@ func (m *Manager) saveServiceState(ms *managedService) {
 	// SaveBackendState and Status may inspect processes; keep them outside
 	// stateMu.
 	backendState := ms.backend.SaveBackendState()
-	// Status is needed for the live status of a normal save and, for a
-	// process backend (where it is cheap), for the boot ID rule below.
+
+	// One snapshot decides both what is persisted and whether the live
+	// status replaces it, so a concurrent enqueueDeploy setting "deploying"
+	// cannot be overwritten with a stale live status.
 	ms.stateMu.Lock()
-	curStatus := ms.state.Status
+	snap := ms.state
 	ms.stateMu.Unlock()
-	needLive := curStatus != "deploying" && curStatus != "failed"
+	needLive := snap.Status != "deploying" && snap.Status != "failed"
+
+	// Status is needed for the live status of a normal save and, for a
+	// process backend (where it is cheap), for the boot ID rule below. The
+	// boot ID gate only matters for process backends, so other backends
+	// are not asked while deploying.
 	_, isProcess := asProcessBackend(ms.backend)
 	var liveStatus string
 	statusErr := errors.New("status not queried")
@@ -806,21 +814,18 @@ func (m *Manager) saveServiceState(ms *managedService) {
 	if statusErr == nil && liveStatus == "running" {
 		m.recordBoot(ms)
 	}
-	ms.stateMu.Lock()
+
 	state := State{
-		Status:        ms.state.Status,
-		DesiredStatus: ms.state.DesiredStatus,
-		LastDeploy:    ms.state.LastDeploy,
-		LastRestart:   ms.state.LastRestart,
-		LastResult:    ms.state.LastResult,
-		LastOutput:    ms.state.LastOutput,
-		FailedStep:    ms.state.FailedStep,
+		Status:        snap.Status,
+		DesiredStatus: snap.DesiredStatus,
+		LastDeploy:    snap.LastDeploy,
+		LastRestart:   snap.LastRestart,
+		LastResult:    snap.LastResult,
+		LastOutput:    snap.LastOutput,
+		FailedStep:    snap.FailedStep,
 		Backend:       backendState,
 		BootID:        ms.recordedBootID,
 	}
-	ms.stateMu.Unlock()
-
-	// If status is not a special deploy state, query the backend for live status.
 	// We only overwrite Status, never DesiredStatus — the operator's last
 	// expressed intent must survive an unexpected process exit so C1
 	// autostart can distinguish "operator stopped" from "crashed".
