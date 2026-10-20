@@ -28,8 +28,12 @@ func sameBoot(a, b int64) bool {
 }
 
 // IsAlive checks whether a process with the given PID exists.
-// Returns true even if the process is owned by another user (EPERM).
+// Returns true even if the process is owned by another user (EPERM). A
+// non-positive pid is never alive.
 func IsAlive(pid int) bool {
+	if pid <= 0 {
+		return false // kill(0, 0) and kill(-1, 0) address whole process groups
+	}
 	err := syscall.Kill(pid, 0)
 	return err == nil || err == syscall.EPERM
 }

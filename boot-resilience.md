@@ -296,9 +296,13 @@ behaviour on main.
   reported through `DeployFailed`. State is saved before an op's reply is
   sent. If the stop fails, the old service stays in place, no replacement is
   created, and the error is returned from `Reload` (other services still
-  reload). The same applies when a service is removed. A service still waiting
-  on the cold-boot readiness gate serves Reload's internal stop immediately
-  (cancelling its pending startup op) while ordinary ops wait as before. A
+  reload). The same applies when a service is removed. The cold-boot startup op is a pending action in the
+  service loop's single select, not a separate wait: ops are served in order
+  the whole time, an operator start/stop/restart cancels the pending startup
+  op, and a deploy waits behind it as on main. The internal stop reports
+  "was running" as the backend running or a startup op still pending, so a
+  replacement created before readiness still gets its cold-boot start; a
+  failed internal stop leaves the loop live and the startup op pending. A
   deploy is forwarded to the specific replacement recorded at swap time, never
   to a later service with the same name. The replacement is created without cold-boot scheduling, is
   started if and only if the old service was running, and carries over the
@@ -324,7 +328,13 @@ behaviour on main.
   `adopt: false` never started anything at boot. If the boot time cannot be
   determined, or an existing saved state has none (or no state dir is
   configured), it is likewise not autostarted. `adopt: true` is unchanged:
-  adopt if possible, otherwise autostart. There is no orphan tracking.
+  adopt if possible, otherwise autostart. The no-state-file rule assumes the state dir is stable and writable;
+  state save errors are logged with the service name. There is no orphan
+  tracking.
+- [x] **IsAlive guard** — `IsAlive(pid <= 0)` is false, since `kill(0, 0)` and
+  `kill(-1, 0)` address whole process groups; this covers `TryAdopt`,
+  `cleanOrphans`, `isRunning` and `pollAlive`, and `cleanOrphans` also needs
+  `PID > 0` and `PGID > 0`.
 - [x] **F** — `ProcessBackend.TryAdopt` returns `(adopted bool, msg string)`;
   the autostart decision branches on the bool, not a message prefix. A record
   with a non-positive pid is never adopted.

@@ -364,18 +364,37 @@ func (m *Manager) serviceLoop(ms *managedService) {
 	retired := false
 	forwardDeploy := false
 
+	// The cold-boot startup op (see above) is a pending action: it runs
+	// when readiness fires, while opCh is served in order the whole time.
+	// readyC is nil (never ready in a select) unless it is pending.
+	startupOp := ""
+	var readyC <-chan struct{}
+	if ms.restartOnStartup {
+		startupOp = "restart"
+		if ms.autostartOnReady {
+			startupOp = "start"
+		}
+		readyC = m.readyCh
+	}
+	startupPending := func() bool { return readyC != nil }
+
 	// handle runs one queued op.
 	handle := func(op syncOp) {
 		if retired {
 			op.result <- reloadedMsg
 			return
 		}
+		// The operator's intent wins over a pending startup op.
+		if !op.internalStop && (op.op == "start" || op.op == "stop" || op.op == "restart") {
+			readyC = nil
+		}
 		var result string
 		if op.internalStop {
 			var snap reloadSnapshot
-			snap, result = m.internalStop(ms)
+			snap, result = m.internalStop(ms, startupPending())
 			if result == "stopped" {
 				retired = true
+				readyC = nil
 				if op.snap != nil {
 					*op.snap = snap
 				}
@@ -398,10 +417,7 @@ func (m *Manager) serviceLoop(ms *managedService) {
 	}
 
 	// exit answers anything still queued and hands a pending deploy on.
-	exit := func(stashed []syncOp) {
-		for _, op := range stashed {
-			op.result <- m.goneMsg()
-		}
+	exit := func() {
 		m.drainOps(ms)
 		if len(ms.deployCh) > 0 {
 			forwardDeploy = true
@@ -413,56 +429,32 @@ func (m *Manager) serviceLoop(ms *managedService) {
 		}
 	}
 
-	if ms.restartOnStartup {
-		op := "restart"
-		if ms.autostartOnReady {
-			op = "start"
-		}
-		// Wait for readiness. As on main, ordinary ops wait behind the
-		// startup op (they are held, in order, and run afterwards); only
-		// Reload's internal stop is served at once, cancelling the startup
-		// op, so a reload is not held up by a slow readiness wait.
-		var stashed []syncOp
-		skipStartup := false
-	wait:
-		for {
-			select {
-			case <-m.readyCh:
-				break wait
-			case queued := <-ms.opCh:
-				if queued.internalStop {
-					handle(queued)
-					skipStartup = true
-					break wait
-				}
-				stashed = append(stashed, queued)
-			case <-ms.ctx.Done():
-				exit(stashed)
-				return
-			}
-		}
-		if !skipStartup {
-			log.Printf("**%s**: cold-boot op %q (adopt: false / autostart)", ms.config.Name, op)
-			result := m.handleOp(ms, op)
-			log.Printf("**%s**: %s", ms.config.Name, result)
-			m.saveServiceState(ms)
-		}
-		for _, queued := range stashed {
-			handle(queued)
-		}
-	}
-
 	// Get the process exit channel if this is a ProcessBackend
 	if pb, ok := asProcessBackend(ms.backend); ok {
 		exitCh = pb.WaitForExit()
 	}
 
 	for {
+		// As on main, a deploy waits behind the pending startup op.
+		deployC := ms.deployCh
+		if startupPending() {
+			deployC = nil
+		}
 		select {
 		case op := <-ms.opCh:
 			handle(op)
 
-		case <-ms.deployCh:
+		case <-readyC:
+			readyC = nil
+			log.Printf("**%s**: cold-boot op %q (adopt: false / autostart)", ms.config.Name, startupOp)
+			result := m.handleOp(ms, startupOp)
+			log.Printf("**%s**: %s", ms.config.Name, result)
+			m.saveServiceState(ms)
+			if pb, ok := asProcessBackend(ms.backend); ok {
+				exitCh = pb.WaitForExit()
+			}
+
+		case <-deployC:
 			if retired || ms.ctx.Err() != nil {
 				// Reload is replacing or removing this service; never
 				// run the deploy here. It is handed on when the loop exits.
@@ -488,7 +480,7 @@ func (m *Manager) serviceLoop(ms *managedService) {
 			// busy-loop.
 
 		case <-ms.ctx.Done():
-			exit(nil)
+			exit()
 			return
 		}
 	}
@@ -561,9 +553,11 @@ func (m *Manager) drainOps(ms *managedService) {
 // internalStop stops the service for a reload and returns the state Reload
 // needs. It runs inside the service loop, so the snapshot cannot be made
 // stale by queued ops. Unlike "stop" it does not record operator intent.
-func (m *Manager) internalStop(ms *managedService) (reloadSnapshot, string) {
+func (m *Manager) internalStop(ms *managedService, startupPending bool) (reloadSnapshot, string) {
 	status, statusErr := ms.backend.Status(m.ctx)
-	wasRunning := statusErr == nil && status == "running"
+	// A pending cold-boot start counts as "was running": the replacement
+	// must still get it.
+	wasRunning := (statusErr == nil && status == "running") || startupPending
 	if err := ms.backend.Stop(m.ctx); err != nil {
 		return reloadSnapshot{}, fmt.Sprintf("stop failed: %v", err)
 	}
@@ -771,7 +765,9 @@ func (m *Manager) saveServiceState(ms *managedService) {
 		}
 	}
 
-	_ = SaveState(m.stateDir, ms.config.Name, state)
+	if err := SaveState(m.stateDir, ms.config.Name, state); err != nil {
+		log.Printf("**%s**: saving state: %v", ms.config.Name, err)
+	}
 }
 
 // notifyEvent calls the notifier and onChange callback.
@@ -1220,7 +1216,7 @@ func (m *Manager) cleanOrphans() {
 		} else {
 			_ = json.Unmarshal(raw, &ps)
 		}
-		if ps.PID != 0 && ps.PGID > 0 && IsAlive(ps.PID) && VerifyProcess(ps) {
+		if ps.PID > 0 && ps.PGID > 0 && IsAlive(ps.PID) && VerifyProcess(ps) {
 			_ = killFn(-ps.PGID, syscall.SIGKILL)
 		}
 		RemoveState(m.stateDir, name)

@@ -1,9 +1,11 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2479,31 +2481,127 @@ func TestManager_ReloadDuringReadinessWaitReturnsPromptly(t *testing.T) {
 	}
 }
 
-func TestManager_OpsWaitForReadinessAsOnMain(t *testing.T) {
+// pendingStartupManager builds a manager with one autostart service whose
+// cold-boot start is pending on readiness (no SignalReady yet). With a
+// factory the backend can be wrapped.
+func pendingStartupManager(t *testing.T, factory func(config.ServiceConfig) Backend) (*Manager, *config.Config, string, func(extra string)) {
+	t.Helper()
+	servicesDir := t.TempDir()
+	svcPath := filepath.Join(servicesDir, "svc1.yaml")
+	write := func(extra string) {
+		data := "dir: /tmp\nautostart: true\nentrypoint:\n  - sleep\n  - \"3600\"\n" + extra
+		if err := os.WriteFile(svcPath, []byte(data), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("")
 	cfg := testConfig(t)
-	yes := true
-	svc := autostartService("svc1", t.TempDir(), &yes)
-	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	cfg.ServicesDir = servicesDir
+	services, _ := config.LoadServices(servicesDir)
+	m, err := newManager(cfg, services, NopNotifier{}, factory)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer m.Stop()
+	t.Cleanup(m.Stop)
+	return m, cfg, svcPath, write
+}
 
-	statusDone := make(chan string, 1)
-	go func() { statusDone <- m.Do("svc1", "status") }()
+func TestManager_OpsServedInOrderBeforeReadiness(t *testing.T) {
+	m, _, _, _ := pendingStartupManager(t, nil)
+
+	done := make(chan string, 1)
+	go func() { done <- m.Do("svc1", "status") }()
 	select {
-	case got := <-statusDone:
-		t.Fatalf("op ran before readiness: %q", got)
-	case <-time.After(300 * time.Millisecond):
+	case got := <-done:
+		if got != "stopped" {
+			t.Fatalf("status before readiness: got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("op was not served while the startup op waits for readiness")
+	}
+}
+
+func TestManager_OperatorOpBeforeReadinessCancelsStartup(t *testing.T) {
+	m, _, _, _ := pendingStartupManager(t, nil)
+
+	done := make(chan string, 1)
+	go func() { done <- m.Do("svc1", "stop") }()
+	select {
+	case got := <-done:
+		if got != "stopped" {
+			t.Fatalf("stop before readiness: got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("operator stop was not served before readiness")
 	}
 	m.SignalReady()
+	time.Sleep(300 * time.Millisecond)
+	if got := m.Do("svc1", "status"); got != "stopped" {
+		t.Fatalf("operator stop must cancel the pending startup op, status %q", got)
+	}
+}
+
+func TestManager_ReloadBeforeReadinessKeepsColdBootStart(t *testing.T) {
+	m, _, _, write := pendingStartupManager(t, nil)
+
+	write("branch: other\n")
+	reloadDone := make(chan error, 1)
+	go func() { reloadDone <- m.Reload() }()
 	select {
-	case got := <-statusDone:
-		if got != "running" {
-			t.Fatalf("op after readiness: got %q, want running (autostart first)", got)
+	case err := <-reloadDone:
+		if err != nil {
+			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("op never ran after readiness")
+	case <-time.After(3 * time.Second):
+		t.Fatal("Reload blocked before readiness")
+	}
+	m.SignalReady()
+	waitForStatus(t, m, "svc1", "running")
+}
+
+func TestManager_FailedReloadStopBeforeReadinessKeepsStartup(t *testing.T) {
+	var fail atomic.Bool
+	logDir := t.TempDir()
+	factory := func(svc config.ServiceConfig) Backend {
+		pb := NewProcessBackend(svc.Name, svc.Dir, svc.Entrypoint, svc.Process.Cmd, logDir)
+		return failingStopBackend{ProcessBackend: pb, fail: &fail}
+	}
+	m, _, _, write := pendingStartupManager(t, factory)
+
+	fail.Store(true)
+	write("branch: other\n")
+	if err := m.Reload(); err == nil {
+		t.Fatal("expected Reload to report the failed stop")
+	}
+	fail.Store(false)
+	m.SignalReady()
+	waitForStatus(t, m, "svc1", "running") // the startup op is still pending and runs
+}
+
+func TestManager_OperatorStopQueuedBeforeReloadIsAppliedInOrder(t *testing.T) {
+	m, _, _, write := pendingStartupManager(t, nil)
+	m.mu.Lock()
+	old := m.services["svc1"]
+	m.mu.Unlock()
+
+	stop := syncOp{op: "stop", result: make(chan string, 1)}
+	old.opCh <- stop
+	write("branch: other\n")
+	reloadDone := make(chan error, 1)
+	go func() { reloadDone <- m.Reload() }()
+	if got := <-stop.result; got != "stopped" {
+		t.Fatalf("operator stop queued before the reload: got %q, want it applied", got)
+	}
+	if err := <-reloadDone; err != nil {
+		t.Fatal(err)
+	}
+	m.SignalReady()
+	time.Sleep(300 * time.Millisecond)
+	if got := m.Do("svc1", "status"); got != "stopped" {
+		t.Fatalf("replacement started despite the operator stop: %q", got)
+	}
+	if d := m.GetAllStates()["svc1"].DesiredStatus; d != "stopped" {
+		t.Fatalf("DesiredStatus: got %q, want stopped", d)
 	}
 }
 
@@ -2559,5 +2657,58 @@ func TestForwardDeploy_GoesToSuccessorNotSameNameService(t *testing.T) {
 	m.forwardDeploy(first)
 	if len(second.deployCh) != 1 {
 		t.Fatal("deploy did not follow the successor chain")
+	}
+}
+
+func TestIsAlive_RejectsNonPositivePids(t *testing.T) {
+	for _, pid := range []int{0, -1, -12345} {
+		if IsAlive(pid) {
+			t.Errorf("IsAlive(%d) must be false (kill would signal a group or everything)", pid)
+		}
+	}
+}
+
+func TestCleanOrphans_NeverKillsWithNonPositivePid(t *testing.T) {
+	cfg := testConfig(t)
+	raw, _ := json.Marshal(processBackendState{PID: -1, PGID: 4242})
+	if err := SaveState(cfg.StateDir, "gone", State{Status: "running", Backend: raw}); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	orig := killFn
+	killFn = func(int, syscall.Signal) error { calls.Add(1); return nil }
+	t.Cleanup(func() { killFn = orig })
+
+	m, err := NewManager(cfg, nil, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	if calls.Load() != 0 {
+		t.Fatal("cleanOrphans killed on a record with pid -1")
+	}
+}
+
+func TestManager_SaveStateErrorIsLogged(t *testing.T) {
+	cfg := testConfig(t)
+	m, err := NewManager(cfg, []config.ServiceConfig{sleepService("svc", t.TempDir())}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	// Make the state dir unusable: replace it with a regular file.
+	if err := os.RemoveAll(cfg.StateDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg.StateDir, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	m.Do("svc", "start")
+	if out := buf.String(); !strings.Contains(out, "**svc**") || !strings.Contains(out, "saving state") {
+		t.Fatalf("a failed state save must be logged with the service name, got: %q", out)
 	}
 }
