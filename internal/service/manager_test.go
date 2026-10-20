@@ -2351,3 +2351,213 @@ func TestNewManager_AdoptFalseAutostartsWhenNoStateFileExists(t *testing.T) {
 	m.SignalReady()
 	waitForStatus(t, m, "testsvc", "running")
 }
+
+// --- boot-time tolerance ---
+
+func TestRebootedSince_ToleratesJitter(t *testing.T) {
+	// gopsutil derives boot time from now minus uptime, so consecutive
+	// reads can differ by about a second without a reboot.
+	const boot = int64(1_700_000_000)
+	orig := bootTimeFn
+	bootTimeFn = func() int64 { return boot }
+	t.Cleanup(func() { bootTimeFn = orig })
+	m := &Manager{}
+
+	for _, c := range []struct {
+		name  string
+		saved int64
+		want  bool
+	}{
+		{"same", boot, false},
+		{"one second later", boot + 1, false},
+		{"one second earlier", boot - 1, false},
+		{"real reboot", boot - 100, true},
+	} {
+		if got := m.rebootedSince("svc", c.saved); got != c.want {
+			t.Errorf("%s: rebootedSince = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestVerifyProcess_ToleratesBootTimeJitter(t *testing.T) {
+	bt, err := host.BootTime()
+	if err != nil {
+		t.Skip(err)
+	}
+	for _, delta := range []int64{-1, 1} {
+		if !VerifyProcess(processBackendState{PID: os.Getpid(), BootTime: int64(bt) + delta}) {
+			t.Errorf("boot time off by %d must still verify the same boot", delta)
+		}
+	}
+	if VerifyProcess(processBackendState{PID: os.Getpid(), BootTime: int64(bt) - 100}) {
+		t.Error("a different boot time must not verify")
+	}
+}
+
+func TestProcessBackend_TryAdoptRejectsNonPositivePid(t *testing.T) {
+	for _, pid := range []int{0, -1} {
+		b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", t.TempDir())
+		b.adopt = true
+		b.restoredState = &processBackendState{PID: pid}
+		b.restoredStatus = "running"
+		if adopted, msg := b.TryAdopt(); adopted {
+			t.Errorf("pid %d adopted: %q", pid, msg)
+		}
+	}
+}
+
+func TestManager_ReloadAbortsRemovalWhenStopFails(t *testing.T) {
+	var fail atomic.Bool
+	logDir := t.TempDir()
+	factory := func(svc config.ServiceConfig) Backend {
+		pb := NewProcessBackend(svc.Name, svc.Dir, svc.Entrypoint, svc.Process.Cmd, logDir)
+		return failingStopBackend{ProcessBackend: pb, fail: &fail}
+	}
+	m, cfg, _ := reloadFixtureWith(t, "", factory, NopNotifier{})
+	m.Do("svc1", "start")
+	waitForStatus(t, m, "svc1", "running")
+	m.mu.Lock()
+	old := m.services["svc1"]
+	m.mu.Unlock()
+
+	fail.Store(true)
+	if err := os.Remove(filepath.Join(cfg.ServicesDir, "svc1.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	err := m.Reload()
+	if err == nil || !strings.Contains(err.Error(), "svc1") {
+		t.Fatalf("expected Reload to report the failed stop, got %v", err)
+	}
+	m.mu.Lock()
+	current := m.services["svc1"]
+	m.mu.Unlock()
+	if current != old || old.ctx.Err() != nil {
+		t.Fatal("a service whose stop failed must stay in place and keep running its loop")
+	}
+	fail.Store(false)
+}
+
+func TestManager_ReloadDuringReadinessWaitReturnsPromptly(t *testing.T) {
+	servicesDir := t.TempDir()
+	svcPath := filepath.Join(servicesDir, "svc1.yaml")
+	base := "dir: /tmp\nautostart: true\nentrypoint:\n  - sleep\n  - \"3600\"\n"
+	if err := os.WriteFile(svcPath, []byte(base), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(t)
+	cfg.ServicesDir = servicesDir
+	services, _ := config.LoadServices(servicesDir)
+	m, err := NewManager(cfg, services, NopNotifier{}) // no state: autostart is pending on readyCh
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop() // also unblocks anything left waiting
+
+	// An ordinary op waits behind the pending startup, as on main.
+	statusDone := make(chan string, 1)
+	go func() { statusDone <- m.Do("svc1", "status") }()
+
+	if err := os.WriteFile(svcPath, []byte(base+"branch: other\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	reloadDone := make(chan error, 1)
+	go func() { reloadDone <- m.Reload() }()
+	select {
+	case err := <-reloadDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Reload blocked behind the readiness wait")
+	}
+	// The ordinary op was queued on the old service and must be answered,
+	// not left hanging.
+	select {
+	case <-statusDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("op queued during the readiness wait was never answered")
+	}
+}
+
+func TestManager_OpsWaitForReadinessAsOnMain(t *testing.T) {
+	cfg := testConfig(t)
+	yes := true
+	svc := autostartService("svc1", t.TempDir(), &yes)
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	statusDone := make(chan string, 1)
+	go func() { statusDone <- m.Do("svc1", "status") }()
+	select {
+	case got := <-statusDone:
+		t.Fatalf("op ran before readiness: %q", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+	m.SignalReady()
+	select {
+	case got := <-statusDone:
+		if got != "running" {
+			t.Fatalf("op after readiness: got %q, want running (autostart first)", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("op never ran after readiness")
+	}
+}
+
+// --- deploy forwarding targets the specific successor ---
+
+func TestForwardDeploy_GoesToSuccessorNotSameNameService(t *testing.T) {
+	rec := &recordingNotifier{}
+	cfg := testConfig(t)
+	m, err := NewManager(cfg, []config.ServiceConfig{sleepService("svc1", t.TempDir())}, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	newMS := func() *managedService {
+		ctx, cancel := context.WithCancel(m.ctx)
+		return &managedService{config: config.ServiceConfig{Name: "svc1"}, deployCh: make(chan struct{}, 1), ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	}
+	m.mu.Lock()
+	current := m.services["svc1"] // a later service with the same name
+	m.mu.Unlock()
+
+	// Retired service with a recorded successor: deploy goes there.
+	successor := newMS()
+	retired := newMS()
+	retired.successor = successor
+	m.forwardDeploy(retired)
+	if len(successor.deployCh) != 1 {
+		t.Fatal("deploy was not forwarded to the recorded successor")
+	}
+	if len(current.deployCh) != 0 {
+		t.Fatal("deploy reached an unrelated service with the same name")
+	}
+
+	// Removed service (no successor): reported, and not given to the
+	// same-named service.
+	removed := newMS()
+	m.forwardDeploy(removed)
+	if len(current.deployCh) != 0 {
+		t.Fatal("deploy for a removed service reached a same-named service")
+	}
+	if len(rec.getDeployFailed()) != 1 {
+		t.Fatalf("removed service deploy should be reported once, got %d", len(rec.getDeployFailed()))
+	}
+
+	// A successor that was itself retired passes the deploy along.
+	second := newMS()
+	middle := newMS()
+	middle.successor = second
+	middle.cancel()
+	first := newMS()
+	first.successor = middle
+	m.forwardDeploy(first)
+	if len(second.deployCh) != 1 {
+		t.Fatal("deploy did not follow the successor chain")
+	}
+}

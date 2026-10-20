@@ -270,6 +270,13 @@ heuristic is still imperfect and the current behaviour is the
 safer one for cold-boot recovery. Documented inline in
 `newManagedService`.
 
+### F6 — adopt:false and an untracked surviving child
+
+After a mezzaops restart without a host reboot, an `adopt: false` service is
+not autostarted, but an untracked surviving child is not guarded against a
+duplicate start by an operator start or a deploy. This is pre-existing
+behaviour on main.
+
 ## Review fixes (post-implementation)
 
 - [x] **F2** — `Manager.Reload` is serialized by a mutex and stops a changed
@@ -289,7 +296,11 @@ safer one for cold-boot recovery. Documented inline in
   reported through `DeployFailed`. State is saved before an op's reply is
   sent. If the stop fails, the old service stays in place, no replacement is
   created, and the error is returned from `Reload` (other services still
-  reload). The replacement is created without cold-boot scheduling, is
+  reload). The same applies when a service is removed. A service still waiting
+  on the cold-boot readiness gate serves Reload's internal stop immediately
+  (cancelling its pending startup op) while ordinary ops wait as before. A
+  deploy is forwarded to the specific replacement recorded at swap time, never
+  to a later service with the same name. The replacement is created without cold-boot scheduling, is
   started if and only if the old service was running, and carries over the
   old desired state.
 - [x] **F3** — `handleOp` start/restart record `DesiredStatus="running"` when
@@ -301,7 +312,10 @@ safer one for cold-boot recovery. Documented inline in
 - [x] **E** — An `adopt: false` service is autostarted only on a real cold
   boot: the host boot time (gopsutil `host.BootTime`, recorded in the service
   state on every save as `boot_time`) must differ from the one in the saved
-  state. After a host reboot no child can have survived, so there is no
+  state by more than 10 seconds (gopsutil derives boot time from now minus
+  uptime, so reads jitter by about a second; the same tolerance is used by
+  `VerifyProcess`, and the first read is cached with
+  `host.EnableBootTimeCache`). After a host reboot no child can have survived, so there is no
   duplicate to avoid. A service with no state file at all in a configured
   state dir has never run here, so it is autostarted too. If mezzaops
   restarts without a host reboot, an `adopt: false` service is not
@@ -312,7 +326,8 @@ safer one for cold-boot recovery. Documented inline in
   configured), it is likewise not autostarted. `adopt: true` is unchanged:
   adopt if possible, otherwise autostart. There is no orphan tracking.
 - [x] **F** — `ProcessBackend.TryAdopt` returns `(adopted bool, msg string)`;
-  the autostart decision branches on the bool, not a message prefix.
+  the autostart decision branches on the bool, not a message prefix. A record
+  with a non-positive pid is never adopted.
 - [x] **G** — `reconnect.RunWithBackoff` resets the delay to `InitialDelay`
   when an attempt ran for at least `MaxDelay` before failing; its doc comment
   now says it retries until ctx is cancelled.

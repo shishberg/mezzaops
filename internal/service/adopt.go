@@ -7,6 +7,26 @@ import (
 	"github.com/shirou/gopsutil/v3/process"
 )
 
+func init() {
+	// gopsutil derives boot time from now minus uptime, truncated to seconds,
+	// so it can vary by about a second between calls. Cache the first read.
+	host.EnableBootTimeCache(true)
+}
+
+// bootTimeTolerance is how far apart two boot times (seconds) may be and
+// still count as the same boot, covering gopsutil's uptime-based jitter.
+const bootTimeTolerance = 10
+
+// sameBoot reports whether two host boot times (unix seconds) are the same
+// boot, allowing for jitter.
+func sameBoot(a, b int64) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d <= bootTimeTolerance
+}
+
 // IsAlive checks whether a process with the given PID exists.
 // Returns true even if the process is owned by another user (EPERM).
 func IsAlive(pid int) bool {
@@ -22,7 +42,7 @@ func IsAlive(pid int) bool {
 func VerifyProcess(ps processBackendState) bool {
 	if ps.BootTime != 0 {
 		bootTime, err := host.BootTime()
-		if err == nil && int64(bootTime) != ps.BootTime {
+		if err == nil && !sameBoot(int64(bootTime), ps.BootTime) {
 			return false
 		}
 	}

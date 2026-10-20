@@ -291,6 +291,12 @@ func (p *ProcessBackend) TryAdopt() (adopted bool, msg string) {
 		return false, "stopped (preserved from previous session)"
 	}
 
+	// No pid recorded: nothing to adopt. (kill(0, 0) would signal our own
+	// process group and report it alive.)
+	if ps.PID <= 0 {
+		return false, "no pid to adopt"
+	}
+
 	// PID is dead -- process crashed while we were down
 	if !IsAlive(ps.PID) {
 		return false, fmt.Sprintf("stale pid %d (process dead)", ps.PID)

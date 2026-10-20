@@ -72,6 +72,9 @@ type managedService struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+	// successor is the service Reload installed in place of this one; nil if
+	// it was removed. Set under Manager.mu.
+	successor *managedService
 
 	// state is only accessed from the service loop goroutine (no lock needed).
 	state ServiceState
@@ -298,7 +301,7 @@ func (m *Manager) rebootedSince(name string, savedBoot int64) bool {
 		log.Printf("**%s**: adopt: false, not autostarting: no host boot time recorded in the saved state", name)
 	case now == 0:
 		log.Printf("**%s**: adopt: false, not autostarting: cannot determine the current host boot time", name)
-	case now == savedBoot:
+	case sameBoot(now, savedBoot):
 		log.Printf("**%s**: adopt: false, not autostarting: mezzaops restarted without a host reboot, so the previous process may still be running", name)
 	default:
 		return true
@@ -354,66 +357,110 @@ func (m *Manager) serviceLoop(ms *managedService) {
 	// C2 retry loop; if SignalReady has not fired by the time
 	// frontends are working, the notification is still dropped
 	// silently — we do not block the cold boot on chat health).
+	var exitCh <-chan struct{}
+	// retired is set (loop-local) once an internal stop succeeds: Reload is
+	// replacing or removing this service, so nothing further may run on its
+	// backend.
+	retired := false
+	forwardDeploy := false
+
+	// handle runs one queued op.
+	handle := func(op syncOp) {
+		if retired {
+			op.result <- reloadedMsg
+			return
+		}
+		var result string
+		if op.internalStop {
+			var snap reloadSnapshot
+			snap, result = m.internalStop(ms)
+			if result == "stopped" {
+				retired = true
+				if op.snap != nil {
+					*op.snap = snap
+				}
+			}
+		} else {
+			result = m.handleOp(ms, op.op)
+		}
+
+		// Persist state after start/stop/restart, before replying, so
+		// a caller (notably Reload) that acts on the reply sees it.
+		if op.op == "start" || op.op == "stop" || op.op == "restart" || op.internalStop {
+			m.saveServiceState(ms)
+		}
+		op.result <- result
+
+		// Refresh exit channel after start/restart (new process, new done chan)
+		if pb, ok := asProcessBackend(ms.backend); ok {
+			exitCh = pb.WaitForExit()
+		}
+	}
+
+	// exit answers anything still queued and hands a pending deploy on.
+	exit := func(stashed []syncOp) {
+		for _, op := range stashed {
+			op.result <- m.goneMsg()
+		}
+		m.drainOps(ms)
+		if len(ms.deployCh) > 0 {
+			forwardDeploy = true
+		}
+		if forwardDeploy && m.ctx.Err() == nil {
+			// The only place a deploy is forwarded: to the recorded
+			// successor, or reported as failed if the service was removed.
+			m.forwardDeploy(ms)
+		}
+	}
+
 	if ms.restartOnStartup {
 		op := "restart"
 		if ms.autostartOnReady {
 			op = "start"
 		}
-		select {
-		case <-m.readyCh:
-		case <-ms.ctx.Done():
-			m.drainOps(ms)
-			return
+		// Wait for readiness. As on main, ordinary ops wait behind the
+		// startup op (they are held, in order, and run afterwards); only
+		// Reload's internal stop is served at once, cancelling the startup
+		// op, so a reload is not held up by a slow readiness wait.
+		var stashed []syncOp
+		skipStartup := false
+	wait:
+		for {
+			select {
+			case <-m.readyCh:
+				break wait
+			case queued := <-ms.opCh:
+				if queued.internalStop {
+					handle(queued)
+					skipStartup = true
+					break wait
+				}
+				stashed = append(stashed, queued)
+			case <-ms.ctx.Done():
+				exit(stashed)
+				return
+			}
 		}
-		log.Printf("**%s**: cold-boot op %q (adopt: false / autostart)", ms.config.Name, op)
-		result := m.handleOp(ms, op)
-		log.Printf("**%s**: %s", ms.config.Name, result)
-		m.saveServiceState(ms)
+		if !skipStartup {
+			log.Printf("**%s**: cold-boot op %q (adopt: false / autostart)", ms.config.Name, op)
+			result := m.handleOp(ms, op)
+			log.Printf("**%s**: %s", ms.config.Name, result)
+			m.saveServiceState(ms)
+		}
+		for _, queued := range stashed {
+			handle(queued)
+		}
 	}
 
 	// Get the process exit channel if this is a ProcessBackend
-	var exitCh <-chan struct{}
 	if pb, ok := asProcessBackend(ms.backend); ok {
 		exitCh = pb.WaitForExit()
 	}
 
-	// retired is set (loop-local) once an internal stop succeeds: Reload is
-	// replacing this service, so nothing further may run on its backend.
-	retired := false
-	forwardDeploy := false
-
 	for {
 		select {
 		case op := <-ms.opCh:
-			if retired {
-				op.result <- reloadedMsg
-				continue
-			}
-			var result string
-			if op.internalStop {
-				var snap reloadSnapshot
-				snap, result = m.internalStop(ms)
-				if result == "stopped" {
-					retired = true
-					if op.snap != nil {
-						*op.snap = snap
-					}
-				}
-			} else {
-				result = m.handleOp(ms, op.op)
-			}
-
-			// Persist state after start/stop/restart, before replying, so
-			// a caller (notably Reload) that acts on the reply sees it.
-			if op.op == "start" || op.op == "stop" || op.op == "restart" || op.internalStop {
-				m.saveServiceState(ms)
-			}
-			op.result <- result
-
-			// Refresh exit channel after start/restart (new process, new done chan)
-			if pb, ok := asProcessBackend(ms.backend); ok {
-				exitCh = pb.WaitForExit()
-			}
+			handle(op)
 
 		case <-ms.deployCh:
 			if retired || ms.ctx.Err() != nil {
@@ -441,22 +488,50 @@ func (m *Manager) serviceLoop(ms *managedService) {
 			// busy-loop.
 
 		case <-ms.ctx.Done():
-			m.drainOps(ms)
-			if len(ms.deployCh) > 0 {
-				forwardDeploy = true
-			}
-			if forwardDeploy && m.ctx.Err() == nil {
-				// This is the only place a deploy is forwarded. The
-				// replacement is installed before this context is
-				// cancelled, so the request reaches it; for a removed
-				// service there is none, and the failure is reported.
-				name := ms.config.Name
-				if err := m.RequestDeploy(name); err != nil {
-					m.notifier.DeployFailed(name, "reload", fmt.Sprintf("deploy was requested while the service was being reloaded and could not be run: %v", err))
-				}
-			}
+			exit(nil)
 			return
 		}
+	}
+}
+
+// forwardDeploy hands a deploy queued on a retiring service to the service
+// that replaced it, following the chain if that one was replaced as well.
+// A removed service has no successor, so the deploy is reported as failed.
+// It targets the recorded successor, never whatever service now has the same
+// name.
+func (m *Manager) forwardDeploy(ms *managedService) {
+	m.mu.Lock()
+	target := ms.successor
+	for target != nil && target.ctx.Err() != nil && target.successor != nil {
+		target = target.successor
+	}
+	if target != nil && target.ctx.Err() == nil {
+		enqueueDeploy(target)
+		m.mu.Unlock()
+		return
+	}
+	m.mu.Unlock()
+	name := ms.config.Name
+	m.notifier.DeployFailed(name, "reload", "deploy was requested while the service was being reloaded or removed and could not be run")
+}
+
+// enqueueDeploy marks ms as deploying and queues a deploy (latest-wins).
+func enqueueDeploy(ms *managedService) {
+	// Mark as deploying synchronously so callers see a non-idle state immediately.
+	ms.stateMu.Lock()
+	ms.state.Status = "deploying"
+	ms.stateMu.Unlock()
+
+	// Drain any pending deploy request (latest-wins).
+	select {
+	case <-ms.deployCh:
+	default:
+	}
+
+	// Non-blocking send.
+	select {
+	case ms.deployCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -759,24 +834,7 @@ func (m *Manager) RequestDeploy(name string) error {
 	if !ok {
 		return fmt.Errorf("service %q not found", name)
 	}
-
-	// Mark as deploying synchronously so callers see a non-idle state immediately.
-	ms.stateMu.Lock()
-	ms.state.Status = "deploying"
-	ms.stateMu.Unlock()
-
-	// Drain any pending deploy request (latest-wins).
-	select {
-	case <-ms.deployCh:
-	default:
-	}
-
-	// Non-blocking send.
-	select {
-	case ms.deployCh <- struct{}{}:
-	default:
-	}
-
+	enqueueDeploy(ms)
 	return nil
 }
 
@@ -857,6 +915,7 @@ func (m *Manager) Reload() error {
 				}
 				m.mu.Lock()
 				m.services[svc.Name] = ms
+				existing.successor = ms
 				m.mu.Unlock()
 				// Retire the old loop; queued and late ops get an error.
 				existing.cancel()
@@ -892,7 +951,11 @@ func (m *Manager) Reload() error {
 		}
 		// The internal stop retires the loop, so a deploy queued behind it
 		// is reported as failed instead of running on a removed service.
-		m.doOn(removed, syncOp{internalStop: true, result: make(chan string, 1)})
+		// If the stop fails the service stays in place, as when replacing.
+		if result := m.doOn(removed, syncOp{internalStop: true, result: make(chan string, 1)}); result != "stopped" {
+			errs = append(errs, fmt.Errorf("reload %s: internal stop: %s", name, result))
+			continue
+		}
 		m.mu.Lock()
 		delete(m.services, name)
 		m.mu.Unlock()
