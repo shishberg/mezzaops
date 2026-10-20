@@ -82,10 +82,15 @@ func (o Options) jitterFraction() float64 {
 	return o.JitterFraction
 }
 
-// RunWithBackoff calls op repeatedly until it returns nil, ctx is cancelled,
-// or MaxDelay is reached for an attempt. The op is called immediately for
+// RunWithBackoff calls op repeatedly until it returns nil or ctx is
+// cancelled; it never gives up on its own. The op is called immediately for
 // the first attempt; on each failure the delay is doubled (capped at
 // MaxDelay) and jittered, then op runs again.
+//
+// If an invocation of op ran for at least MaxDelay before failing, it is
+// treated as a healthy connection that later dropped rather than a failed
+// connect: the delay resets to InitialDelay, so a sync that dies after days
+// of uptime retries after about a second instead of waiting at the cap.
 //
 // If op returns ctx.Err() the loop exits with that error and does not
 // log. Any other error is logged via the configured Logger and retried.
@@ -102,6 +107,7 @@ func RunWithBackoff(ctx context.Context, name string, opts Options, op func(ctx 
 			return err
 		}
 
+		started := nowFn()
 		err := op(ctx)
 		if err == nil {
 			return nil
@@ -110,14 +116,24 @@ func RunWithBackoff(ctx context.Context, name string, opts Options, op func(ctx 
 			return ctx.Err()
 		}
 
+		if nowFn().Sub(started) >= opts.maxDelay() {
+			delay = 0
+		}
+
 		nextDelay := nextBackoff(delay, opts)
 		logAttempt(opts, name, attempt, err, nextDelay)
-		if err := sleep(ctx, nextDelay); err != nil {
+		if err := sleepFn(ctx, nextDelay); err != nil {
 			return err
 		}
 		delay = nextDelay
 	}
 }
+
+// Seams for tests: the clock and the sleep function.
+var (
+	nowFn   = time.Now
+	sleepFn = sleep
+)
 
 // nextBackoff doubles delay and caps it at opts.maxDelay, with optional
 // symmetric jitter. The result is always >= 1ms.

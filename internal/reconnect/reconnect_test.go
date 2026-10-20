@@ -215,3 +215,42 @@ func TestNextBackoff_PositiveJitterClampedToMaxDelay(t *testing.T) {
 		assert.LessOrEqual(t, got, opts.MaxDelay, "iter %d: %v", i, got)
 	}
 }
+
+func TestRunWithBackoff_DelayResetsAfterLongRun(t *testing.T) {
+	// Fake clock and sleep so the test is instant and deterministic.
+	var clock time.Time
+	origNow, origSleep := nowFn, sleepFn
+	nowFn = func() time.Time { return clock }
+	var slept []time.Duration
+	sleepFn = func(ctx context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		return nil
+	}
+	t.Cleanup(func() { nowFn, sleepFn = origNow, origSleep })
+
+	// How long each attempt "runs" before failing; the last one succeeds.
+	runs := []time.Duration{
+		time.Second,     // quick failure: next delay 1s
+		time.Second,     // quick failure: next delay 2s
+		time.Second,     // quick failure: next delay 4s
+		2 * time.Minute, // long healthy run, then failure: delay resets to 1s
+		time.Second,     // quick failure: next delay 2s
+	}
+	i := 0
+	err := RunWithBackoff(context.Background(), "test", Options{
+		InitialDelay:   time.Second,
+		MaxDelay:       time.Minute,
+		JitterFraction: -1,
+	}, func(ctx context.Context) error {
+		if i >= len(runs) {
+			return nil
+		}
+		clock = clock.Add(runs[i])
+		i++
+		return errors.New("dropped")
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []time.Duration{
+		1 * time.Second, 2 * time.Second, 4 * time.Second, 1 * time.Second, 2 * time.Second,
+	}, slept)
+}
