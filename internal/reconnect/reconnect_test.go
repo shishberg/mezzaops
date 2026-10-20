@@ -57,7 +57,7 @@ func TestRunWithBackoff_CtxCancelDuringBackoff(t *testing.T) {
 		attempts.Add(1)
 		return errors.New("transient")
 	})
-	assert.ErrorIs(t, err, context.Canceled)
+	assert.NoError(t, err, "cancellation is a clean shutdown")
 	// The first attempt ran, then we cancelled during its backoff.
 	assert.LessOrEqual(t, attempts.Load(), int32(2),
 		"attempts should not have continued after cancel")
@@ -86,7 +86,7 @@ func TestRunWithBackoff_CtxCancelDuringOp(t *testing.T) {
 	cancel()
 	select {
 	case err := <-done:
-		assert.ErrorIs(t, err, context.Canceled)
+		assert.NoError(t, err, "cancellation is a clean shutdown")
 	case <-time.After(2 * time.Second):
 		t.Fatal("RunWithBackoff did not return after op returned ctx.Err()")
 	}

@@ -363,11 +363,7 @@ func stopRun(t *testing.T, cancel context.CancelFunc, done <-chan error) {
 	cancel()
 	select {
 	case err := <-done:
-		// RunWithBackoff reports cancellation as ctx.Err(), as in the
-		// other frontends.
-		if err != nil {
-			assert.ErrorIs(t, err, context.Canceled)
-		}
+		assert.NoError(t, err)
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run did not exit after cancel")
 	}

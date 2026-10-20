@@ -92,8 +92,10 @@ func (o Options) jitterFraction() float64 {
 // connect: the delay resets to InitialDelay, so a sync that dies after days
 // of uptime retries after about a second instead of waiting at the cap.
 //
-// If op returns ctx.Err() the loop exits with that error and does not
-// log. Any other error is logged via the configured Logger and retried.
+// When ctx is cancelled the loop exits and returns nil: a clean shutdown is
+// not an error. Callers can tell cancellation apart from success by
+// checking ctx.Err(). Any other error is logged via the configured Logger
+// and retried.
 //
 // The first attempt has no preceding sleep, so a frontend that is healthy
 // on first call goes through the loop with no observable delay.
@@ -103,8 +105,8 @@ func RunWithBackoff(ctx context.Context, name string, opts Options, op func(ctx 
 	for {
 		attempt++
 
-		if err := ctx.Err(); err != nil {
-			return err
+		if ctx.Err() != nil {
+			return nil
 		}
 
 		started := nowFn()
@@ -113,7 +115,7 @@ func RunWithBackoff(ctx context.Context, name string, opts Options, op func(ctx 
 			return nil
 		}
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return nil
 		}
 
 		if nowFn().Sub(started) >= opts.maxDelay() {
@@ -123,7 +125,7 @@ func RunWithBackoff(ctx context.Context, name string, opts Options, op func(ctx 
 		nextDelay := nextBackoff(delay, opts)
 		logAttempt(opts, name, attempt, err, nextDelay)
 		if err := sleepFn(ctx, nextDelay); err != nil {
-			return err
+			return nil // ctx cancelled while waiting
 		}
 		delay = nextDelay
 	}
