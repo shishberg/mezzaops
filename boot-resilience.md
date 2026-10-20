@@ -272,17 +272,21 @@ safer one for cold-boot recovery. Documented inline in
 
 ## Review fixes (post-implementation)
 
-- [x] **F2** — `Manager.Reload` stops a changed service with an internal stop
-  op that leaves `DesiredStatus` alone. The op runs inside the service loop,
-  captures "was running" and the desired state at the moment it stops, and
-  returns them in its reply (no stored field). The loop then retires: ops
-  queued behind the stop and later ops get "service was reloaded; retry", and
-  Reload cancels the old service's context so its goroutine exits and no
-  caller blocks. State is saved before an op's reply is sent. If the stop
-  fails, the old service stays in place, no replacement is created, and the
-  error is returned from `Reload` (other services still reload). The
-  replacement is created without cold-boot scheduling, is started if and only
-  if the old service was running, and carries over the old desired state.
+- [x] **F2** — `Manager.Reload` is serialized by a mutex and stops a changed
+  service with a private internal stop (a flag on the internal op type that
+  only Reload sets; `Do(name, "stop-internal")` is an unknown command). The
+  stop leaves `DesiredStatus` alone and does not touch a leftover orphan
+  process. It runs inside the service loop, captures "was running" and the
+  desired state at the moment it stops, and returns them in its reply. The
+  loop then retires: ops queued behind the stop and later ops get "service
+  was reloaded; retry", and Reload cancels the old service's context so its
+  goroutine exits and no caller blocks. A deploy requested while the swap is
+  in flight is forwarded to the replacement. State is saved before an op's
+  reply is sent. If the stop fails, the old service stays in place, no
+  replacement is created, and the error is returned from `Reload` (other
+  services still reload). The replacement is created without cold-boot
+  scheduling, is started if and only if the old service was running, and
+  carries over the old desired state.
 - [x] **F3** — `handleOp` start/restart record `DesiredStatus="running"` when
   the command is accepted, before the backend call, so a failed start still
   records intent.
@@ -291,16 +295,23 @@ safer one for cold-boot recovery. Documented inline in
   cold-boot autostart for a running service.
 - [x] **E** — With `adopt: false`, autostart no longer starts a second copy
   when the persisted pid is still alive (the child runs in its own process
-  group); it logs a warning instead. The process is considered alive unless
-  the recorded boot time differs from the current one, or a recorded create
-  time does not match the live process; with no timing data recorded (gopsutil
-  can fail on darwin) it is assumed alive and the check is logged as
-  unverified. The orphan's record is kept in later state saves while it stays
-  alive, so the guard survives reloads and further cold boots. `Start`
-  (operator start/restart, deploy restart) refuses with an error while the
-  orphan is alive and leaves its record intact. `TryAdopt` adopts a live,
-  non-mismatching process whatever status was saved, so enabling `adopt` later
-  picks the orphan up instead of duplicating it.
+  group); it logs a warning instead. The backend forgets a child's pid when
+  it observes the exit, so a crash record holds no pid that could later be
+  reused. A record is considered alive unless its recorded boot time differs
+  from the current one or a recorded create time does not match the live
+  process. With no timing data (gopsutil can fail on darwin) it is assumed
+  alive and logged once as unverified, except that a "stopped" record not
+  marked as an orphan (what an exited child leaves in older state files) is
+  treated as stale and is neither adopted nor allowed to block a start. The
+  orphan's record (marked `orphan`) is kept in later state saves while it
+  stays alive, so the guard survives reloads and further cold boots. `Start`
+  refuses with an error while the orphan is alive. `Stop` (and so a restart
+  or deploy) terminates a verified orphan with SIGTERM then SIGKILL on its
+  process group and clears the record; an unverifiable one is left alone and
+  an error naming the pid is returned. `TryAdopt` adopts a live,
+  non-mismatching process whatever status was saved (except an unverifiable
+  one under a "stopped" status), so enabling `adopt` later picks the orphan
+  up instead of duplicating it.
 - [x] **F** — `ProcessBackend.TryAdopt` returns `(adopted bool, msg string)`;
   the autostart decision branches on the bool, not a message prefix.
 - [x] **G** — `reconnect.RunWithBackoff` resets the delay to `InitialDelay`

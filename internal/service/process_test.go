@@ -1,8 +1,10 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -423,6 +425,49 @@ func TestProcessBackend_PersistedProcessAlive(t *testing.T) {
 				t.Fatalf("PersistedProcessAlive: got %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+func TestProcessBackend_ExitedChildLeavesNoPidInSavedState(t *testing.T) {
+	b := newTestBackend(t, []string{"true"}, "")
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-b.WaitForExit():
+	case <-time.After(5 * time.Second):
+		t.Fatal("child did not exit")
+	}
+	if raw := b.SaveBackendState(); raw != nil {
+		t.Fatalf("an exited child must not persist its pid, got %s", raw)
+	}
+}
+
+func TestProcessBackend_UnverifiedWarningLoggedOnce(t *testing.T) {
+	child := exec.Command("sleep", "3600")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+
+	b := newTestBackend(t, []string{"sleep", "3600"}, "")
+	raw, _ := json.Marshal(processBackendState{PID: child.Process.Pid, PGID: child.Process.Pid})
+	b.RestoreBackendState(raw)
+	b.MarkOrphan()
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	for range 3 {
+		_ = b.Start(context.Background())
+		_ = b.SaveBackendState()
+		_ = b.PersistedProcessAlive()
+	}
+	if n := strings.Count(buf.String(), "cannot be verified"); n != 1 {
+		t.Fatalf("unverified warning logged %d times, want once:\n%s", n, buf.String())
+	}
+	if !strings.Contains(buf.String(), "no create time recorded") {
+		t.Fatalf("warning should say why: %s", buf.String())
 	}
 }
 

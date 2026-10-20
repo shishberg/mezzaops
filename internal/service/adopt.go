@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"syscall"
 
 	"github.com/shirou/gopsutil/v3/host"
@@ -27,28 +28,30 @@ const (
 // checkIdentity compares ps with the live process, doing at most one
 // process lookup. A boot time that differs from the current one means the
 // process is gone (reboot); otherwise a recorded create time must match.
-func checkIdentity(ps processBackendState) identity {
+// For identityUnverified, why says whether nothing was recorded or the
+// lookup failed.
+func checkIdentity(ps processBackendState) (id identity, why string) {
 	if ps.BootTime != 0 {
 		bootTime, err := host.BootTime()
 		if err == nil && int64(bootTime) != ps.BootTime {
-			return identityMismatch
+			return identityMismatch, ""
 		}
 	}
 	if ps.CreateTime == 0 {
-		return identityUnverified
+		return identityUnverified, "no create time recorded"
 	}
 	p, err := process.NewProcess(int32(ps.PID))
 	if err != nil {
-		return identityMismatch
+		return identityMismatch, ""
 	}
 	createTime, err := p.CreateTime()
 	if err != nil {
-		return identityUnverified
+		return identityUnverified, fmt.Sprintf("create-time lookup failed: %v", err)
 	}
 	if createTime != ps.CreateTime {
-		return identityMismatch
+		return identityMismatch, ""
 	}
-	return identityVerified
+	return identityVerified, ""
 }
 
 // VerifyProcess checks that the PID in the state still refers to the same
@@ -57,5 +60,6 @@ func checkIdentity(ps processBackendState) identity {
 // returns true as graceful degradation -- we accept the PID rather than
 // incorrectly restarting a process we can't identify.
 func VerifyProcess(ps processBackendState) bool {
-	return checkIdentity(ps) != identityMismatch
+	id, _ := checkIdentity(ps)
+	return id != identityMismatch
 }

@@ -22,11 +22,7 @@ import (
 	"github.com/shishberg/mezzaops/internal/deploy"
 )
 
-// internalStopOp stops a service without recording operator intent. It is
-// used by Reload, which stops the old service before replacing it.
-const internalStopOp = "stop-internal"
-
-// reloadSnapshot is the state captured by internalStopOp for Reload.
+// reloadSnapshot is the state captured by an internal stop for Reload.
 type reloadSnapshot struct {
 	wasRunning bool   // the backend was running just before the stop
 	desired    string // DesiredStatus at the moment of the stop
@@ -40,7 +36,11 @@ const reloadedMsg = "service was reloaded; retry"
 type syncOp struct {
 	op     string
 	result chan string
-	// snap, if non-nil, receives the snapshot taken by internalStopOp
+	// internalStop makes the op Reload's stop-for-replacement instead of
+	// op: it stops the service without recording operator intent. Only
+	// Reload sets it; Do cannot.
+	internalStop bool
+	// snap, if non-nil, receives the snapshot taken by an internalStop
 	// before result is sent.
 	snap *reloadSnapshot
 }
@@ -94,6 +94,7 @@ type Manager struct {
 
 	// For reload
 	servicesDir string
+	reloadMu    sync.Mutex // serializes Reload
 
 	// newBackend builds the backend for a service. Defaults to
 	// backendForConfig; tests substitute a factory to inject failures.
@@ -250,9 +251,9 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot, repla
 		// With adoption disabled the previous child may still be alive
 		// in its own process group. Starting another copy would create
 		// a duplicate, so refuse to autostart and warn instead.
-		if !adopt && pb.PersistedProcessAlive() {
+		if !adopted && pb.PersistedProcessAlive() {
 			pb.MarkOrphan()
-			log.Printf("**%s**: WARNING: adoption is disabled but the previous process (pid %d) is still alive; not autostarting to avoid a duplicate. Stop it manually or enable adopt.", svc.Name, pb.restoredState.PID)
+			log.Printf("**%s**: WARNING: the previous process (pid %d) appears to be still alive but was not adopted (adopt: false, or identity unverifiable); not autostarting to avoid a duplicate. Stop it (the stop command terminates a verified one) or enable adopt.", svc.Name, pb.restoredState.PID)
 		} else if !adopted && !replacing && svc.ShouldAutostart(startOnBoot) {
 			if persistedDesired != "stopped" || svc.AutostartForce {
 				ms.autostartOnReady = true
@@ -345,6 +346,7 @@ func (m *Manager) serviceLoop(ms *managedService) {
 	// retired is set (loop-local) once an internal stop succeeds: Reload is
 	// replacing this service, so nothing further may run on its backend.
 	retired := false
+	forwardDeploy := false
 
 	for {
 		select {
@@ -354,7 +356,7 @@ func (m *Manager) serviceLoop(ms *managedService) {
 				continue
 			}
 			var result string
-			if op.op == internalStopOp {
+			if op.internalStop {
 				var snap reloadSnapshot
 				snap, result = m.internalStop(ms)
 				if result == "stopped" {
@@ -369,7 +371,7 @@ func (m *Manager) serviceLoop(ms *managedService) {
 
 			// Persist state after start/stop/restart, before replying, so
 			// a caller (notably Reload) that acts on the reply sees it.
-			if op.op == "start" || op.op == "stop" || op.op == "restart" || op.op == internalStopOp {
+			if op.op == "start" || op.op == "stop" || op.op == "restart" || op.internalStop {
 				m.saveServiceState(ms)
 			}
 			op.result <- result
@@ -381,6 +383,9 @@ func (m *Manager) serviceLoop(ms *managedService) {
 
 		case <-ms.deployCh:
 			if retired {
+				// Reload is replacing this service; hand the deploy to
+				// the replacement once this loop exits.
+				forwardDeploy = true
 				continue
 			}
 			m.executeDeploy(ms)
@@ -403,18 +408,34 @@ func (m *Manager) serviceLoop(ms *managedService) {
 
 		case <-ms.ctx.Done():
 			m.drainOps(ms)
+			if len(ms.deployCh) > 0 {
+				forwardDeploy = true
+			}
+			if forwardDeploy && m.ctx.Err() == nil {
+				// The replacement is installed before this context is
+				// cancelled, so this reaches it.
+				if err := m.RequestDeploy(ms.config.Name); err != nil {
+					log.Printf("**%s**: deploy requested during reload could not be forwarded: %v", ms.config.Name, err)
+				}
+			}
 			return
 		}
 	}
 }
 
+// goneMsg is the reply for an op that cannot run because its service was
+// replaced by Reload, or the manager is stopping.
+func (m *Manager) goneMsg() string {
+	if m.ctx.Err() != nil {
+		return "manager shutting down"
+	}
+	return reloadedMsg
+}
+
 // drainOps answers every op still queued on a service whose loop is
 // exiting, so callers do not wait forever.
 func (m *Manager) drainOps(ms *managedService) {
-	msg := reloadedMsg
-	if m.ctx.Err() != nil {
-		msg = "manager shutting down"
-	}
+	msg := m.goneMsg()
 	for {
 		select {
 		case op := <-ms.opCh:
@@ -431,7 +452,9 @@ func (m *Manager) drainOps(ms *managedService) {
 func (m *Manager) internalStop(ms *managedService) (reloadSnapshot, string) {
 	status, statusErr := ms.backend.Status(m.ctx)
 	wasRunning := statusErr == nil && status == "running"
-	if err := ms.backend.Stop(m.ctx); err != nil {
+	// Leave any leftover (orphan) process alone: a config change is not a
+	// request to kill it.
+	if err := ms.backend.Stop(withKeepOrphan(m.ctx)); err != nil {
 		return reloadSnapshot{}, fmt.Sprintf("stop failed: %v", err)
 	}
 	ms.stateMu.Lock()
@@ -668,17 +691,10 @@ func (m *Manager) Do(name, op string) string {
 // doOn sends so to ms's loop and waits for the result. It returns instead of
 // blocking if the service is replaced or the manager stops.
 func (m *Manager) doOn(ms *managedService, so syncOp) string {
-	gone := func() string {
-		if m.ctx.Err() != nil {
-			return "manager shutting down"
-		}
-		return reloadedMsg
-	}
-
 	select {
 	case ms.opCh <- so:
 	case <-ms.ctx.Done():
-		return gone()
+		return m.goneMsg()
 	}
 
 	select {
@@ -690,7 +706,7 @@ func (m *Manager) doOn(ms *managedService, so syncOp) string {
 		case result := <-so.result:
 			return result
 		default:
-			return gone()
+			return m.goneMsg()
 		}
 	}
 }
@@ -720,6 +736,17 @@ func (m *Manager) RequestDeploy(name string) error {
 	select {
 	case ms.deployCh <- struct{}{}:
 	default:
+	}
+
+	// If Reload retired this service while we were queueing, its loop may
+	// already have exited; the replacement is installed by then, so ask it.
+	if ms.ctx.Err() != nil && m.ctx.Err() == nil {
+		m.mu.Lock()
+		current := m.services[name]
+		m.mu.Unlock()
+		if current != nil && current != ms {
+			return m.RequestDeploy(name)
+		}
 	}
 
 	return nil
@@ -756,6 +783,9 @@ func (m *Manager) StopAll() {
 // Reload re-reads services from the services directory and adds/removes/updates
 // services as needed.
 func (m *Manager) Reload() error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+
 	if m.servicesDir == "" {
 		return fmt.Errorf("no services_dir configured")
 	}
@@ -778,7 +808,7 @@ func (m *Manager) Reload() error {
 			// Check if config changed
 			if !serviceConfigEqual(existing.config, svc) {
 				var snap reloadSnapshot
-				so := syncOp{op: internalStopOp, result: make(chan string, 1), snap: &snap}
+				so := syncOp{internalStop: true, result: make(chan string, 1), snap: &snap}
 				if result := m.doOn(existing, so); result != "stopped" {
 					// Keep the old service in place; the swap would
 					// otherwise run two copies of the process.
