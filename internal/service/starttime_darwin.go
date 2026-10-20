@@ -11,4 +11,4 @@ func processStartID(pid int) (int64, error) {
 // hostRules are the verification rules for this platform: on macOS the start
 // ID is the creation time, and CreateTime and the boot time are absolute
 // kernel values, so a difference means a different process or boot.
-var hostRules = rulesDarwin
+func hostRules() platformRules { return rulesDarwin() }

@@ -389,8 +389,8 @@ similar offset is plausible.
   mismatch carries a reason, and `verifyProcess` follows these steps: (1) a
   non-positive or dead pid is a mismatch; (2) a record with no identity fields
   at all is verified, as on main; (3) the boot-level check can only rule a
-  process out: boot IDs both known and different (a record with no boot ID of its own is also ruled out when the service
-  state file's `boot_id` is known and differs from the current one: that
+  process out: boot IDs both known and different (a record with no boot ID of its own is
+  also ruled out when the service state file's `boot_id` is known and differs from the current one: that
   file's `boot_id` is the boot during which it was last written and any
   process recorded in it started at or before that point, so it cannot be
   alive, which keeps first-reboot-after-upgrade autostart working on Linux. A
@@ -414,11 +414,14 @@ similar offset is plausible.
   stepped; a failed lookup is a mismatch if the process exited and unknown if
   alive; (6) otherwise no per-process comparison was possible: unknown. The
   platform rules are one `platformRules` struct of three named bools
-  (`startIDIsCreateTime`, `createTimeCanReject`, `bootTimeCanReject`); the
-  struct accepts any combination but only `rulesLinux` and `rulesDarwin` are
-  used, and neither is reassigned. `hostRules` is the platform's value; the
-  Manager holds it as a field and passes it to `TryAdopt`, `verifyProcess` and
-  the backend, and tests construct a Manager with whichever rules they need. A process adopted at startup from a legacy record (no boot ID, and only when
+  (`startIDIsCreateTime`, `createTimeCanReject`, `bootTimeCanReject`) plus a
+  `createTimeTolerance` (1000 ms on Linux, 0 on macOS); the struct accepts any
+  combination but only `rulesLinux()` and `rulesDarwin()` are used, and being
+  functions they cannot be reassigned. `hostRules()` is the platform's value;
+  the Manager holds it as a field and gives it to the backend, which uses it in
+  `TryAdopt` and when saving, and to `verifyProcess` and `cleanOrphans`; tests
+  construct a Manager with whichever rules they need.
+  A process adopted at startup from a legacy record (no boot ID, and only when
   a host boot ID is available to add; a missing start ID alone is not legacy,
   since the lookup may simply fail on this host) is re-persisted immediately, so
   its record is rewritten with the current boot ID and start ID; the following

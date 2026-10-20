@@ -61,9 +61,9 @@ const (
 )
 
 // platformRules are the per-platform verification rules, as named fields. The
-// struct accepts any combination of the three bools; only rulesLinux and
-// rulesDarwin are used, and neither is ever reassigned. Production uses
-// hostRules; tests pass either value explicitly.
+// struct accepts any combination of its fields; only rulesLinux() and
+// rulesDarwin() are used, and being functions they cannot be reassigned.
+// Production uses hostRules(); tests pass either value explicitly.
 type platformRules struct {
 	// startIDIsCreateTime: the start ID is the creation time, so a failed
 	// start ID lookup leaves nothing more to try and a record that already
@@ -76,19 +76,28 @@ type platformRules struct {
 	// a different boot. On Linux it does not: BootTime is now minus uptime,
 	// so a clock step moves it.
 	bootTimeCanReject bool
+	// createTimeTolerance is how far (ms) two CreateTime values may differ
+	// and still match. On Linux gopsutil recomputes the boot time from
+	// /proc/uptime on every read, so CreateTime wobbles by about a second;
+	// on macOS it is the kernel's absolute start time and compared exactly.
+	createTimeTolerance int64
 }
 
-var (
-	// rulesLinux: CreateTime and BootTime are derived from the wall clock.
-	rulesLinux = platformRules{}
-	// rulesDarwin: the start ID is CreateTime and CreateTime and BootTime
-	// are absolute kernel values.
-	rulesDarwin = platformRules{startIDIsCreateTime: true, createTimeCanReject: true, bootTimeCanReject: true}
-)
+// rulesLinux: CreateTime and BootTime are derived from the wall clock, and
+// CreateTime wobbles by about a second.
+func rulesLinux() platformRules {
+	return platformRules{createTimeTolerance: 1000}
+}
+
+// rulesDarwin: the start ID is CreateTime, and CreateTime and BootTime are
+// absolute kernel values compared exactly.
+func rulesDarwin() platformRules {
+	return platformRules{startIDIsCreateTime: true, createTimeCanReject: true, bootTimeCanReject: true}
+}
 
 // verifyProcess checks that the PID in the state still refers to the same
 // process we originally started. rules are the platform's verification rules
-// (hostRules in production); serviceBootID is the boot ID in the service state
+// (hostRules() in production); serviceBootID is the boot ID in the service state
 // file, or "" if unknown. The steps, in order:
 //
 //  1. A non-positive pid, or one that is not alive, is a mismatch.
@@ -111,7 +120,8 @@ var (
 //     a mismatch; otherwise it is unknown on macOS (startIDIsCreateTime: the
 //     CreateTime lookup would be the same call) and on Linux step 5 is tried.
 //  5. If the record has a CreateTime it is looked up and compared with
-//     createTimeMatches (exact on macOS, legacyCreateTimeTolerance on Linux).
+//     createTimeMatches (rules.createTimeTolerance: exact on macOS, about a
+//     second on Linux).
 //     A match is verified. A difference is a mismatch only where
 //     createTimeCanReject (macOS, where CreateTime is absolute); on Linux
 //     CreateTime moves when the clock is stepped, so a difference is unknown.
@@ -123,7 +133,9 @@ var (
 // the same boot is unknown, not a mismatch, so the service is not autostarted
 // that run (and this is logged) rather than risking a duplicate. Records with
 // a start ID detect pid reuse exactly.
-func verifyProcess(ps processBackendState, rules platformRules, serviceBootID string) (verifyResult, mismatchReason) {
+func verifyProcess(
+	ps processBackendState, rules platformRules, serviceBootID string,
+) (verifyResult, mismatchReason) {
 	if ps.PID <= 0 {
 		return verifyMismatch, reasonBadPID
 	}
@@ -197,7 +209,7 @@ func checkCreateTime(ps processBackendState, rules platformRules) (verifyResult,
 		return verifyUnknown, reasonNone
 	}
 	switch {
-	case createTimeMatches(live, ps.CreateTime, legacyCreateTimeTolerance):
+	case createTimeMatches(live, ps.CreateTime, rules.createTimeTolerance):
 		return verifyVerified, reasonNone
 	case rules.createTimeCanReject:
 		return verifyMismatch, reasonDifferentProcess

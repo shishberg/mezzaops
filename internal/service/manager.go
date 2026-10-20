@@ -118,7 +118,7 @@ type Manager struct {
 	// bootID is the host boot ID, read once when the manager is created.
 	bootID string
 
-	// rules are the process verification rules (hostRules in production).
+	// rules are the process verification rules (hostRules() in production).
 	rules platformRules
 
 	// For reload
@@ -147,7 +147,7 @@ type Manager struct {
 
 // NewManager creates a Manager for the given service configs.
 func NewManager(cfg *config.Config, services []config.ServiceConfig, notifier Notifier) (*Manager, error) {
-	return newManager(cfg, services, notifier, nil, hostRules)
+	return newManager(cfg, services, notifier, nil, hostRules())
 }
 
 // newManager is NewManager with an optional backend factory (nil selects
@@ -277,7 +277,7 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 	if pb, ok := asProcessBackend(backend); ok {
 		pb.adopt = adopt
 		pb.rules = m.rules
-		outcome, msg := pb.TryAdopt(m.rules, persistedBootID)
+		outcome, msg := pb.TryAdopt(persistedBootID)
 		adopted := outcome == adoptYes
 		// Only a legacy record (written without a boot ID) is worth
 		// re-persisting, and only if a boot ID is available to add. A missing

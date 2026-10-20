@@ -35,8 +35,8 @@ func TestVerifyProcessMatchingState(t *testing.T) {
 			ps.CreateTime = ct
 		}
 	}
-	if !verifiedWith(ps, hostRules, "") {
-		t.Fatal("VerifyProcess should return true for current process state")
+	if !verifiedWith(ps, hostRules(), "") {
+		t.Fatal("verifyProcess should verify the current process state")
 	}
 }
 
@@ -47,8 +47,8 @@ func TestVerifyProcessWrongBootTime(t *testing.T) {
 		PGID:     pid,
 		BootTime: 1, // impossibly old boot time
 	}
-	if verifiedWith(ps, hostRules, "") {
-		t.Fatal("VerifyProcess should return false when boot time mismatches")
+	if verifiedWith(ps, hostRules(), "") {
+		t.Fatal("verifyProcess should not verify when boot time mismatches")
 	}
 }
 

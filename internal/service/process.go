@@ -35,7 +35,7 @@ type ProcessBackend struct {
 	cmd        string   // sh -c wrapper -- used if entrypoint is empty
 	logDir     string
 	adopt      bool          // whether to attempt process adoption
-	rules      platformRules // verification rules (hostRules unless the manager says otherwise)
+	rules      platformRules // verification rules (hostRules() unless the manager says otherwise)
 
 	mu      sync.Mutex
 	pid     int
@@ -56,7 +56,7 @@ func NewProcessBackend(name, dir string, entrypoint []string, cmd string, logDir
 		entrypoint: entrypoint,
 		cmd:        cmd,
 		logDir:     logDir,
-		rules:      hostRules,
+		rules:      hostRules(),
 	}
 }
 
@@ -296,11 +296,11 @@ const (
 )
 
 // TryAdopt attempts to re-adopt a process from a previous session using
-// the restored state, under the given verification rules. serviceBootID is the
+// the restored state, under the backend's verification rules. serviceBootID is the
 // boot ID in the service state file; it can only rule out a record that has
 // no boot ID of its own. It reports the outcome (see adoptOutcome) and a
 // human-readable description of what happened.
-func (p *ProcessBackend) TryAdopt(rules platformRules, serviceBootID string) (adoptOutcome, string) {
+func (p *ProcessBackend) TryAdopt(serviceBootID string) (adoptOutcome, string) {
 	if !p.adopt {
 		return adoptNo, "adoption disabled"
 	}
@@ -316,7 +316,7 @@ func (p *ProcessBackend) TryAdopt(rules platformRules, serviceBootID string) (ad
 		return adoptNo, "stopped (preserved from previous session)"
 	}
 
-	result, reason := verifyProcess(ps, rules, serviceBootID)
+	result, reason := verifyProcess(ps, p.rules, serviceBootID)
 	switch result {
 	case verifyMismatch:
 		switch reason {
