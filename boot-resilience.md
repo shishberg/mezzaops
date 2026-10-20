@@ -237,22 +237,22 @@ a one-liner.
 ## Implementation progress
 
 Tracking the actual implementation of the changes above. Each entry lists
-the change, commits, validation, and any deviations from the spec.
+the change, validation, and any deviations from the spec.
 
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
-- [x] **C4** — Discord nil-session panic guard. Final commit: `4aff882` (amended from `9c64a90` after codex review). Extracted `Bot.setCommands(sess, cmds)` helper with nil guards for session, State, and State.User; routed the three call sites (post-open registration, shutdown deregistration, reload re-registration) through it. Codex also flagged a status-goroutine leak that the C2 retry loop would have amplified — fixed by moving the status goroutine and reconnect handlers to start only after `setCommands` succeeds, so a registration failure bails before any long-lived goroutine is registered. Tests: `TestSetCommands_NilSession`, `TestSetCommands_NilState`, `TestSetCommands_NilUser` against a constructed `discordgo.Session`. `make check` clean.
-- [x] **C6** — Config strict-decoding / unknown-key warning. Final commit: `817f444` (amended from `7951b31` after codex review). Loads still go through `yaml.Unmarshal`; after the load, the file is unmarshaled a second time into `map[string]yaml.Node` (which resolves YAML merge keys and aliases) and `log.Printf` warns for each top-level key not in `knownTopLevelConfigKeys`. Load is non-fatal. README updated to document the strictness behaviour and the recognised top-level keys. Codex review caught two issues that were fixed in the amend: (1) the original walker operated on the raw AST and warned about `<<` itself instead of the merged-in keys (or skipped alias keys entirely); (2) the original tests asserted the substring `process`, which the help text happens to always contain for any unknown key. The fixed tests parse the actual unknown keys out of the warning line and add a YAML-merge regression test.
-- [x] **C2** + **C3** — Frontend reconnect + bounded readiness wait. Final commit: `97b8ddd` (amended from `e7e817d` after two codex review passes). New package `internal/reconnect` with `RunWithBackoff(ctx, name, opts, op)` (1s→60s, ±20% jitter clamped to MaxDelay). All three frontends wrap their connect path in it: mattermost retries the initial REST setup and drops into its existing WebSocket reconnect loop; matrix wraps discovery + client construction + crypto + sync (New() is now lazy so boot-time discovery failures are retried, every attempt builds a fresh client because the previous attempt's crypto helper closes the SQLite database); discord wraps the full connect path with the status goroutine captured per-attempt and `b.session` mutex-protected. New `Config.ReadinessTimeout` (YAML `readiness_timeout`, default 30s) is the maximum time the app layer waits for all frontends to be Ready before firing `manager.SignalReady()`. The wait is implemented in `waitForReadyChannels` (a free function) and wired by `App.waitForReady`. Discord gained a `Ready()` channel that closes after the first successful `setCommands`. Concurrency hardening (from codex review): new `connMu` in matrix protects client/roomID/realClient; new `idMu` in mattermost protects userID/channelID; discord `b.session` is mutex-protected. Codex review of the amend pass caught a high-severity plaintext race (client was being published before `helper.Init` completed, so `PostMessage` could send plaintext into a room the operator expected to be encrypted) and a medium-severity discovery-cancel bug (`discoverClientAPI` used `context.Background()`). Both fixed: `runOnce` now builds a local `*mautrix.Client`, inits the crypto helper, then publishes the ready client atomically under `connMu`; `PostMessage` also drops messages when `client.Crypto == nil` as a belt-and-braces guard. `discoverFunc` and `resolveHomeserverURL` now thread `ctx` through to `mautrix.DiscoverClientAPI`. New regression tests: `TestPostMessage_DropsWhenCryptoUnset` and `TestRunOnce_DiscoveryRespectsContextCancel`. `make check` clean.
-- [x] **C1** — Per-service `autostart` + global `start_on_boot` (cold-boot Start). Final commit: `75136a3` (amended from `00b95e5` after codex review). New `ServiceConfig.Autostart` (tri-state `*bool`) and `ServiceConfig.AutostartForce` (bool). New `Config.StartOnBoot` (default false). In `newManagedService`, after a ProcessBackend has tried adoption, the manager schedules a cold-boot "start" (not "restart") via a new `autostartOnReady` flag on `managedService` when (a) adoption failed, (b) autostart is enabled, and (c) the persisted `DesiredStatus` is not "stopped" (or AutostartForce is set). `DesiredStatus` is a new state field set by handleOp "start" / "stop" / "restart"; it is preserved across `saveServiceState` overwrites of the live `Status` field. This was added in response to a codex review finding: the first pass used `Status` (which is overwritten on process exit) and would suppress autostart for a crashed process. `serviceConfigEqual` also now compares `Adopt`, `Autostart`, and `AutostartForce` so reload picks up changes. Codex review of the amend caught that `start_on_boot` was missing from `knownTopLevelConfigKeys` so a valid C1 config was always logged as an unknown key — fixed by adding it to the map and adding `TestLoadConfig_StartOnBootNotFlaggedUnknown`.
-- [x] **C5** — Single-instance lock on state dir (flock / pidfile). Final commit: `75136a3` (same commit as C1, since they were implemented together). New `acquireStateLock` opens `<state_dir>/mezzaops.lock`, takes `syscall.Flock` with `LOCK_EX|LOCK_NB`, writes `pid=<pid>`, and returns the file handle held for the Manager's lifetime. `Stop` calls `releaseStateLock`. A second `NewManager` on the same state dir fails fast with a descriptive error. The lock is per-process so a crashed instance does not leave a stale lock. Build-tagged: `lock_unix.go` covers `linux || darwin`, which are the only supported platforms; other platforms fail to build rather than silently skipping the lock.
+- [x] **C4** — Discord nil-session panic guard. Extracted `Bot.setCommands(sess, cmds)` helper with nil guards for session, State, and State.User; routed the three call sites (post-open registration, shutdown deregistration, reload re-registration) through it. Codex also flagged a status-goroutine leak that the C2 retry loop would have amplified — fixed by moving the status goroutine and reconnect handlers to start only after `setCommands` succeeds, so a registration failure bails before any long-lived goroutine is registered. Tests: `TestSetCommands_NilSession`, `TestSetCommands_NilState`, `TestSetCommands_NilUser` against a constructed `discordgo.Session`. `make check` clean.
+- [x] **C6** — Config strict-decoding / unknown-key warning. Loads still go through `yaml.Unmarshal`; after the load, the file is unmarshaled a second time into `map[string]yaml.Node` (which resolves YAML merge keys and aliases) and `log.Printf` warns for each top-level key not in `knownTopLevelConfigKeys`. Load is non-fatal. README updated to document the strictness behaviour and the recognised top-level keys. Codex review caught two issues that were fixed in the amend: (1) the original walker operated on the raw AST and warned about `<<` itself instead of the merged-in keys (or skipped alias keys entirely); (2) the original tests asserted the substring `process`, which the help text happens to always contain for any unknown key. The fixed tests parse the actual unknown keys out of the warning line and add a YAML-merge regression test.
+- [x] **C2** + **C3** — Frontend reconnect + bounded readiness wait. New package `internal/reconnect` with `RunWithBackoff(ctx, name, opts, op)` (1s→60s, ±20% jitter clamped to MaxDelay). All three frontends wrap their connect path in it: mattermost retries its REST setup and WebSocket listen together (WebSocket drops are retried by `RunWithBackoff`, see H); matrix wraps discovery + client construction + crypto + sync (New() is now lazy so boot-time discovery failures are retried, every attempt builds a fresh client because the previous attempt's crypto helper closes the SQLite database); discord wraps the full connect path with the status goroutine captured per-attempt and `b.session` mutex-protected. New `Config.ReadinessTimeout` (YAML `readiness_timeout`, default 30s) is the maximum time the app layer waits for all frontends to be Ready before firing `manager.SignalReady()`. The wait is implemented in `waitForReadyChannels` (a free function) and wired by `App.waitForReady`. Discord gained a `Ready()` channel that closes after the first successful `setCommands`. Concurrency hardening (from codex review): new `connMu` in matrix protects client/roomID/realClient; new `idMu` in mattermost protects userID/channelID; discord `b.session` is mutex-protected. Codex review of the amend pass caught a high-severity plaintext race (client was being published before `helper.Init` completed, so `PostMessage` could send plaintext into a room the operator expected to be encrypted) and a medium-severity discovery-cancel bug (`discoverClientAPI` used `context.Background()`). Both fixed: `runOnce` now builds a local `*mautrix.Client`, inits the crypto helper, then publishes the ready client atomically under `connMu`; `PostMessage` also drops messages when `client.Crypto == nil` as a belt-and-braces guard. `discoverFunc` and `resolveHomeserverURL` now thread `ctx` through to `mautrix.DiscoverClientAPI`. New regression tests: `TestPostMessage_DropsWhenCryptoUnset` and `TestRunOnce_DiscoveryRespectsContextCancel`. `make check` clean.
+- [x] **C1** — Per-service `autostart` + global `start_on_boot` (cold-boot Start). New `ServiceConfig.Autostart` (tri-state `*bool`) and `ServiceConfig.AutostartForce` (bool). New `Config.StartOnBoot` (default false). In `newManagedService`, after a ProcessBackend has tried adoption, the manager schedules a cold-boot "start" (not "restart") via a new `autostartOnReady` flag on `managedService` when (a) adoption failed, (b) autostart is enabled, and (c) the persisted `DesiredStatus` is not "stopped" (or AutostartForce is set). `DesiredStatus` is a new state field set by handleOp "start" / "stop" / "restart"; it is preserved across `saveServiceState` overwrites of the live `Status` field. This was added in response to a codex review finding: the first pass used `Status` (which is overwritten on process exit) and would suppress autostart for a crashed process. `serviceConfigEqual` also now compares `Adopt`, `Autostart`, and `AutostartForce` so reload picks up changes. Codex review of the amend caught that `start_on_boot` was missing from `knownTopLevelConfigKeys` so a valid C1 config was always logged as an unknown key — fixed by adding it to the map and adding `TestLoadConfig_StartOnBootNotFlaggedUnknown`.
+- [x] **C5** — Single-instance lock on state dir (flock / pidfile). Implemented in the same commit as C1. New `acquireStateLock` opens `<state_dir>/mezzaops.lock`, takes `syscall.Flock` with `LOCK_EX|LOCK_NB`, writes `pid=<pid>`, and returns the file handle held for the Manager's lifetime. `Stop` calls `releaseStateLock`. A second `NewManager` on the same state dir fails fast with a descriptive error. The lock is per-process so a crashed instance does not leave a stale lock. The lock covers Linux and macOS, which are the only supported platforms (`lock_unix.go` is tagged `linux || darwin`); other platforms fail to build rather than silently skipping the lock.
 
 ## Follow-ups (deferred from this work)
 
-Codex review of the final C1 + C5 + C2 + C3 commits surfaced
-remaining concerns that touch the broader op-lifecycle and are
+Codex review of the final C1 + C5 + C2 + C3 work surfaced
+a remaining concern that touches the broader op-lifecycle and is
 out of scope for the spec change. Documented here so a future pass
-can pick them up.
+can pick it up.
 
 ### F1 — Legacy `status:"stopped"` state-file migration
 
@@ -270,24 +270,33 @@ heuristic is still imperfect and the current behaviour is the
 safer one for cold-boot recovery. Documented inline in
 `newManagedService`.
 
-### F2 — Reload records its internal stop as operator intent
+## Review fixes (post-implementation)
 
-`Manager.Reload` calls `m.Do(svc.Name, "stop")` on the old service
-before swapping in a replacement. The `stop` op currently writes
-`DesiredStatus="stopped"` (which is correct for an operator stop
-but wrong here — this is an internal stop for the swap). The
-replacement's `DesiredStatus` ends up "stopped" and a later cold
-boot would suppress autostart. Fix: add an internal stop path
-that preserves desired state, or have `Reload` read the desired
-state before stopping and re-apply it to the replacement.
-
-### F3 — Failed start/restart do not record the operator's new intent
-
-`handleOp` "start" and "restart" write `DesiredStatus="running"`
-**after** the backend call succeeds. If the backend call fails,
-the intent is not recorded, so a prior `DesiredStatus="stopped"`
-persists and a later cold boot suppresses autostart despite the
-operator having asked for a start. Fix: set desired state when
-accepting the command, before calling the backend, and cover the
-failed-start case in `TestNewManager_FailedStartPreservesIntent`
-(or similar).
+- [x] **F2** — `Manager.Reload` now stops a changed service with an internal
+  stop op that leaves `DesiredStatus` alone, copies the old desired state to
+  the replacement, and restarts the replacement if the old service was
+  running. Toggling `autostart` on a running service and reloading leaves it
+  running with `desired_status: running`.
+- [x] **F3** — `handleOp` start/restart record `DesiredStatus="running"` when
+  the command is accepted, before the backend call, so a failed start still
+  records intent.
+- [x] **D** — A successful deploy that restarts the process sets
+  `DesiredStatus="running"`, so a prior operator stop no longer suppresses
+  cold-boot autostart for a running service.
+- [x] **E** — With `adopt: false`, autostart no longer starts a second copy
+  when the persisted pid is still alive (the child runs in its own process
+  group); it logs a warning instead.
+- [x] **F** — `ProcessBackend.TryAdopt` returns `(adopted bool, msg string)`;
+  the autostart decision branches on the bool, not a message prefix.
+- [x] **G** — `reconnect.RunWithBackoff` resets the delay to `InitialDelay`
+  when an attempt ran for at least `MaxDelay` before failing; its doc comment
+  now says it retries until ctx is cancelled.
+- [x] **H** — Frontend `markReady` uses `sync.Once`; frontends pass
+  `reconnect.Options{}` (zero values equal the defaults); Mattermost
+  WebSocket drops return an error and `RunWithBackoff` is the only retry
+  loop (REST identity/channel lookups are re-run on each reconnect).
+- [x] **I** — Removed the unreachable prior-client cleanup from Matrix
+  `runOnce`.
+- [x] **J** — `knownTopLevelConfigKeys` is derived from `Config` yaml tags
+  via reflection, with a test that every tag is recognised.
+- [x] **K** — Corrected the `ShouldAutostart` doc comment.
