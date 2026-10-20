@@ -42,11 +42,6 @@ type ProcessBackend struct {
 	logPath string
 	process *exec.Cmd
 	done    chan struct{} // closed when process exits
-	// unknownRecord is the restored record of a live process whose identity
-	// could not be verified. While no process is tracked, Status reports
-	// "unknown", SaveBackendState keeps returning the record so each restart
-	// re-evaluates it, and Stop refuses. Cleared by Start.
-	unknownRecord *processBackendState
 
 	restoredState  *processBackendState // set by RestoreBackendState
 	restoredStatus string               // status from the state file
@@ -105,7 +100,6 @@ func (p *ProcessBackend) Start(ctx context.Context) error {
 	}
 
 	pid := cmd.Process.Pid
-	p.unknownRecord = nil
 	p.pid = pid
 	p.pgid = pid
 	p.process = cmd
@@ -132,25 +126,13 @@ func (p *ProcessBackend) Start(ctx context.Context) error {
 	return nil
 }
 
-type internalStopKey struct{}
-
-// withInternalStop marks a Stop as Reload's stop-for-replacement, which must
-// not be refused because of an unverified leftover process.
-func withInternalStop(ctx context.Context) context.Context {
-	return context.WithValue(ctx, internalStopKey{}, true)
-}
-
 // Stop sends SIGTERM to the process group, waits up to 5 seconds,
 // then sends SIGKILL. Returns nil if the process is not running.
 func (p *ProcessBackend) Stop(ctx context.Context) error {
 	p.mu.Lock()
 
 	if !p.isRunning() {
-		unknown := p.unknownRecord
 		p.mu.Unlock()
-		if unknown != nil && ctx.Value(internalStopKey{}) == nil {
-			return fmt.Errorf("cannot stop unverified process pid %d; stop it manually", unknown.PID)
-		}
 		return nil
 	}
 
@@ -204,9 +186,6 @@ func (p *ProcessBackend) Status(ctx context.Context) (string, error) {
 	if p.isRunning() {
 		return "running", nil
 	}
-	if p.unknownRecord != nil {
-		return "unknown", nil
-	}
 	return "stopped", nil
 }
 
@@ -229,16 +208,8 @@ func (p *ProcessBackend) SaveBackendState() json.RawMessage {
 	pid := p.pid
 	pgid := p.pgid
 	logPath := p.logPath
-	unknown := p.unknownRecord
 	p.mu.Unlock()
 
-	// A live process whose identity could not be verified is not tracked,
-	// but its record is kept unchanged so every restart re-evaluates it.
-	if pid == 0 && unknown != nil {
-		if data, err := json.Marshal(unknown); err == nil {
-			return data
-		}
-	}
 	return saveBackendStateFromFields(pid, pgid, logPath)
 }
 
@@ -317,7 +288,8 @@ const (
 	// adoptYes: a live process was adopted.
 	adoptYes
 	// adoptUnknown: a live process exists but its identity could not be
-	// verified; it was not adopted and the caller must not autostart.
+	// verified; it was not adopted and the caller must not autostart for
+	// this run.
 	adoptUnknown
 )
 
@@ -357,11 +329,8 @@ func (p *ProcessBackend) TryAdopt() (adoptOutcome, string) {
 		return adoptNo, fmt.Sprintf("pid %d reused by different process", ps.PID)
 	case verifyUnknown:
 		// Alive, but whether it is ours could not be determined. Neither
-		// adopt it nor let autostart start a duplicate.
-		p.mu.Lock()
-		rec := ps
-		p.unknownRecord = &rec
-		p.mu.Unlock()
+		// adopt it nor let autostart start a duplicate for this run.
+		// Nothing is persisted for it.
 		return adoptUnknown, fmt.Sprintf("pid %d is alive but its identity could not be verified; not adopting it and not autostarting", ps.PID)
 	}
 

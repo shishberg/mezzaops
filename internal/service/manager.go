@@ -287,9 +287,9 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool, 
 		// adopt: false a surviving child from the previous mezzaops would be
 		// duplicated, so autostart only after a host reboot (no child can
 		// have survived one); see rebootedSince.
-		if outcome == adoptUnknown {
-			log.Printf("**%s**: not autostarting: a process from the previous run is alive but could not be verified", svc.Name)
-		} else if !adopted && !replacing && svc.ShouldAutostart(startOnBoot) {
+		// On adoptUnknown (logged above with the pid) autostart is skipped
+		// for this run only.
+		if outcome != adoptUnknown && !adopted && !replacing && svc.ShouldAutostart(startOnBoot) {
 			if (persistedDesired != "stopped" || svc.AutostartForce) &&
 				(adopt || neverRan || gatePassed || m.rebootedSince(svc.Name, persistedBootID)) {
 				ms.autostartOnReady = true
@@ -605,7 +605,7 @@ func (m *Manager) drainOps(ms *managedService) {
 func (m *Manager) internalStop(ms *managedService, startupPending bool) (reloadSnapshot, string) {
 	status, statusErr := ms.backend.Status(m.ctx)
 	backendRunning := statusErr == nil && status == "running"
-	if err := ms.backend.Stop(withInternalStop(m.ctx)); err != nil {
+	if err := ms.backend.Stop(m.ctx); err != nil {
 		return reloadSnapshot{}, fmt.Sprintf("stop failed: %v", err)
 	}
 	ms.stateMu.Lock()

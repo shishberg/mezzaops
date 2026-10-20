@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io/fs"
 	"log"
 	"os"
@@ -3362,71 +3361,8 @@ func TestNewManager_UnknownIdentityIsNeitherAdoptedNorAutostarted(t *testing.T) 
 	m := unknownIdentityManager(t, cfg, svc)
 	defer m.Stop()
 	time.Sleep(300 * time.Millisecond)
-	if got := m.Do("testsvc", "status"); got != "unknown" {
-		t.Fatalf("an alive pid with unknown identity is neither adopted nor autostarted, and reports unknown: %q", got)
-	}
-}
-
-func TestNewManager_UnknownIdentityRecordSurvivesSaveAndRestart(t *testing.T) {
-	cfg, svc := seedUnknownIdentity(t)
-	m1 := unknownIdentityManager(t, cfg, svc)
-	m1.mu.Lock()
-	ms := m1.services["testsvc"]
-	m1.mu.Unlock()
-	m1.saveServiceState(ms) // any save (exit event, deploy, op)
-	m1.Stop()
-	s, saved, err := LoadState(cfg.StateDir, "testsvc")
-	if err != nil || !strings.Contains(string(saved), fmt.Sprintf(`"pid":%d`, unknownPID)) {
-		t.Fatalf("the unverified record was dropped by a save: %s (err %v)", saved, err)
-	}
-	if s.Status != "unknown" {
-		t.Fatalf("saved status: got %q, want unknown (so \"stopped\" handling does not apply)", s.Status)
-	}
-
-	// A restart re-evaluates the record: still unknown, still no autostart.
-	m2 := unknownIdentityManager(t, cfg, svc)
-	defer m2.Stop()
-	time.Sleep(300 * time.Millisecond)
-	if got := m2.Do("testsvc", "status"); got != "unknown" {
-		t.Fatalf("after a restart: %q", got)
-	}
-}
-
-func TestManager_StopRefusesUnverifiedProcessButRecordsIntent(t *testing.T) {
-	cfg, svc := seedUnknownIdentity(t)
-	m := unknownIdentityManager(t, cfg, svc)
-	defer m.Stop()
-
-	got := m.Do("testsvc", "stop")
-	if got == "stopped" || !strings.Contains(got, fmt.Sprint(unknownPID)) || !strings.Contains(got, "stop it manually") {
-		t.Fatalf("stop of an unverified process: got %q, want an error naming the pid", got)
-	}
-	if d := m.GetAllStates()["testsvc"].DesiredStatus; d != "stopped" {
-		t.Fatalf("the operator's intent is recorded first: DesiredStatus %q", d)
-	}
-}
-
-func TestManager_ReloadIsNotBlockedByUnverifiedProcess(t *testing.T) {
-	cfg, _ := seedUnknownIdentity(t)
-	servicesDir := t.TempDir()
-	cfg.ServicesDir = servicesDir
-	svcPath := filepath.Join(servicesDir, "testsvc.yaml")
-	data := "dir: /tmp\nautostart: true\nentrypoint:\n  - sleep\n  - \"3600\"\n"
-	if err := os.WriteFile(svcPath, []byte(data), 0644); err != nil {
-		t.Fatal(err)
-	}
-	services, _ := config.LoadServices(servicesDir)
-	m, err := NewManager(cfg, services, NopNotifier{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	m.SignalReady()
-	if err := os.WriteFile(svcPath, []byte(data+"branch: other\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.Reload(); err != nil {
-		t.Fatalf("a config reload must not be blocked by the unverified process: %v", err)
+	if got := m.Do("testsvc", "status"); got != "stopped" {
+		t.Fatalf("an alive pid with unknown identity is neither adopted nor autostarted: %q", got)
 	}
 }
 
@@ -3474,4 +3410,41 @@ func TestVerifyProcessResult_BootIDMatchWithoutStartIDUsesCreateTime(t *testing.
 	if got := verifyProcessResult(processBackendState{PID: 1234, BootID: "boot-A", CreateTime: 1_700_000_000_000}); got != verifyVerified {
 		t.Errorf("CreateTime match: got %v, want verified", got)
 	}
+}
+
+func TestVerifyProcessResult_NoComparisonPossibleIsUnknown(t *testing.T) {
+	withStartID(t, func(int) (int64, error) {
+		t.Fatal("must not look up a start ID without a current boot ID")
+		return 0, nil
+	})
+	withBootID(t, "") // the current boot ID is unreadable
+	// The record has identity fields (boot ID and start ID) but none of them
+	// can be compared: unknown, not verified.
+	if got := verifyProcessResult(processBackendState{PID: 1234, BootID: "boot-A", StartID: 7}); got != verifyUnknown {
+		t.Errorf("boot ID + start ID, no current boot ID, nothing else: got %v, want unknown", got)
+	}
+	// A record with no identity fields at all is accepted, as on main.
+	if got := verifyProcessResult(processBackendState{PID: 1234}); got != verifyVerified {
+		t.Errorf("no identity fields: got %v, want verified", got)
+	}
+}
+
+func TestManager_FailedStopStillRecordsIntent(t *testing.T) {
+	var fail atomic.Bool
+	logDir := t.TempDir()
+	factory := func(svc config.ServiceConfig) Backend {
+		pb := NewProcessBackend(svc.Name, svc.Dir, svc.Entrypoint, svc.Process.Cmd, logDir)
+		return failingStopBackend{ProcessBackend: pb, fail: &fail}
+	}
+	m, _, _ := reloadFixtureWith(t, "", factory, NopNotifier{})
+	m.Do("svc1", "start")
+	waitForStatus(t, m, "svc1", "running")
+	fail.Store(true)
+	if got := m.Do("svc1", "stop"); !strings.Contains(got, "stop failed") {
+		t.Fatalf("expected a failed stop, got %q", got)
+	}
+	if d := m.GetAllStates()["svc1"].DesiredStatus; d != "stopped" {
+		t.Fatalf("a failed stop still records the operator's intent: DesiredStatus %q", d)
+	}
+	fail.Store(false)
 }

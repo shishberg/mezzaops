@@ -79,11 +79,14 @@ func verifyProcessResult(ps processBackendState) verifyResult {
 		}
 		return verifyUnknown
 	}
+	// compared records whether any identity comparison was actually made.
+	compared := false
 
 	if cur := bootIDFn(); ps.BootID != "" && cur != "" {
 		if ps.BootID != cur {
 			return verifyMismatch
 		}
+		compared = true
 		if ps.StartID != 0 {
 			id, err := processStartIDFn(ps.PID)
 			switch {
@@ -96,16 +99,14 @@ func verifyProcessResult(ps processBackendState) verifyResult {
 			}
 		}
 	} else if ps.BootTime != 0 {
-		bootTime, err := bootTimeFn()
-		switch {
-		case err == nil && !sameBoot(bootTime, ps.BootTime):
-			return verifyMismatch
-		case err != nil && ps.CreateTime == 0:
-			// Nothing else to check the process against.
-			return verifyUnknown
+		// If the boot time cannot be read but a CreateTime was recorded, the
+		// CreateTime comparison below decides.
+		if bootTime, err := bootTimeFn(); err == nil {
+			if !sameBoot(bootTime, ps.BootTime) {
+				return verifyMismatch
+			}
+			compared = true
 		}
-		// If the boot time cannot be read but a CreateTime was recorded,
-		// the CreateTime comparison below decides.
 	}
 	if ps.CreateTime != 0 {
 		createTime, err := createTimeFn(ps.PID)
@@ -115,6 +116,15 @@ func verifyProcessResult(ps processBackendState) verifyResult {
 		if !createTimeMatches(createTime, ps.CreateTime, legacyCreateTimeTolerance) {
 			return verifyMismatch
 		}
+		compared = true
+	}
+	// A record with identity fields where none could be compared (for
+	// example a boot ID and start ID with an unreadable current boot ID) is
+	// unknown. A record with no identity fields at all is accepted, as on
+	// main.
+	hasIdentity := ps.BootID != "" || ps.StartID != 0 || ps.BootTime != 0 || ps.CreateTime != 0
+	if hasIdentity && !compared {
+		return verifyUnknown
 	}
 	return verifyVerified
 }

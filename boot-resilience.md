@@ -274,11 +274,14 @@ safer one for cold-boot recovery. Documented inline in
 
 After a mezzaops restart without a host reboot, an `adopt: false` service is
 not autostarted, but an untracked surviving child is not guarded against a
-duplicate start by an operator start or a deploy. The same holds for a live
-process whose identity could not be verified (the "unknown" case below): it is
-not adopted and not autostarted over, and its record is kept in saved state so
-each restart re-evaluates it, but an operator start or deploy can still start a
-second copy. This is pre-existing behaviour on main.
+duplicate start by an operator start or a deploy. This is pre-existing
+behaviour on main.
+
+If a live process's identity is unknown at startup (the pid is alive but the
+lookup failed), autostart is skipped for that run only. The record is not
+retained, so a later restart may autostart if the lookup succeeds or the
+record has been overwritten. Operator start and deploy are not guarded
+(pre-existing).
 
 ## Review fixes (post-implementation)
 
@@ -320,7 +323,7 @@ second copy. This is pre-existing behaviour on main.
   to a later service with the same name. The replacement carries over the old
   desired state, and has no cold-boot scheduling of its own unless only a
   startup op was pending.
-- [x] **F3** — `handleOp` start/restart record `DesiredStatus="running"` when
+- [x] **F3** — `handleOp` start/restart record `DesiredStatus="running"` (and stop records `"stopped"`) when
   the command is accepted, before the backend call, so a failed start still
   records intent.
 - [x] **D** — A successful deploy that restarts the process sets
@@ -382,21 +385,16 @@ second copy. This is pre-existing behaviour on main.
   second. The result is three-state: verified, mismatch (a different process
   or gone), or unknown (the pid is alive but a lookup failed). `TryAdopt`
   adopts only on verified; on unknown it neither adopts nor lets autostart run
-  (logged with the pid), so no duplicate is started. While the unverified
-  record is held and no process is tracked, the backend's `Status` reports
-  `unknown` (so the saved status is `unknown`, not `stopped`, and main's
-  "stopped" early return does not apply on the next restart); its record is
-  kept unchanged in later saves until the backend starts a process, so every
-  restart re-evaluates it; and an operator `stop` returns an error naming the
-  pid ("cannot stop unverified process pid N; stop it manually") after the
-  intent has been recorded. Reload's internal stop is not refused. A lookup
-  that fails because the process exited in the meantime is a mismatch. On the
-  legacy path an unreadable boot time skips that check only when a CreateTime
-  was recorded (which then decides); with no CreateTime the result is unknown.
-  `cleanOrphans` kills only on verified. A record with no identity data at all
-  is accepted, as on main. are no jitter or clock-step thresholds. `adopt: true` is
-  unchanged: adopt if possible, otherwise autostart. There is no orphan
-  tracking.
+  (logged once with the pid), so no duplicate is started for that run; nothing
+  is persisted for it. A lookup that fails because the process exited in the
+  meantime is a mismatch. If a record has identity fields but none could be
+  compared (for example a boot ID and start ID with an unreadable current boot
+  ID and no CreateTime) the result is unknown; a record with no identity
+  fields at all is accepted, as on main. On the legacy path an unreadable boot
+  time skips that check only when a CreateTime was recorded (which then
+  decides). `cleanOrphans` kills only on verified. There are no jitter or
+  clock-step thresholds. `adopt: true` is unchanged: adopt if possible,
+  otherwise autostart. There is no orphan tracking.
 - [x] **IsAlive guard** — `IsAlive(pid <= 0)` is false, since `kill(0, 0)` and
   `kill(-1, 0)` address whole process groups; this covers `TryAdopt`,
   `cleanOrphans`, `isRunning` and `pollAlive`, and `cleanOrphans` also needs
