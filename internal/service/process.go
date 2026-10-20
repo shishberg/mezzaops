@@ -273,31 +273,32 @@ func (p *ProcessBackend) RestoreBackendState(fullStateJSON json.RawMessage) {
 }
 
 // TryAdopt attempts to re-adopt a process from a previous session using
-// the restored state. Returns a string describing what happened.
-func (p *ProcessBackend) TryAdopt() string {
+// the restored state. It reports whether a live process was adopted and a
+// human-readable description of what happened.
+func (p *ProcessBackend) TryAdopt() (adopted bool, msg string) {
 	if !p.adopt {
-		return "adoption disabled"
+		return false, "adoption disabled"
 	}
 
 	if p.restoredState == nil {
-		return "no state to adopt"
+		return false, "no state to adopt"
 	}
 
 	ps := *p.restoredState
 
 	// Desired state is stopped -- respect it
 	if p.restoredStatus == "stopped" {
-		return "stopped (preserved from previous session)"
+		return false, "stopped (preserved from previous session)"
 	}
 
 	// PID is dead -- process crashed while we were down
 	if !IsAlive(ps.PID) {
-		return fmt.Sprintf("stale pid %d (process dead)", ps.PID)
+		return false, fmt.Sprintf("stale pid %d (process dead)", ps.PID)
 	}
 
 	// PID is alive but belongs to a different process (reboot or PID reuse)
 	if !VerifyProcess(ps) {
-		return fmt.Sprintf("pid %d reused by different process", ps.PID)
+		return false, fmt.Sprintf("pid %d reused by different process", ps.PID)
 	}
 
 	// PID is alive and verified -- adopt it
@@ -313,7 +314,18 @@ func (p *ProcessBackend) TryAdopt() string {
 	// Poll since we can't cmd.Wait() on a process we didn't spawn
 	go p.pollAlive(ps.PID, done)
 
-	return fmt.Sprintf("adopted (pid %d)", ps.PID)
+	return true, fmt.Sprintf("adopted (pid %d)", ps.PID)
+}
+
+// PersistedProcessAlive reports whether the pid recorded in the restored
+// state still refers to the live process we originally started. It is used
+// when adoption is disabled, to avoid starting a duplicate of a child that
+// outlived the previous manager.
+func (p *ProcessBackend) PersistedProcessAlive() bool {
+	if p.restoredState == nil || p.restoredState.PID == 0 {
+		return false
+	}
+	return IsAlive(p.restoredState.PID) && VerifyProcess(*p.restoredState)
 }
 
 // IsRunning returns whether the process is currently running (thread-safe).

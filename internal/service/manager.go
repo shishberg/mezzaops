@@ -21,6 +21,10 @@ import (
 	"github.com/shishberg/mezzaops/internal/deploy"
 )
 
+// internalStopOp stops a service without recording operator intent. It is
+// used by Reload, which stops the old service before replacing it.
+const internalStopOp = "stop-internal"
+
 // syncOp is a synchronous operation request sent to a service's goroutine.
 type syncOp struct {
 	op     string
@@ -180,7 +184,7 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool) 
 	adopt := svc.ShouldAdopt()
 	if pb, ok := backend.(*ProcessBackend); ok {
 		pb.adopt = adopt
-		msg := pb.TryAdopt()
+		adopted, msg := pb.TryAdopt()
 		log.Printf("**%s**: %s", svc.Name, msg)
 
 		// C1: if adoption did not result in a running process and
@@ -192,8 +196,13 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot bool) 
 		// issues a "start" op rather than a "restart" — a cold-boot
 		// autostart should not look like a hot reload to the
 		// notifier (no "restarted" event, no LastRestart bump).
-		adopted := strings.HasPrefix(msg, "adopted")
-		if !adopted && svc.ShouldAutostart(startOnBoot) {
+		//
+		// With adoption disabled the previous child may still be alive
+		// in its own process group. Starting another copy would create
+		// a duplicate, so refuse to autostart and warn instead.
+		if !adopted && !adopt && pb.PersistedProcessAlive() {
+			log.Printf("**%s**: WARNING: adoption is disabled but the previous process (pid %d) is still alive; not autostarting to avoid a duplicate. Stop it manually or enable adopt.", svc.Name, pb.restoredState.PID)
+		} else if !adopted && svc.ShouldAutostart(startOnBoot) {
 			if persistedDesired != "stopped" || svc.AutostartForce {
 				ms.autostartOnReady = true
 				ms.restartOnStartup = true
@@ -287,7 +296,7 @@ func (m *Manager) serviceLoop(ms *managedService) {
 			op.result <- result
 
 			// Persist state after start/stop/restart
-			if op.op == "start" || op.op == "stop" || op.op == "restart" {
+			if op.op == "start" || op.op == "stop" || op.op == "restart" || op.op == internalStopOp {
 				m.saveServiceState(ms)
 			}
 
@@ -323,17 +332,26 @@ func (m *Manager) handleOp(ms *managedService, op string) string {
 	ctx := m.ctx
 	switch op {
 	case "start":
-		if err := ms.backend.Start(ctx); err != nil {
-			return fmt.Sprintf("start failed: %v", err)
-		}
-		// Operator intent is now "running". Clear the persisted
-		// "stopped" so a future C1 autostart does not get blocked
-		// by a prior operator stop.
+		// Record operator intent when the command is accepted, before
+		// the backend call, so a failed start still clears a prior
+		// "stopped" and a later cold boot is not suppressed.
 		ms.stateMu.Lock()
 		ms.state.DesiredStatus = "running"
 		ms.stateMu.Unlock()
+		if err := ms.backend.Start(ctx); err != nil {
+			return fmt.Sprintf("start failed: %v", err)
+		}
 		m.notifyEvent(ms.config.Name, "started")
 		return "started"
+
+	case internalStopOp:
+		// Stop for an internal reason (config reload). Unlike "stop",
+		// this is not operator intent, so DesiredStatus is untouched.
+		if err := ms.backend.Stop(ctx); err != nil {
+			return fmt.Sprintf("stop failed: %v", err)
+		}
+		m.notifyEvent(ms.config.Name, "stopped")
+		return "stopped"
 
 	case "stop":
 		if err := ms.backend.Stop(ctx); err != nil {
@@ -350,12 +368,14 @@ func (m *Manager) handleOp(ms *managedService, op string) string {
 		return "stopped"
 
 	case "restart":
+		ms.stateMu.Lock()
+		ms.state.DesiredStatus = "running"
+		ms.stateMu.Unlock()
 		if err := ms.backend.Restart(ctx); err != nil {
 			return fmt.Sprintf("restart failed: %v", err)
 		}
 		ms.stateMu.Lock()
 		ms.state.LastRestart = time.Now()
-		ms.state.DesiredStatus = "running"
 		ms.stateMu.Unlock()
 		m.notifyEvent(ms.config.Name, "restarted")
 		return "restarted"
@@ -473,6 +493,9 @@ func (m *Manager) executeDeploy(ms *managedService) {
 	ms.state.LastOutput = result.Output
 	ms.state.FailedStep = ""
 	ms.state.LastRestart = time.Now()
+	// The deploy left the process running, so the operator's intent is
+	// "running" regardless of an earlier stop.
+	ms.state.DesiredStatus = "running"
 	ms.stateMu.Unlock()
 
 	m.saveServiceState(ms)
@@ -633,10 +656,24 @@ func (m *Manager) Reload() error {
 		if exists {
 			// Check if config changed
 			if !serviceConfigEqual(existing.config, svc) {
-				m.Do(svc.Name, "stop")
+				// Capture state before the internal stop: the replacement
+				// must keep the old desired state, and be running again
+				// if the old service was running.
+				status, statusErr := existing.backend.Status(m.ctx)
+				wasRunning := statusErr == nil && status == "running"
+				existing.stateMu.Lock()
+				desired := existing.state.DesiredStatus
+				existing.stateMu.Unlock()
+
+				m.Do(svc.Name, internalStopOp)
 				// Cancel the old loop by removing from map; it will exit on ctx.Done
 				// when manager stops, but we need to replace it now.
 				ms := m.newManagedService(svc, m.startOnBoot)
+				ms.state.DesiredStatus = desired
+				if wasRunning {
+					ms.autostartOnReady = true
+					ms.restartOnStartup = true
+				}
 				m.mu.Lock()
 				m.services[svc.Name] = ms
 				m.mu.Unlock()

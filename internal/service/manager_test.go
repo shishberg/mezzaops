@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1615,4 +1616,235 @@ func TestServiceConfigEqual_AutostartChangesTriggerReload(t *testing.T) {
 			assert.Equal(t, c.want, serviceConfigEqual(c.a, c.b))
 		})
 	}
+}
+
+// --- Boot-resilience follow-ups ---
+
+// waitForPersistedDesired polls the state file until desired_status matches.
+// The service loop persists state just after replying to an op, so the file
+// can lag the reply briefly.
+func waitForPersistedDesired(t *testing.T, stateDir, name, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s, _, err := LoadState(stateDir, name)
+		if err == nil && s.DesiredStatus == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("persisted desired_status for %s: got %q (err %v), want %q", name, s.DesiredStatus, err, want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// waitForStatus polls Do(name, "status") until it contains want.
+func waitForStatus(t *testing.T, m *Manager, name, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		result := m.Do(name, "status")
+		if strings.Contains(result, want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("service %s did not reach %q, status: %q", name, want, result)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestManager_ReloadPreservesDesiredStateWhenAutostartToggled(t *testing.T) {
+	servicesDir := t.TempDir()
+	svcPath := filepath.Join(servicesDir, "svc1.yaml")
+	base := "dir: /tmp\nentrypoint:\n  - sleep\n  - \"3600\"\n"
+	if err := os.WriteFile(svcPath, []byte(base), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testConfig(t)
+	cfg.ServicesDir = servicesDir
+	services, err := config.LoadServices(servicesDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := NewManager(cfg, services, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	m.SignalReady() // as in production, frontends are up before any reload
+
+	m.Do("svc1", "start")
+	waitForStatus(t, m, "svc1", "running")
+
+	// Turn autostart on for the running service and reload.
+	if err := os.WriteFile(svcPath, []byte(base+"autostart: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Reload(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForStatus(t, m, "svc1", "running")
+	if got := m.GetAllStates()["svc1"].DesiredStatus; got != "running" {
+		t.Fatalf("DesiredStatus after reload: got %q, want running", got)
+	}
+	waitForPersistedDesired(t, cfg.StateDir, "svc1", "running")
+}
+
+func TestManager_ReloadKeepsStoppedServiceStopped(t *testing.T) {
+	servicesDir := t.TempDir()
+	svcPath := filepath.Join(servicesDir, "svc1.yaml")
+	base := "dir: /tmp\nentrypoint:\n  - sleep\n  - \"3600\"\n"
+	if err := os.WriteFile(svcPath, []byte(base), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(t)
+	cfg.ServicesDir = servicesDir
+	services, _ := config.LoadServices(servicesDir)
+	m, err := NewManager(cfg, services, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	m.SignalReady()
+
+	m.Do("svc1", "start")
+	m.Do("svc1", "stop")
+
+	if err := os.WriteFile(svcPath, []byte(base+"autostart: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	waitForStatus(t, m, "svc1", "stopped")
+	if got := m.GetAllStates()["svc1"].DesiredStatus; got != "stopped" {
+		t.Fatalf("DesiredStatus after reload: got %q, want stopped", got)
+	}
+}
+
+func TestManager_FailedStartRecordsIntent(t *testing.T) {
+	for _, op := range []string{"start", "restart"} {
+		t.Run(op, func(t *testing.T) {
+			cfg := testConfig(t)
+			writeStoppedState(t, cfg.StateDir, "badsvc")
+			svc := config.ServiceConfig{
+				Name:       "badsvc",
+				Dir:        t.TempDir(),
+				Entrypoint: []string{"/nonexistent/mezzaops-test-binary"},
+			}
+			m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Stop()
+
+			result := m.Do("badsvc", op)
+			if !strings.Contains(result, "failed") {
+				t.Fatalf("expected %s to fail, got %q", op, result)
+			}
+			if got := m.GetAllStates()["badsvc"].DesiredStatus; got != "running" {
+				t.Fatalf("DesiredStatus after failed %s: got %q, want running", op, got)
+			}
+			waitForPersistedDesired(t, cfg.StateDir, "badsvc", "running")
+		})
+	}
+}
+
+func TestManager_DeployRecordsRunningIntent(t *testing.T) {
+	cfg := testConfig(t)
+	svc := config.ServiceConfig{
+		Name:       "testsvc",
+		Dir:        t.TempDir(),
+		Entrypoint: []string{"sleep", "3600"},
+		Deploy:     []string{"echo deploying"},
+	}
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	m.Do("testsvc", "start")
+	m.Do("testsvc", "stop")
+	if got := m.GetAllStates()["testsvc"].DesiredStatus; got != "stopped" {
+		t.Fatalf("precondition: DesiredStatus %q, want stopped", got)
+	}
+
+	if err := m.RequestDeploy("testsvc"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		st := m.GetAllStates()["testsvc"]
+		if st.Status == "running" && st.LastResult == "success" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("deploy did not finish: %+v", st)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := m.GetAllStates()["testsvc"].DesiredStatus; got != "running" {
+		t.Fatalf("DesiredStatus after deploy: got %q, want running", got)
+	}
+	waitForPersistedDesired(t, cfg.StateDir, "testsvc", "running")
+}
+
+func TestNewManager_AdoptFalseDoesNotAutostartOverLiveProcess(t *testing.T) {
+	cfg := testConfig(t)
+
+	// A live child in its own process group, as left behind by a
+	// previous mezzaops instance.
+	child := exec.Command("sleep", "3600")
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+	})
+
+	backend, _ := json.Marshal(map[string]int{"pid": child.Process.Pid, "pgid": child.Process.Pid})
+	if err := SaveState(cfg.StateDir, "testsvc", State{Status: "running", DesiredStatus: "running", Backend: backend}); err != nil {
+		t.Fatal(err)
+	}
+
+	yes, no := true, false
+	svc := autostartService("testsvc", t.TempDir(), &yes)
+	svc.Adopt = &no
+
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	m.SignalReady()
+
+	time.Sleep(300 * time.Millisecond)
+	if result := m.Do("testsvc", "status"); !strings.Contains(result, "stopped") {
+		t.Fatalf("autostart must not start a duplicate over a live process, status: %q", result)
+	}
+}
+
+func TestManager_InternalStopPreservesDesiredStatus(t *testing.T) {
+	cfg := testConfig(t)
+	m, err := NewManager(cfg, []config.ServiceConfig{sleepService("svc", t.TempDir())}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	m.Do("svc", "start")
+	if result := m.Do("svc", internalStopOp); result != "stopped" {
+		t.Fatalf("internal stop: got %q", result)
+	}
+	if got := m.GetAllStates()["svc"].DesiredStatus; got != "running" {
+		t.Fatalf("DesiredStatus after internal stop: got %q, want running", got)
+	}
+	waitForStatus(t, m, "svc", "stopped")
 }
