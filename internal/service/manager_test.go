@@ -28,6 +28,7 @@ import (
 // testConfig builds a Config suitable for testing with temporary directories.
 func testConfig(t *testing.T) *config.Config {
 	t.Helper()
+	cleanupChildren(t) // stop service processes the test starts
 	return &config.Config{
 		LogDir:   t.TempDir(),
 		StateDir: t.TempDir(),
