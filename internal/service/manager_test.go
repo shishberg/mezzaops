@@ -2196,80 +2196,6 @@ func TestManager_StateSavedBeforeOpReply(t *testing.T) {
 	}
 }
 
-// --- adopt: false autostart is gated on a host reboot ---
-
-func currentBootTime(t *testing.T) int64 {
-	t.Helper()
-	bt, err := host.BootTime()
-	if err != nil {
-		t.Skipf("boot time unavailable: %v", err)
-	}
-	return int64(bt)
-}
-
-// adoptFalseAutostartManager starts a manager for an adopt:false, autostart
-// service whose saved state (dead pid, desired running) has the given boot time.
-func adoptFalseAutostartManager(t *testing.T, savedBoot int64) *Manager {
-	t.Helper()
-	cfg := testConfig(t)
-	if err := SaveState(cfg.StateDir, "testsvc", State{
-		Status:        "running",
-		DesiredStatus: "running",
-		Backend:       json.RawMessage(`{"pid":99999999,"pgid":99999999}`),
-		BootTime:      savedBoot,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	yes, no := true, false
-	svc := autostartService("testsvc", t.TempDir(), &yes)
-	svc.Adopt = &no
-	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(m.Stop)
-	m.SignalReady()
-	return m
-}
-
-func TestNewManager_AdoptFalseAutostartsAfterHostReboot(t *testing.T) {
-	m := adoptFalseAutostartManager(t, currentBootTime(t)-100)
-	waitForStatus(t, m, "testsvc", "running")
-}
-
-func TestNewManager_AdoptFalseDoesNotAutostartWithoutReboot(t *testing.T) {
-	m := adoptFalseAutostartManager(t, currentBootTime(t))
-	time.Sleep(300 * time.Millisecond)
-	if result := m.Do("testsvc", "status"); !strings.Contains(result, "stopped") {
-		t.Fatalf("adopt:false service autostarted without a host reboot: %q", result)
-	}
-}
-
-func TestNewManager_AdoptFalseDoesNotAutostartWithoutRecordedBootTime(t *testing.T) {
-	m := adoptFalseAutostartManager(t, 0)
-	time.Sleep(300 * time.Millisecond)
-	if result := m.Do("testsvc", "status"); !strings.Contains(result, "stopped") {
-		t.Fatalf("adopt:false service autostarted with no recorded boot time: %q", result)
-	}
-}
-
-func TestManager_SaveRecordsBootTime(t *testing.T) {
-	cfg := testConfig(t)
-	m, err := NewManager(cfg, []config.ServiceConfig{sleepService("svc", t.TempDir())}, NopNotifier{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	m.Do("svc", "start")
-	s, _, err := LoadState(cfg.StateDir, "svc")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.BootTime != currentBootTime(t) {
-		t.Fatalf("saved boot time: got %d, want %d", s.BootTime, currentBootTime(t))
-	}
-}
-
 // --- cleanOrphans never signals a non-positive process group ---
 
 func TestCleanOrphans_NeverKillsNonPositivePgid(t *testing.T) {
@@ -2355,31 +2281,6 @@ func TestNewManager_AdoptFalseAutostartsWhenNoStateFileExists(t *testing.T) {
 }
 
 // --- boot-time tolerance ---
-
-func TestRebootedSince_ToleratesJitter(t *testing.T) {
-	// gopsutil derives boot time from now minus uptime, so consecutive
-	// reads can differ by about a second without a reboot.
-	const boot = int64(1_700_000_000)
-	orig := bootTimeFn
-	bootTimeFn = func() int64 { return boot }
-	t.Cleanup(func() { bootTimeFn = orig })
-	m := &Manager{}
-
-	for _, c := range []struct {
-		name  string
-		saved int64
-		want  bool
-	}{
-		{"same", boot, false},
-		{"one second later", boot + 1, false},
-		{"one second earlier", boot - 1, false},
-		{"real reboot", boot - 100, true},
-	} {
-		if got := m.rebootedSince("svc", c.saved); got != c.want {
-			t.Errorf("%s: rebootedSince = %v, want %v", c.name, got, c.want)
-		}
-	}
-}
 
 func TestVerifyProcess_ToleratesBootTimeJitter(t *testing.T) {
 	bt, err := host.BootTime()
@@ -2710,5 +2611,143 @@ func TestManager_SaveStateErrorIsLogged(t *testing.T) {
 	m.Do("svc", "start")
 	if out := buf.String(); !strings.Contains(out, "**svc**") || !strings.Contains(out, "saving state") {
 		t.Fatalf("a failed state save must be logged with the service name, got: %q", out)
+	}
+}
+
+// --- adopt: false autostart is gated on a host reboot (boot ID) ---
+
+// withBootID substitutes the current boot ID for the test.
+func withBootID(t *testing.T, id string) {
+	t.Helper()
+	orig := bootIDFn
+	bootIDFn = func() string { return id }
+	t.Cleanup(func() { bootIDFn = orig })
+}
+
+// adoptFalseAutostartManager starts a manager for an adopt:false, autostart
+// service whose saved state (dead pid, desired running) has the given boot ID.
+func adoptFalseAutostartManager(t *testing.T, savedBootID string) *Manager {
+	t.Helper()
+	cfg := testConfig(t)
+	if err := SaveState(cfg.StateDir, "testsvc", State{
+		Status:        "running",
+		DesiredStatus: "running",
+		Backend:       json.RawMessage(`{"pid":99999999,"pgid":99999999}`),
+		BootID:        savedBootID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	yes, no := true, false
+	svc := autostartService("testsvc", t.TempDir(), &yes)
+	svc.Adopt = &no
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Stop)
+	m.SignalReady()
+	return m
+}
+
+func TestNewManager_AdoptFalseAutostartsAfterHostReboot(t *testing.T) {
+	withBootID(t, "boot-B")
+	m := adoptFalseAutostartManager(t, "boot-A")
+	waitForStatus(t, m, "testsvc", "running")
+}
+
+func TestNewManager_AdoptFalseDoesNotAutostartOnSameBoot(t *testing.T) {
+	withBootID(t, "boot-A")
+	m := adoptFalseAutostartManager(t, "boot-A")
+	time.Sleep(300 * time.Millisecond)
+	if result := m.Do("testsvc", "status"); !strings.Contains(result, "stopped") {
+		t.Fatalf("adopt:false service autostarted without a host reboot: %q", result)
+	}
+}
+
+func TestNewManager_AdoptFalseDoesNotAutostartWhenBootIDUnknown(t *testing.T) {
+	for name, c := range map[string]struct{ now, saved string }{
+		"saved state has none": {"boot-B", ""},
+		"current unavailable":  {"", "boot-A"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			withBootID(t, c.now)
+			m := adoptFalseAutostartManager(t, c.saved)
+			time.Sleep(300 * time.Millisecond)
+			if result := m.Do("testsvc", "status"); !strings.Contains(result, "stopped") {
+				t.Fatalf("autostarted with an unknown boot ID: %q", result)
+			}
+		})
+	}
+}
+
+func TestManager_SaveRecordsBootID(t *testing.T) {
+	withBootID(t, "boot-X")
+	cfg := testConfig(t)
+	m, err := NewManager(cfg, []config.ServiceConfig{sleepService("svc", t.TempDir())}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	m.Do("svc", "start")
+	s, raw, err := LoadState(cfg.StateDir, "svc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.BootID != "boot-X" {
+		t.Fatalf("saved boot id: got %q", s.BootID)
+	}
+	if strings.Count(string(raw), `"boot_id":"boot-X"`) != 2 { // state and process record
+		t.Fatalf("process record should carry the boot id: %s", raw)
+	}
+}
+
+func TestVerifyProcess_BootID(t *testing.T) {
+	withBootID(t, "boot-A")
+	bt, err := host.BootTime()
+	if err != nil {
+		t.Skip(err)
+	}
+	pid := os.Getpid()
+	// Matching IDs: same boot, even if the (jittery) boot time disagrees.
+	if !VerifyProcess(processBackendState{PID: pid, BootID: "boot-A", BootTime: int64(bt) - 500}) {
+		t.Error("matching boot ID must verify")
+	}
+	if VerifyProcess(processBackendState{PID: pid, BootID: "boot-OLD", BootTime: int64(bt)}) {
+		t.Error("a different boot ID must not verify")
+	}
+	// An ID on only one side falls back to the boot-time check.
+	if !VerifyProcess(processBackendState{PID: pid, BootTime: int64(bt)}) {
+		t.Error("no recorded ID: matching boot time must verify")
+	}
+	if VerifyProcess(processBackendState{PID: pid, BootTime: int64(bt) - 500}) {
+		t.Error("no recorded ID: different boot time must not verify")
+	}
+	withBootID(t, "")
+	if VerifyProcess(processBackendState{PID: pid, BootID: "boot-A", BootTime: int64(bt) - 500}) {
+		t.Error("no current ID: fall back to the boot time, which differs")
+	}
+}
+
+func TestBootID_RealValueIsNonEmpty(t *testing.T) {
+	if id := bootID(); id == "" {
+		t.Fatal("bootID() returned empty on a supported platform")
+	}
+}
+
+func TestRebootedSince(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		now, saved string
+		want       bool
+	}{
+		{"same", "a", "a", false},
+		{"different", "b", "a", true},
+		{"saved empty", "b", "", false},
+		{"current empty", "", "a", false},
+	} {
+		m := &Manager{bootID: c.now}
+		if got := m.rebootedSince("svc", c.saved); got != c.want {
+			t.Errorf("%s: rebootedSince = %v, want %v", c.name, got, c.want)
+		}
 	}
 }

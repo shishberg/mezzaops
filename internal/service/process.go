@@ -22,6 +22,7 @@ type processBackendState struct {
 	LogPath    string `json:"log_path,omitempty"`
 	BootTime   int64  `json:"boot_time,omitempty"`
 	CreateTime int64  `json:"create_time,omitempty"`
+	BootID     string `json:"boot_id,omitempty"`
 }
 
 // ProcessBackend manages a service as a child process with process adoption
@@ -224,6 +225,7 @@ func saveBackendStateFromFields(pid, pgid int, logPath string) json.RawMessage {
 	if bootTime, err := host.BootTime(); err == nil {
 		ps.BootTime = int64(bootTime)
 	}
+	ps.BootID = bootIDFn()
 	if proc, err := process.NewProcess(int32(pid)); err == nil {
 		if ct, err := proc.CreateTime(); err == nil {
 			ps.CreateTime = ct

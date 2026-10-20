@@ -314,22 +314,26 @@ behaviour on main.
   `DesiredStatus="running"`, so a prior operator stop no longer suppresses
   cold-boot autostart for a running service.
 - [x] **E** — An `adopt: false` service is autostarted only on a real cold
-  boot: the host boot time (gopsutil `host.BootTime`, recorded in the service
-  state on every save as `boot_time`) must differ from the one in the saved
-  state by more than 10 seconds (gopsutil derives boot time from now minus
-  uptime, so reads jitter by about a second; the same tolerance is used by
-  `VerifyProcess`, and the first read is cached with
-  `host.EnableBootTimeCache`). After a host reboot no child can have survived, so there is no
+  boot, detected with the kernel's per-boot UUID rather than a boot time
+  (gopsutil derives boot time from the wall clock minus uptime, so it changes
+  when NTP steps the clock): `/proc/sys/kernel/random/boot_id` on Linux,
+  `kern.bootsessionuuid` on macOS, behind `bootID()` in build-tagged files.
+  The ID is read once per manager and recorded in the service state on every
+  save as `boot_id` (and in the process backend record). The service is
+  autostarted iff both the recorded and the current IDs are non-empty and
+  differ. After a host reboot no child can have survived, so there is no
   duplicate to avoid. A service with no state file at all in a configured
-  state dir has never run here, so it is autostarted too. If mezzaops
-  restarts without a host reboot, an `adopt: false` service is not
-  autostarted and one line is logged saying why (the previous process may
-  still be running); this matches the behaviour before this branch, when
-  `adopt: false` never started anything at boot. If the boot time cannot be
-  determined, or an existing saved state has none (or no state dir is
-  configured), it is likewise not autostarted. `adopt: true` is unchanged:
-  adopt if possible, otherwise autostart. The no-state-file rule assumes the state dir is stable and writable;
-  state save errors are logged with the service name. There is no orphan
+  state dir has never run here, so it is autostarted too; that rule assumes
+  the state dir is stable and writable, and state save errors are logged with
+  the service name. If mezzaops restarts without a host reboot, an
+  `adopt: false` service is not autostarted and one line is logged saying why
+  (the previous process may still be running); this matches the behaviour
+  before this branch, when `adopt: false` never started anything at boot. If
+  either ID is unknown (an existing saved state without one, or the ID is
+  unavailable, or no state dir is configured) it is likewise not autostarted.
+  `VerifyProcess` compares boot IDs when both sides have one and otherwise
+  falls back to the boot time with a 10 second tolerance. `adopt: true` is
+  unchanged: adopt if possible, otherwise autostart. There is no orphan
   tracking.
 - [x] **IsAlive guard** — `IsAlive(pid <= 0)` is false, since `kill(0, 0)` and
   `kill(-1, 0)` address whole process groups; this covers `TryAdopt`,

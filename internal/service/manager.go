@@ -19,7 +19,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shishberg/mezzaops/internal/config"
 	"github.com/shishberg/mezzaops/internal/deploy"
 )
@@ -97,6 +96,9 @@ type Manager struct {
 	logDir   string
 	stateDir string
 
+	// bootID is the host boot ID, read once when the manager is created.
+	bootID string
+
 	// For reload
 	servicesDir string
 	reloadMu    sync.Mutex // serializes Reload
@@ -159,6 +161,7 @@ func newManager(cfg *config.Config, services []config.ServiceConfig, notifier No
 		readyCh:     make(chan struct{}),
 		shutdownCh:  make(chan struct{}),
 	}
+	m.bootID = bootIDFn()
 	m.newBackend = factory
 	if m.newBackend == nil {
 		m.newBackend = m.backendForConfig
@@ -223,13 +226,13 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot, repla
 	// stopped) would silently break cold-boot recovery for services
 	// that crashed just before the upgrade.
 	var persistedDesired string
-	var persistedBoot int64
+	var persistedBootID string
 	s, raw, err := LoadState(m.stateDir, svc.Name)
 	// With a state dir configured but no state file for this service, it
 	// has never run here, so no previous child can exist.
 	neverRan := err != nil && m.stateDir != "" && errors.Is(err, fs.ErrNotExist)
 	if err == nil {
-		persistedBoot = s.BootTime
+		persistedBootID = s.BootID
 		ms.state.LastDeploy = s.LastDeploy
 		ms.state.LastRestart = s.LastRestart
 		ms.state.LastResult = s.LastResult
@@ -264,7 +267,7 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot, repla
 		// (no child can have survived one); see rebootedSince.
 		if !adopted && !replacing && svc.ShouldAutostart(startOnBoot) {
 			if (persistedDesired != "stopped" || svc.AutostartForce) &&
-				(adopt || neverRan || m.rebootedSince(svc.Name, persistedBoot)) {
+				(adopt || neverRan || m.rebootedSince(svc.Name, persistedBootID)) {
 				ms.autostartOnReady = true
 				ms.restartOnStartup = true
 				reason := "cold boot (adoption failed)"
@@ -281,27 +284,18 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot, repla
 	return ms
 }
 
-// bootTimeFn returns the host boot time (unix seconds), or 0 if unknown.
-// A variable so tests can substitute it.
-var bootTimeFn = func() int64 {
-	bt, err := host.BootTime()
-	if err != nil {
-		return 0
-	}
-	return int64(bt)
-}
-
 // rebootedSince reports whether the host rebooted since the state recording
-// savedBoot was written, logging why an adopt: false service is not
-// autostarted when it did not (or when that cannot be determined).
-func (m *Manager) rebootedSince(name string, savedBoot int64) bool {
-	now := bootTimeFn()
+// savedBootID was written, logging why an adopt: false service is not
+// autostarted when it did not (or when that cannot be determined). It
+// compares per-boot IDs, which unlike a wall-clock-derived boot time do not
+// change when the clock is stepped.
+func (m *Manager) rebootedSince(name, savedBootID string) bool {
 	switch {
-	case savedBoot == 0:
-		log.Printf("**%s**: adopt: false, not autostarting: no host boot time recorded in the saved state", name)
-	case now == 0:
-		log.Printf("**%s**: adopt: false, not autostarting: cannot determine the current host boot time", name)
-	case sameBoot(now, savedBoot):
+	case savedBootID == "":
+		log.Printf("**%s**: adopt: false, not autostarting: no host boot ID recorded in the saved state", name)
+	case m.bootID == "":
+		log.Printf("**%s**: adopt: false, not autostarting: cannot determine the current host boot ID", name)
+	case m.bootID == savedBootID:
 		log.Printf("**%s**: adopt: false, not autostarting: mezzaops restarted without a host reboot, so the previous process may still be running", name)
 	default:
 		return true
@@ -751,7 +745,7 @@ func (m *Manager) saveServiceState(ms *managedService) {
 		LastOutput:    ms.state.LastOutput,
 		FailedStep:    ms.state.FailedStep,
 		Backend:       backendState,
-		BootTime:      bootTimeFn(),
+		BootID:        m.bootID,
 	}
 	ms.stateMu.Unlock()
 

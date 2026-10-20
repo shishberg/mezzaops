@@ -30,9 +30,9 @@ type State struct {
 	LastOutput    string          `json:"last_output,omitempty"`
 	FailedStep    string          `json:"failed_step,omitempty"`
 	Backend       json.RawMessage `json:"backend,omitempty"`
-	// BootTime is the host boot time (unix seconds) when the state was last
-	// saved. A different value on the next load means the host rebooted.
-	BootTime int64 `json:"boot_time,omitempty"`
+	// BootID is the kernel's per-boot UUID when the state was last saved. A
+	// different value on the next load means the host rebooted.
+	BootID string `json:"boot_id,omitempty"`
 }
 
 func statePath(dir, name string) string {
