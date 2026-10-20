@@ -4,8 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -179,19 +182,42 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // knownTopLevelConfigKeys is the set of top-level keys LoadConfig recognises.
-// Kept in one place so warnUnknownTopLevelKeys and the Config struct cannot
-// drift apart without a compile error in tests.
-var knownTopLevelConfigKeys = map[string]struct{}{
-	"services_dir":      {},
-	"log_dir":           {},
-	"state_dir":         {},
-	"discord":           {},
-	"mattermost":        {},
-	"matrix":            {},
-	"webhook":           {},
-	"dashboard":         {},
-	"readiness_timeout": {},
-	"start_on_boot":     {},
+// It is derived from the yaml tags on Config, so a new field is recognised
+// automatically.
+var knownTopLevelConfigKeys = yamlKeys(reflect.TypeFor[Config]())
+
+// yamlKeys returns the set of YAML mapping keys that decoding into struct
+// type t accepts. It follows yaml.v3 conventions: a tag of "-" omits the
+// field, ",inline" on a struct field merges that struct's keys, an empty
+// name defaults to the lowercased field name, and unexported fields are
+// ignored unless embedded, as in yaml.v3.
+func yamlKeys(t reflect.Type) map[string]struct{} {
+	keys := make(map[string]struct{})
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if !f.IsExported() && !f.Anonymous {
+			continue
+		}
+		name, opts, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		if name == "-" && opts == "" {
+			continue
+		}
+		if slices.Contains(strings.Split(opts, ","), "inline") {
+			ft := f.Type
+			if ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				maps.Copy(keys, yamlKeys(ft))
+			}
+			continue
+		}
+		if name == "" {
+			name = strings.ToLower(f.Name)
+		}
+		keys[name] = struct{}{}
+	}
+	return keys
 }
 
 // warnUnknownTopLevelKeys walks the top-level mapping of a parsed config

@@ -2,9 +2,11 @@ package config_test
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -529,4 +531,32 @@ func TestLoadConfig_ReadinessTimeoutIsKnownKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, strings.Contains(out, "unknown"),
 		"readiness_timeout should be a known top-level key, got: %q", out)
+}
+
+func TestLoadConfig_EveryConfigYAMLTagIsKnown(t *testing.T) {
+	// Every yaml-tagged field on Config must be accepted without an
+	// "unknown top-level key" warning. Keys are derived from the struct,
+	// so adding a field cannot leave this out of sync.
+	typ := reflect.TypeFor[config.Config]()
+	var doc strings.Builder
+	n := 0
+	for i := range typ.NumField() {
+		tag, _, _ := strings.Cut(typ.Field(i).Tag.Get("yaml"), ",")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		fmt.Fprintf(&doc, "%s:\n", tag) // null value decodes into any field type
+		n++
+	}
+	require.Positive(t, n)
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(doc.String()), 0o644))
+
+	var err error
+	out := captureLog(t, func() {
+		_, err = config.LoadConfig(path)
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, out, "unknown top-level key")
 }
