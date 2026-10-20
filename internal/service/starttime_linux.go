@@ -18,4 +18,9 @@ func processStartID(pid int) (int64, error) {
 
 // startIDIsCreateTime reports whether the start ID is the creation time, so a
 // record that already has CreateTime need not look the process up again.
-var startIDIsCreateTime = false
+const startIDIsCreateTime = false
+
+// createTimeCanReject: on Linux CreateTime is derived from the wall clock, so a
+// clock step on the same boot moves it for the very same process. It can
+// confirm a process but a difference proves nothing.
+const createTimeCanReject = false

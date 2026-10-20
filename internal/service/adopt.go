@@ -56,8 +56,26 @@ func isGone(err error) bool {
 	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, process.ErrorProcessNotRunning)
 }
 
-// verifyProcessResult checks that the PID in the state still refers to the
-// same process we originally started. The steps, in order:
+// mismatchReason says why verifyMismatch was returned.
+type mismatchReason int
+
+const (
+	reasonNone             mismatchReason = iota
+	reasonBadPID                          // pid <= 0
+	reasonDead                            // the process is gone
+	reasonDifferentBoot                   // recorded under a different boot
+	reasonDifferentProcess                // alive, but not the recorded process
+)
+
+// verifyProcessResult checks a record against the live process using the
+// platform's rules (startIDIsCreateTime, createTimeCanReject).
+func verifyProcessResult(ps processBackendState) (verifyResult, mismatchReason) {
+	return verifyProcess(ps, startIDIsCreateTime, createTimeCanReject)
+}
+
+// verifyProcess checks that the PID in the state still refers to the same
+// process we originally started. The two platform parameters are explicit so
+// tests can cover both values. The steps, in order:
 //
 //  1. A non-positive pid, or one that is not alive, is a mismatch.
 //  2. A record with no identity fields at all (BootID, StartID, BootTime and
@@ -72,77 +90,84 @@ func isGone(err error) bool {
 //     the start ID (start ticks since boot on Linux, creation time on macOS;
 //     exact and clock-independent) is looked up: equal is verified, different
 //     is a mismatch. If the lookup fails, a process that has exited is a
-//     mismatch. Otherwise it is unknown on macOS (the CreateTime lookup would
-//     be the same call); on Linux the CreateTime check is tried, but because
-//     CreateTime moves when the clock is stepped it can then only verify the
-//     process, never reject it (a difference is unknown).
+//     mismatch; otherwise it is unknown on macOS (startIDIsCreateTime: the
+//     CreateTime lookup would be the same call) and on Linux step 5 is tried.
 //  5. If the record has a CreateTime it is looked up and compared with
-//     createTimeMatches (exact on macOS, legacyCreateTimeTolerance on Linux,
-//     where gopsutil recomputes the boot time and CreateTime wobbles by about a
-//     second). A match is verified; a difference is a mismatch, except after a
-//     failed start ID lookup (see step 4); a failed lookup is a mismatch if
-//     the process has exited and unknown if it is alive.
+//     createTimeMatches (exact on macOS, legacyCreateTimeTolerance on Linux).
+//     A match is verified. A difference is a mismatch only where
+//     createTimeCanReject (macOS, where CreateTime is absolute); on Linux
+//     CreateTime moves when the clock is stepped, so a difference is unknown.
+//     A failed lookup is a mismatch if the process has exited and unknown if
+//     it is alive.
 //  6. Otherwise no per-process comparison was possible: unknown.
-func verifyProcessResult(ps processBackendState) verifyResult {
-	if ps.PID <= 0 || !isAliveFn(ps.PID) {
-		return verifyMismatch
+//
+// Trade-off: on Linux a legacy record (no start ID) whose pid was reused on
+// the same boot is unknown, not a mismatch, so the service is not autostarted
+// that run (and this is logged) rather than risking a duplicate. Records with
+// a start ID detect pid reuse exactly.
+func verifyProcess(ps processBackendState, startIDIsCT, ctCanReject bool) (verifyResult, mismatchReason) {
+	if ps.PID <= 0 {
+		return verifyMismatch, reasonBadPID
+	}
+	if !isAliveFn(ps.PID) {
+		return verifyMismatch, reasonDead
 	}
 	if ps.BootID == "" && ps.StartID == 0 && ps.BootTime == 0 && ps.CreateTime == 0 {
-		return verifyVerified
+		return verifyVerified, reasonNone
 	}
 
 	cur := bootIDFn()
 	sameBootID := false
 	if ps.BootID != "" && cur != "" {
 		if ps.BootID != cur {
-			return verifyMismatch
+			return verifyMismatch, reasonDifferentBoot
 		}
 		sameBootID = true
 	} else if ps.BootTime != 0 {
 		if bt, err := bootTimeFn(); err == nil && !sameBoot(bt, ps.BootTime) {
-			return verifyMismatch
+			return verifyMismatch, reasonDifferentBoot
 		}
 	}
 
-	startIDApplied := false
 	if ps.StartID != 0 && sameBootID {
-		startIDApplied = true
 		id, err := processStartIDFn(ps.PID)
 		if err == nil {
 			if id == ps.StartID {
-				return verifyVerified
+				return verifyVerified, reasonNone
 			}
-			return verifyMismatch
+			return verifyMismatch, reasonDifferentProcess
 		}
 		if goneAfter(ps.PID, err) {
-			return verifyMismatch
+			return verifyMismatch, reasonDead
 		}
-		// Alive, but the start ID could not be read.
-		if startIDIsCreateTime {
-			// The CreateTime lookup would be the same call.
-			return verifyUnknown
+		if startIDIsCT {
+			return verifyUnknown, reasonNone
 		}
-		// On Linux CreateTime moves when the clock is stepped, so below it
-		// can confirm the process but never reject it.
 	}
 
 	if ps.CreateTime != 0 {
-		live, err := createTimeFn(ps.PID)
-		if err != nil {
-			if goneAfter(ps.PID, err) {
-				return verifyMismatch
-			}
-			return verifyUnknown
-		}
-		if createTimeMatches(live, ps.CreateTime, legacyCreateTimeTolerance) {
-			return verifyVerified
-		}
-		if startIDApplied {
-			return verifyUnknown
-		}
-		return verifyMismatch
+		return checkCreateTime(ps, ctCanReject)
 	}
-	return verifyUnknown
+	return verifyUnknown, reasonNone
+}
+
+// checkCreateTime compares the record's CreateTime with the live one.
+func checkCreateTime(ps processBackendState, canReject bool) (verifyResult, mismatchReason) {
+	live, err := createTimeFn(ps.PID)
+	if err != nil {
+		if goneAfter(ps.PID, err) {
+			return verifyMismatch, reasonDead
+		}
+		return verifyUnknown, reasonNone
+	}
+	switch {
+	case createTimeMatches(live, ps.CreateTime, legacyCreateTimeTolerance):
+		return verifyVerified, reasonNone
+	case canReject:
+		return verifyMismatch, reasonDifferentProcess
+	default:
+		return verifyUnknown, reasonNone
+	}
 }
 
 // goneAfter reports whether a failed lookup means the process no longer
@@ -197,5 +222,6 @@ func isAliveFn(pid int) bool {
 // An unknown result is not verified (cleanOrphans, for one, must not kill on
 // it).
 func VerifyProcess(ps processBackendState) bool {
-	return verifyProcessResult(ps) == verifyVerified
+	result, _ := verifyProcessResult(ps)
+	return result == verifyVerified
 }
