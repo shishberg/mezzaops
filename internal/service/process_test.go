@@ -1,12 +1,9 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -390,110 +387,4 @@ func TestProcessBackend_TryAdoptStalePID(t *testing.T) {
 	if !strings.Contains(msg, "stale pid") {
 		t.Fatalf("TryAdopt with dead PID: got %q", msg)
 	}
-}
-
-func TestProcessBackend_PersistedProcessAlive(t *testing.T) {
-	child := exec.Command("sleep", "3600")
-	if err := child.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
-	pid := child.Process.Pid
-
-	var live processBackendState
-	if err := json.Unmarshal(orphanBackendState(t, pid), &live); err != nil {
-		t.Fatal(err)
-	}
-
-	cases := []struct {
-		name  string
-		state *processBackendState
-		want  bool
-	}{
-		{"nil", nil, false},
-		{"matching create time", &live, true},
-		{"no timing data falls back to alive", &processBackendState{PID: pid, PGID: pid}, true},
-		{"boot time mismatch is dead", &processBackendState{PID: pid, PGID: pid, BootTime: 1, CreateTime: live.CreateTime}, false},
-		{"create time mismatch", &processBackendState{PID: pid, PGID: pid, CreateTime: live.CreateTime + 100000}, false},
-		{"dead pid", &processBackendState{PID: 99999999, CreateTime: live.CreateTime}, false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", t.TempDir())
-			b.restoredState = c.state
-			if got := b.PersistedProcessAlive(); got != c.want {
-				t.Fatalf("PersistedProcessAlive: got %v, want %v", got, c.want)
-			}
-		})
-	}
-}
-
-func TestProcessBackend_ExitedChildLeavesNoPidInSavedState(t *testing.T) {
-	b := newTestBackend(t, []string{"true"}, "")
-	if err := b.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-b.WaitForExit():
-	case <-time.After(5 * time.Second):
-		t.Fatal("child did not exit")
-	}
-	if raw := b.SaveBackendState(); raw != nil {
-		t.Fatalf("an exited child must not persist its pid, got %s", raw)
-	}
-}
-
-func TestProcessBackend_UnverifiedWarningLoggedOnce(t *testing.T) {
-	child := exec.Command("sleep", "3600")
-	if err := child.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
-
-	b := newTestBackend(t, []string{"sleep", "3600"}, "")
-	raw, _ := json.Marshal(processBackendState{PID: child.Process.Pid, PGID: child.Process.Pid})
-	b.RestoreBackendState(raw)
-	b.MarkOrphan()
-
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
-	for range 3 {
-		_ = b.Start(context.Background())
-		_ = b.SaveBackendState()
-		_ = b.PersistedProcessAlive()
-	}
-	if n := strings.Count(buf.String(), "cannot be verified"); n != 1 {
-		t.Fatalf("unverified warning logged %d times, want once:\n%s", n, buf.String())
-	}
-	if !strings.Contains(buf.String(), "no create time recorded") {
-		t.Fatalf("warning should say why: %s", buf.String())
-	}
-}
-
-func TestProcessBackend_StartRefusedWhileOrphanAliveThenAllowed(t *testing.T) {
-	child := exec.Command("sleep", "3600")
-	if err := child.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
-
-	b := newTestBackend(t, []string{"sleep", "3600"}, "")
-	b.adopt = false
-	b.RestoreBackendState(orphanBackendState(t, child.Process.Pid))
-	b.MarkOrphan()
-
-	if err := b.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "still running") {
-		t.Fatalf("Start over live orphan: got %v", err)
-	}
-	if b.SaveBackendState() == nil {
-		t.Fatal("orphan record must be kept after a refused Start")
-	}
-
-	_ = child.Process.Kill()
-	_ = child.Wait()
-	if err := b.Start(context.Background()); err != nil {
-		t.Fatalf("Start after orphan exited: %v", err)
-	}
-	t.Cleanup(func() { _ = b.Stop(context.Background()) })
 }

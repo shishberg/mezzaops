@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/process"
+	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shishberg/mezzaops/internal/config"
 	"github.com/stretchr/testify/assert"
 )
@@ -1799,43 +1798,6 @@ func TestManager_DeployRecordsRunningIntent(t *testing.T) {
 	waitForPersistedDesired(t, cfg.StateDir, "testsvc", "running")
 }
 
-func TestNewManager_AdoptFalseDoesNotAutostartOverLiveProcess(t *testing.T) {
-	cfg := testConfig(t)
-
-	// A live child in its own process group, as left behind by a
-	// previous mezzaops instance.
-	child := exec.Command("sleep", "3600")
-	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := child.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = child.Process.Kill()
-		_ = child.Wait()
-	})
-
-	backend := orphanBackendState(t, child.Process.Pid)
-	if err := SaveState(cfg.StateDir, "testsvc", State{Status: "running", DesiredStatus: "running", Backend: backend}); err != nil {
-		t.Fatal(err)
-	}
-
-	yes, no := true, false
-	svc := autostartService("testsvc", t.TempDir(), &yes)
-	svc.Adopt = &no
-
-	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	m.SignalReady()
-
-	time.Sleep(300 * time.Millisecond)
-	if result := m.Do("testsvc", "status"); !strings.Contains(result, "stopped") {
-		t.Fatalf("autostart must not start a duplicate over a live process, status: %q", result)
-	}
-}
-
 func TestManager_InternalStopPreservesDesiredStatus(t *testing.T) {
 	cfg := testConfig(t)
 	m, err := NewManager(cfg, []config.ServiceConfig{sleepService("svc", t.TempDir())}, NopNotifier{})
@@ -1856,34 +1818,15 @@ func TestManager_InternalStopPreservesDesiredStatus(t *testing.T) {
 	}
 }
 
-// orphanBackendState builds a persisted backend record for a live pid,
-// including the create time that PersistedProcessAlive requires.
-func orphanBackendState(t *testing.T, pid int) json.RawMessage {
-	t.Helper()
-	proc, err := process.NewProcess(int32(pid))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ct, err := proc.CreateTime()
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, err := json.Marshal(processBackendState{PID: pid, PGID: pid, CreateTime: ct})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return raw
-}
-
 // reloadFixture creates a manager with one service svc1 loaded from a
 // services dir, returning a helper that rewrites the service file.
 func reloadFixture(t *testing.T, extra string) (*Manager, *config.Config, func(extra string)) {
 	t.Helper()
-	return reloadFixtureWith(t, extra, nil)
+	return reloadFixtureWith(t, extra, nil, NopNotifier{})
 }
 
 // reloadFixtureWith is reloadFixture with an optional backend factory.
-func reloadFixtureWith(t *testing.T, extra string, factory func(config.ServiceConfig) Backend) (*Manager, *config.Config, func(extra string)) {
+func reloadFixtureWith(t *testing.T, extra string, factory func(config.ServiceConfig) Backend, notifier Notifier) (*Manager, *config.Config, func(extra string)) {
 	t.Helper()
 	servicesDir := t.TempDir()
 	svcPath := filepath.Join(servicesDir, "svc1.yaml")
@@ -1900,7 +1843,7 @@ func reloadFixtureWith(t *testing.T, extra string, factory func(config.ServiceCo
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := newManager(cfg, services, NopNotifier{}, factory)
+	m, err := newManager(cfg, services, notifier, factory)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1953,7 +1896,7 @@ func TestManager_ReloadStoppedAdoptFalseServiceStaysStopped(t *testing.T) {
 
 // failingStopBackend wraps a ProcessBackend and fails Stop while fail is set.
 // Embedding *ProcessBackend keeps it recognised as process-backed, so the
-// production adoption and orphan paths run against it.
+// production adoption path runs against it.
 type failingStopBackend struct {
 	*ProcessBackend
 	fail *atomic.Bool
@@ -1973,7 +1916,7 @@ func TestManager_ReloadAbortsWhenInternalStopFails(t *testing.T) {
 		pb := NewProcessBackend(svc.Name, svc.Dir, svc.Entrypoint, svc.Process.Cmd, logDir)
 		return failingStopBackend{ProcessBackend: pb, fail: &fail}
 	}
-	m, _, write := reloadFixtureWith(t, "", factory)
+	m, _, write := reloadFixtureWith(t, "", factory, NopNotifier{})
 	m.Do("svc1", "start")
 	waitForStatus(t, m, "svc1", "running")
 
@@ -2022,273 +1965,6 @@ func TestManager_ReloadRespectsStopQueuedBeforeReload(t *testing.T) {
 	}
 }
 
-func TestManager_OrphanGuardSurvivesSaveAndReload(t *testing.T) {
-	cfg := testConfig(t)
-	servicesDir := t.TempDir()
-	cfg.ServicesDir = servicesDir
-	svcPath := filepath.Join(servicesDir, "svc1.yaml")
-	write := func(extra string) {
-		data := "dir: /tmp\nadopt: false\nautostart: true\nentrypoint:\n  - sleep\n  - \"3600\"\n" + extra
-		if err := os.WriteFile(svcPath, []byte(data), 0644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write("")
-
-	child := exec.Command("sleep", "3600")
-	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := child.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
-	if err := SaveState(cfg.StateDir, "svc1", State{
-		Status: "running", DesiredStatus: "running",
-		Backend: orphanBackendState(t, child.Process.Pid),
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	services, err := config.LoadServices(servicesDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	m, err := NewManager(cfg, services, NopNotifier{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.SignalReady()
-
-	for i, extra := range []string{"branch: a\n", "branch: b\n"} {
-		time.Sleep(200 * time.Millisecond)
-		waitForStatus(t, m, "svc1", "stopped")
-		write(extra)
-		if err := m.Reload(); err != nil {
-			t.Fatal(err)
-		}
-		time.Sleep(200 * time.Millisecond)
-		if result := m.Do("svc1", "status"); !strings.Contains(result, "stopped") {
-			t.Fatalf("reload %d started a duplicate over the live orphan: %q", i+1, result)
-		}
-	}
-
-	// A later cold boot (fresh manager, same state dir) must still see
-	// the orphan and refuse to autostart a duplicate.
-	m.Stop()
-	services, err = config.LoadServices(servicesDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	m2, err := NewManager(cfg, services, NopNotifier{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m2.Stop()
-	m2.SignalReady()
-	time.Sleep(300 * time.Millisecond)
-	if result := m2.Do("svc1", "status"); !strings.Contains(result, "stopped") {
-		t.Fatalf("cold boot after save/reload started a duplicate: %q", result)
-	}
-}
-
-// orphanFixture starts a live child in its own process group, as left
-// behind by a previous instance, and persists a state file for svc1 that
-// records it the way an adopt:false run does (status "stopped").
-func orphanFixture(t *testing.T, stateDir string) *exec.Cmd {
-	t.Helper()
-	child := exec.Command("sleep", "3600")
-	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := child.Start(); err != nil {
-		t.Fatal(err)
-	}
-	reaped := make(chan struct{})
-	go func() { _ = child.Wait(); close(reaped) }() // a killed orphan must not linger as a zombie
-	t.Cleanup(func() { _ = child.Process.Kill(); <-reaped })
-	if err := SaveState(stateDir, "svc1", State{
-		Status: "stopped", DesiredStatus: "running",
-		Backend: orphanBackendState(t, child.Process.Pid),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	return child
-}
-
-func orphanService(dir string, adopt bool, deploy ...string) config.ServiceConfig {
-	yes := true
-	svc := autostartService("svc1", dir, &yes)
-	svc.Adopt = &adopt
-	svc.Deploy = deploy
-	return svc
-}
-
-func TestManager_StartRefusedWhileOrphanAlive(t *testing.T) {
-	cfg := testConfig(t)
-	child := orphanFixture(t, cfg.StateDir)
-	m, err := NewManager(cfg, []config.ServiceConfig{orphanService(t.TempDir(), false)}, NopNotifier{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	m.SignalReady()
-
-	if result := m.Do("svc1", "start"); !strings.Contains(result, "still running") {
-		t.Fatalf("start over a live orphan: got %q, want refusal", result)
-	}
-	if !IsAlive(child.Process.Pid) {
-		t.Fatal("a refused start must leave the orphan alone")
-	}
-	// The record must survive for the next boot.
-	waitForPersistedPID(t, cfg.StateDir, "svc1", child.Process.Pid)
-}
-
-func TestManager_StopTerminatesVerifiedOrphan(t *testing.T) {
-	cfg := testConfig(t)
-	child := orphanFixture(t, cfg.StateDir)
-	m, err := NewManager(cfg, []config.ServiceConfig{orphanService(t.TempDir(), false)}, NopNotifier{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	m.SignalReady()
-
-	if result := m.Do("svc1", "stop"); result != "stopped" {
-		t.Fatalf("stop over a verified orphan: got %q", result)
-	}
-	waitForDead(t, child.Process.Pid)
-	// With the orphan gone, start works and the record is replaced.
-	if result := m.Do("svc1", "start"); result != "started" {
-		t.Fatalf("start after orphan stopped: got %q", result)
-	}
-}
-
-func TestManager_DeployTerminatesVerifiedOrphanAndStarts(t *testing.T) {
-	cfg := testConfig(t)
-	child := orphanFixture(t, cfg.StateDir)
-	m, err := NewManager(cfg, []config.ServiceConfig{orphanService(t.TempDir(), false, "echo deploying")}, NopNotifier{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	m.SignalReady()
-
-	if err := m.RequestDeploy("svc1"); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		st := m.GetAllStates()["svc1"]
-		if st.LastResult == "success" && st.Status == "running" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("deploy did not succeed: %+v", st)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	waitForDead(t, child.Process.Pid)
-}
-
-func TestManager_StopRefusesUnverifiedOrphan(t *testing.T) {
-	cfg := testConfig(t)
-	child := exec.Command("sleep", "3600")
-	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := child.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
-	// No create time recorded (gopsutil failed): identity is unverifiable.
-	raw, _ := json.Marshal(processBackendState{PID: child.Process.Pid, PGID: child.Process.Pid})
-	if err := SaveState(cfg.StateDir, "svc1", State{Status: "running", DesiredStatus: "running", Backend: raw}); err != nil {
-		t.Fatal(err)
-	}
-	m, err := NewManager(cfg, []config.ServiceConfig{orphanService(t.TempDir(), false)}, NopNotifier{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	m.SignalReady()
-
-	result := m.Do("svc1", "stop")
-	if result == "stopped" || !strings.Contains(result, fmt.Sprint(child.Process.Pid)) || !strings.Contains(result, "verified") {
-		t.Fatalf("stop of an unverifiable orphan: got %q, want an error naming the pid", result)
-	}
-	if !IsAlive(child.Process.Pid) {
-		t.Fatal("an unverifiable process must not be killed")
-	}
-}
-
-// waitForDead polls until pid is gone.
-func waitForDead(t *testing.T, pid int) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for IsAlive(pid) {
-		if time.Now().After(deadline) {
-			t.Fatalf("pid %d still alive", pid)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-// crashRecordFixture persists what an old build left after a child exited:
-// status "stopped", a pid that is now held by an unrelated live process, and
-// no create time.
-func crashRecordFixture(t *testing.T, stateDir string) *exec.Cmd {
-	t.Helper()
-	unrelated := exec.Command("sleep", "3600")
-	unrelated.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := unrelated.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = unrelated.Process.Kill(); _ = unrelated.Wait() })
-	raw, _ := json.Marshal(processBackendState{PID: unrelated.Process.Pid, PGID: unrelated.Process.Pid})
-	if err := SaveState(stateDir, "svc1", State{Status: "stopped", DesiredStatus: "running", Backend: raw}); err != nil {
-		t.Fatal(err)
-	}
-	return unrelated
-}
-
-func TestManager_CrashRecordWithReusedPidIsNotAdopted(t *testing.T) {
-	cfg := testConfig(t)
-	unrelated := crashRecordFixture(t, cfg.StateDir)
-	svc := autostartService("svc1", t.TempDir(), nil)
-	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{}) // adopt defaults to true
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	m.SignalReady()
-
-	time.Sleep(200 * time.Millisecond)
-	if result := m.Do("svc1", "status"); !strings.Contains(result, "stopped") {
-		t.Fatalf("adopted an unrelated process from a crash record: status %q", result)
-	}
-	// stop must not signal the unrelated process group.
-	m.Do("svc1", "stop")
-	if !IsAlive(unrelated.Process.Pid) {
-		t.Fatal("stop killed an unrelated process")
-	}
-}
-
-func TestManager_CrashRecordWithReusedPidDoesNotBlockStart(t *testing.T) {
-	cfg := testConfig(t)
-	unrelated := crashRecordFixture(t, cfg.StateDir)
-	svc := autostartService("svc1", t.TempDir(), nil)
-	no := false
-	svc.Adopt = &no
-	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	m.SignalReady()
-
-	if result := m.Do("svc1", "start"); result != "started" {
-		t.Fatalf("start blocked by a reused pid in a crash record: %q", result)
-	}
-	if !IsAlive(unrelated.Process.Pid) {
-		t.Fatal("start killed an unrelated process")
-	}
-}
-
 // blockingStopBackend blocks Stop until release is closed (when non-nil).
 type blockingStopBackend struct {
 	*ProcessBackend
@@ -2305,7 +1981,7 @@ func (b blockingStopBackend) Stop(ctx context.Context) error {
 	return b.ProcessBackend.Stop(ctx)
 }
 
-func TestManager_DeployRacingWithReloadIsForwarded(t *testing.T) {
+func TestManager_DeployRacingWithReloadRunsExactlyOnce(t *testing.T) {
 	logDir := t.TempDir()
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -2316,10 +1992,12 @@ func TestManager_DeployRacingWithReloadIsForwarded(t *testing.T) {
 		}
 		return pb
 	}
-	m, _, write := reloadFixtureWith(t, "deploy:\n  - echo deploying\n", factory)
+	runsFile := filepath.Join(t.TempDir(), "runs")
+	deployYAML := "deploy:\n  - echo run >> " + runsFile + "\n"
+	m, _, write := reloadFixtureWith(t, deployYAML, factory, NopNotifier{})
 
 	reloadDone := make(chan error, 1)
-	write("deploy:\n  - echo deploying\nbranch: other\n")
+	write(deployYAML + "branch: other\n")
 	go func() { reloadDone <- m.Reload() }()
 
 	// Reload's internal stop is now running inside the old loop.
@@ -2339,12 +2017,62 @@ func TestManager_DeployRacingWithReloadIsForwarded(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if st := m.GetAllStates()["svc1"]; st.LastResult == "success" {
-			return
+			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("deploy requested during reload was dropped: %+v", m.GetAllStates()["svc1"])
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond) // a duplicate forward would run by now
+	data, err := os.ReadFile(runsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(data), "run"); n != 1 {
+		t.Fatalf("deploy ran %d times, want exactly 1", n)
+	}
+}
+
+func TestManager_DeployForRemovedServiceIsReported(t *testing.T) {
+	logDir := t.TempDir()
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	factory := func(svc config.ServiceConfig) Backend {
+		pb := NewProcessBackend(svc.Name, svc.Dir, svc.Entrypoint, svc.Process.Cmd, logDir)
+		return blockingStopBackend{ProcessBackend: pb, entered: entered, release: release}
+	}
+	rec := &recordingNotifier{}
+	m, cfg, _ := reloadFixtureWith(t, "deploy:\n  - echo deploying\n", factory, rec)
+
+	// Removing the service makes Reload stop it, which blocks in the loop.
+	if err := os.Remove(filepath.Join(cfg.ServicesDir, "svc1.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	reloadDone := make(chan error, 1)
+	go func() { reloadDone <- m.Reload() }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop did not start")
+	}
+	if err := m.RequestDeploy("svc1"); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-reloadDone; err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for len(rec.getDeployFailed()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a deploy for a removed service was dropped without a failure report")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(rec.getDeployStarted()) != 0 {
+		t.Fatal("a removed service must not run its deploy")
 	}
 }
 
@@ -2355,7 +2083,7 @@ func TestManager_ConcurrentReloadsCreateOneReplacement(t *testing.T) {
 		created.Add(1)
 		return NewProcessBackend(svc.Name, svc.Dir, svc.Entrypoint, svc.Process.Cmd, logDir)
 	}
-	m, _, write := reloadFixtureWith(t, "", factory)
+	m, _, write := reloadFixtureWith(t, "", factory, NopNotifier{})
 	m.Do("svc1", "start")
 	waitForStatus(t, m, "svc1", "running")
 	before := created.Load()
@@ -2384,43 +2112,6 @@ func TestManager_DoRejectsInternalStopString(t *testing.T) {
 	defer m.Stop()
 	if result := m.Do("svc", "stop-internal"); !strings.Contains(result, "unknown command") {
 		t.Fatalf("Do must not accept the internal stop: got %q", result)
-	}
-}
-
-// waitForPersistedPID polls until the state file's backend record names pid.
-func waitForPersistedPID(t *testing.T, stateDir, name string, pid int) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		_, raw, err := LoadState(stateDir, name)
-		if err == nil && strings.Contains(string(raw), fmt.Sprintf(`"pid":%d`, pid)) {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("state for %s does not record pid %d: %s (err %v)", name, pid, raw, err)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-func TestNewManager_OrphanAdoptedWhenAdoptEnabledLater(t *testing.T) {
-	cfg := testConfig(t)
-	child := orphanFixture(t, cfg.StateDir)
-	m, err := NewManager(cfg, []config.ServiceConfig{orphanService(t.TempDir(), true)}, NopNotifier{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	m.SignalReady()
-
-	time.Sleep(300 * time.Millisecond)
-	waitForStatus(t, m, "svc1", "running")
-	pb, _ := asProcessBackend(m.services["svc1"].backend)
-	pb.mu.Lock()
-	pid := pb.pid
-	pb.mu.Unlock()
-	if pid != child.Process.Pid {
-		t.Fatalf("expected the orphan (pid %d) to be adopted, backend pid is %d", child.Process.Pid, pid)
 	}
 }
 
@@ -2500,5 +2191,147 @@ func TestManager_StateSavedBeforeOpReply(t *testing.T) {
 	}
 	if s.DesiredStatus != "stopped" {
 		t.Fatalf("state not saved before reply: desired_status %q", s.DesiredStatus)
+	}
+}
+
+// --- adopt: false autostart is gated on a host reboot ---
+
+func currentBootTime(t *testing.T) int64 {
+	t.Helper()
+	bt, err := host.BootTime()
+	if err != nil {
+		t.Skipf("boot time unavailable: %v", err)
+	}
+	return int64(bt)
+}
+
+// adoptFalseAutostartManager starts a manager for an adopt:false, autostart
+// service whose saved state (dead pid, desired running) has the given boot time.
+func adoptFalseAutostartManager(t *testing.T, savedBoot int64) *Manager {
+	t.Helper()
+	cfg := testConfig(t)
+	if err := SaveState(cfg.StateDir, "testsvc", State{
+		Status:        "running",
+		DesiredStatus: "running",
+		Backend:       json.RawMessage(`{"pid":99999999,"pgid":99999999}`),
+		BootTime:      savedBoot,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	yes, no := true, false
+	svc := autostartService("testsvc", t.TempDir(), &yes)
+	svc.Adopt = &no
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Stop)
+	m.SignalReady()
+	return m
+}
+
+func TestNewManager_AdoptFalseAutostartsAfterHostReboot(t *testing.T) {
+	m := adoptFalseAutostartManager(t, currentBootTime(t)-100)
+	waitForStatus(t, m, "testsvc", "running")
+}
+
+func TestNewManager_AdoptFalseDoesNotAutostartWithoutReboot(t *testing.T) {
+	m := adoptFalseAutostartManager(t, currentBootTime(t))
+	time.Sleep(300 * time.Millisecond)
+	if result := m.Do("testsvc", "status"); !strings.Contains(result, "stopped") {
+		t.Fatalf("adopt:false service autostarted without a host reboot: %q", result)
+	}
+}
+
+func TestNewManager_AdoptFalseDoesNotAutostartWithoutRecordedBootTime(t *testing.T) {
+	m := adoptFalseAutostartManager(t, 0)
+	time.Sleep(300 * time.Millisecond)
+	if result := m.Do("testsvc", "status"); !strings.Contains(result, "stopped") {
+		t.Fatalf("adopt:false service autostarted with no recorded boot time: %q", result)
+	}
+}
+
+func TestManager_SaveRecordsBootTime(t *testing.T) {
+	cfg := testConfig(t)
+	m, err := NewManager(cfg, []config.ServiceConfig{sleepService("svc", t.TempDir())}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	m.Do("svc", "start")
+	s, _, err := LoadState(cfg.StateDir, "svc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.BootTime != currentBootTime(t) {
+		t.Fatalf("saved boot time: got %d, want %d", s.BootTime, currentBootTime(t))
+	}
+}
+
+// --- cleanOrphans never signals a non-positive process group ---
+
+func TestCleanOrphans_NeverKillsNonPositivePgid(t *testing.T) {
+	cfg := testConfig(t)
+	child := exec.Command("sleep", "3600")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	// State for a service that is no longer configured, with a live pid
+	// but pgid 0: kill(-0) would signal our own process group.
+	raw, _ := json.Marshal(processBackendState{PID: child.Process.Pid, PGID: 0})
+	if err := SaveState(cfg.StateDir, "gone", State{Status: "running", Backend: raw}); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var calls []int
+	orig := killFn
+	killFn = func(pid int, sig syscall.Signal) error {
+		mu.Lock()
+		calls = append(calls, pid)
+		mu.Unlock()
+		return nil
+	}
+	t.Cleanup(func() { killFn = orig })
+
+	m, err := NewManager(cfg, nil, NopNotifier{}) // NewManager runs cleanOrphans
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, pid := range calls {
+		if pid >= 0 {
+			t.Fatalf("cleanOrphans called kill(%d): would signal our own process group", pid)
+		}
+	}
+}
+
+func TestCleanOrphans_KillsVerifiedGroup(t *testing.T) {
+	cfg := testConfig(t)
+	child := exec.Command("sleep", "3600")
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
+	raw, _ := json.Marshal(processBackendState{PID: child.Process.Pid, PGID: 424242})
+	if err := SaveState(cfg.StateDir, "gone", State{Status: "running", Backend: raw}); err != nil {
+		t.Fatal(err)
+	}
+	var got atomic.Int64
+	orig := killFn
+	killFn = func(pid int, sig syscall.Signal) error { got.Store(int64(pid)); return nil }
+	t.Cleanup(func() { killFn = orig })
+
+	m, err := NewManager(cfg, nil, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	if got.Load() != -424242 {
+		t.Fatalf("cleanOrphans kill target: got %d, want -424242", got.Load())
 	}
 }

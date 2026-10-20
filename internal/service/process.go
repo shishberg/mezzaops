@@ -4,12 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,10 +22,6 @@ type processBackendState struct {
 	LogPath    string `json:"log_path,omitempty"`
 	BootTime   int64  `json:"boot_time,omitempty"`
 	CreateTime int64  `json:"create_time,omitempty"`
-	// Orphan marks a record persisted for a live process this backend does
-	// not manage (adopt: false), as opposed to the record of a child that
-	// has exited.
-	Orphan bool `json:"orphan,omitempty"`
 }
 
 // ProcessBackend manages a service as a child process with process adoption
@@ -47,10 +41,8 @@ type ProcessBackend struct {
 	process *exec.Cmd
 	done    chan struct{} // closed when process exits
 
-	unverifiedLogged atomic.Bool          // the "cannot be verified" warning was logged for this record
-	orphan           *processBackendState // live untracked process from a previous run (adopt: false)
-	restoredState    *processBackendState // set by RestoreBackendState
-	restoredStatus   string               // status from the state file
+	restoredState  *processBackendState // set by RestoreBackendState
+	restoredStatus string               // status from the state file
 }
 
 // NewProcessBackend creates a new ProcessBackend.
@@ -64,31 +56,11 @@ func NewProcessBackend(name, dir string, entrypoint []string, cmd string, logDir
 	}
 }
 
-// Start launches the process. If already running, returns nil. It refuses
-// while a live process from a previous instance (adopt: false) exists, so
-// the orphan is not duplicated and its record not erased.
+// Start launches the process. If already running, returns nil.
 func (p *ProcessBackend) Start(ctx context.Context) error {
 	p.mu.Lock()
-	running := p.isRunning()
-	orphan := p.orphan
-	p.mu.Unlock()
-	if running {
-		return nil
-	}
-	if orphan != nil {
-		// The process lookup happens outside p.mu.
-		if p.recordAlive(*orphan, false) {
-			return fmt.Errorf("previous instance pid %d is still running; stop it or enable adopt", orphan.PID)
-		}
-		p.mu.Lock()
-		if p.orphan == orphan {
-			p.orphan = nil
-		}
-		p.mu.Unlock()
-	}
-
-	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if p.isRunning() {
 		return nil
 	}
@@ -146,45 +118,20 @@ func (p *ProcessBackend) Start(ctx context.Context) error {
 	p.done = done
 	go func() {
 		_ = cmd.Wait()
-		// Forget the pid once the child is reaped, so a later state save
-		// does not persist a pid the OS may reuse for an unrelated process.
-		p.mu.Lock()
-		if p.done == done {
-			p.pid = 0
-			p.pgid = 0
-			p.process = nil
-			p.done = nil
-		}
-		p.mu.Unlock()
 		close(done)
 	}()
 
 	return nil
 }
 
-type keepOrphanKey struct{}
-
-// withKeepOrphan returns a context telling Stop to leave a leftover
-// (orphan) process alone. Reload's internal stop uses it.
-func withKeepOrphan(ctx context.Context) context.Context {
-	return context.WithValue(ctx, keepOrphanKey{}, true)
-}
-
 // Stop sends SIGTERM to the process group, waits up to 5 seconds,
-// then sends SIGKILL. Returns nil if the process is not running. If a
-// verified leftover process from a previous instance exists, it is stopped
-// the same way; one whose identity cannot be verified is not touched and an
-// error is returned.
+// then sends SIGKILL. Returns nil if the process is not running.
 func (p *ProcessBackend) Stop(ctx context.Context) error {
 	p.mu.Lock()
 
 	if !p.isRunning() {
-		orphan := p.orphan
 		p.mu.Unlock()
-		if orphan == nil || ctx.Value(keepOrphanKey{}) != nil {
-			return nil
-		}
-		return p.stopOrphan(orphan)
+		return nil
 	}
 
 	pgid := p.pgid
@@ -219,55 +166,6 @@ func (p *ProcessBackend) Stop(ctx context.Context) error {
 	}
 
 	return nil
-}
-
-// stopOrphan terminates a leftover process from a previous instance.
-func (p *ProcessBackend) stopOrphan(orphan *processBackendState) error {
-	forget := func() {
-		p.mu.Lock()
-		if p.orphan == orphan {
-			p.orphan = nil
-		}
-		p.mu.Unlock()
-	}
-	if orphan.PID == 0 || !IsAlive(orphan.PID) {
-		forget()
-		return nil
-	}
-	id, why := checkIdentity(*orphan)
-	switch id {
-	case identityMismatch:
-		forget() // the pid now belongs to something else
-		return nil
-	case identityUnverified:
-		return fmt.Errorf("previous instance pid %d cannot be verified as our process (%s); stop it manually", orphan.PID, why)
-	}
-
-	pgid := orphan.PGID
-	if pgid <= 0 {
-		pgid = orphan.PID
-	}
-	_ = syscall.Kill(-pgid, syscall.SIGTERM)
-	if !waitDead(orphan.PID, 5*time.Second) {
-		_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		if !waitDead(orphan.PID, 5*time.Second) {
-			return fmt.Errorf("previous instance pid %d did not exit after SIGKILL", orphan.PID)
-		}
-	}
-	forget()
-	return nil
-}
-
-// waitDead polls until pid is gone or timeout elapses.
-func waitDead(pid int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for IsAlive(pid) {
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	return true
 }
 
 // Restart stops then starts the process.
@@ -308,15 +206,8 @@ func (p *ProcessBackend) SaveBackendState() json.RawMessage {
 	pid := p.pid
 	pgid := p.pgid
 	logPath := p.logPath
-	orphan := p.orphan
 	p.mu.Unlock()
 
-	if pid == 0 && orphan != nil && p.recordAlive(*orphan, false) {
-		raw, err := json.Marshal(orphan)
-		if err == nil {
-			return raw
-		}
-	}
 	return saveBackendStateFromFields(pid, pgid, logPath)
 }
 
@@ -395,30 +286,19 @@ func (p *ProcessBackend) TryAdopt() (adopted bool, msg string) {
 
 	ps := *p.restoredState
 
-	// A live process we started is adopted whatever status was saved: an
-	// adopt: false run saves "stopped" while its orphan is still alive.
-	stopped := p.restoredStatus == "stopped"
-	if ps.PID == 0 || !IsAlive(ps.PID) {
-		if stopped {
-			return false, "stopped (preserved from previous session)"
-		}
+	// Desired state is stopped -- respect it
+	if p.restoredStatus == "stopped" {
+		return false, "stopped (preserved from previous session)"
+	}
+
+	// PID is dead -- process crashed while we were down
+	if !IsAlive(ps.PID) {
 		return false, fmt.Sprintf("stale pid %d (process dead)", ps.PID)
 	}
-	id, why := checkIdentity(ps)
-	if id == identityMismatch {
-		if stopped {
-			return false, "stopped (preserved from previous session)"
-		}
-		// Alive but a different process (reboot or PID reuse)
+
+	// PID is alive but belongs to a different process (reboot or PID reuse)
+	if !VerifyProcess(ps) {
 		return false, fmt.Sprintf("pid %d reused by different process", ps.PID)
-	}
-	if id == identityUnverified {
-		// A stopped record we cannot verify is not trustworthy: the pid
-		// may have been reused after the child exited.
-		if stopped {
-			return false, fmt.Sprintf("stopped (pid %d cannot be verified: %s)", ps.PID, why)
-		}
-		p.warnUnverified(ps.PID, why)
 	}
 
 	// PID is alive and verified -- adopt it
@@ -435,64 +315,6 @@ func (p *ProcessBackend) TryAdopt() (adopted bool, msg string) {
 	go p.pollAlive(ps.PID, done)
 
 	return true, fmt.Sprintf("adopted (pid %d)", ps.PID)
-}
-
-// PersistedProcessAlive reports whether the restored state refers to a
-// process that is still alive and is, as far as can be verified, not some
-// other process. It is used to avoid starting a duplicate of a child that
-// outlived the previous manager. See recordAlive for the rules.
-func (p *ProcessBackend) PersistedProcessAlive() bool {
-	if p.restoredState == nil {
-		return false
-	}
-	// A "stopped" record that is not marked as an orphan is what a child
-	// that exited leaves behind; its pid may since have been reused.
-	fromExit := p.restoredStatus == "stopped" && !p.restoredState.Orphan
-	return p.recordAlive(*p.restoredState, fromExit)
-}
-
-// recordAlive reports whether ps.PID is alive and not known to be a
-// different process: a recorded boot time must match the current one, and a
-// recorded create time must match the live process. When neither is
-// recorded (gopsutil can fail on darwin) the identity is unverified; to
-// avoid a duplicate it is then assumed alive, unless the record came from an
-// observed exit (fromExit), where the pid is likely stale.
-func (p *ProcessBackend) recordAlive(ps processBackendState, fromExit bool) bool {
-	if ps.PID == 0 || !IsAlive(ps.PID) {
-		return false
-	}
-	id, why := checkIdentity(ps)
-	switch id {
-	case identityMismatch:
-		return false
-	case identityUnverified:
-		if fromExit {
-			return false
-		}
-		p.warnUnverified(ps.PID, why)
-	}
-	return true
-}
-
-// warnUnverified logs once per record that an identity could not be verified.
-func (p *ProcessBackend) warnUnverified(pid int, why string) {
-	if p.unverifiedLogged.CompareAndSwap(false, true) {
-		log.Printf("**%s**: pid %d cannot be verified as our process (%s); assuming it is", p.name, pid, why)
-	}
-}
-
-// MarkOrphan records the restored process as a live orphan that this
-// backend does not manage. SaveBackendState keeps persisting its record
-// while it stays alive, so later saves and reloads still see it.
-func (p *ProcessBackend) MarkOrphan() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.restoredState != nil {
-		ps := *p.restoredState
-		ps.Orphan = true
-		p.orphan = &ps
-		p.unverifiedLogged.Store(false)
-	}
 }
 
 // processBackend lets wrappers embedding *ProcessBackend be recognised as

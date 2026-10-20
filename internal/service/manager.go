@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shishberg/mezzaops/internal/config"
 	"github.com/shishberg/mezzaops/internal/deploy"
 )
@@ -218,8 +219,10 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot, repla
 	// stopped) would silently break cold-boot recovery for services
 	// that crashed just before the upgrade.
 	var persistedDesired string
+	var persistedBoot int64
 	s, raw, err := LoadState(m.stateDir, svc.Name)
 	if err == nil {
+		persistedBoot = s.BootTime
 		ms.state.LastDeploy = s.LastDeploy
 		ms.state.LastRestart = s.LastRestart
 		ms.state.LastResult = s.LastResult
@@ -247,15 +250,14 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot, repla
 		// issues a "start" op rather than a "restart" — a cold-boot
 		// autostart should not look like a hot reload to the
 		// notifier (no "restarted" event, no LastRestart bump).
+
 		//
-		// With adoption disabled the previous child may still be alive
-		// in its own process group. Starting another copy would create
-		// a duplicate, so refuse to autostart and warn instead.
-		if !adopted && pb.PersistedProcessAlive() {
-			pb.MarkOrphan()
-			log.Printf("**%s**: WARNING: the previous process (pid %d) appears to be still alive but was not adopted (adopt: false, or identity unverifiable); not autostarting to avoid a duplicate. Stop it (the stop command terminates a verified one) or enable adopt.", svc.Name, pb.restoredState.PID)
-		} else if !adopted && !replacing && svc.ShouldAutostart(startOnBoot) {
-			if persistedDesired != "stopped" || svc.AutostartForce {
+		// With adopt: false a surviving child from the previous mezzaops
+		// would be duplicated, so autostart only after a host reboot
+		// (no child can have survived one); see rebootedSince.
+		if !adopted && !replacing && svc.ShouldAutostart(startOnBoot) {
+			if (persistedDesired != "stopped" || svc.AutostartForce) &&
+				(adopt || m.rebootedSince(svc.Name, persistedBoot)) {
 				ms.autostartOnReady = true
 				ms.restartOnStartup = true
 				reason := "cold boot (adoption failed)"
@@ -270,6 +272,34 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot, repla
 	}
 
 	return ms
+}
+
+// bootTimeFn returns the host boot time (unix seconds), or 0 if unknown.
+// A variable so tests can substitute it.
+var bootTimeFn = func() int64 {
+	bt, err := host.BootTime()
+	if err != nil {
+		return 0
+	}
+	return int64(bt)
+}
+
+// rebootedSince reports whether the host rebooted since the state recording
+// savedBoot was written, logging why an adopt: false service is not
+// autostarted when it did not (or when that cannot be determined).
+func (m *Manager) rebootedSince(name string, savedBoot int64) bool {
+	now := bootTimeFn()
+	switch {
+	case savedBoot == 0:
+		log.Printf("**%s**: adopt: false, not autostarting: no host boot time recorded in the saved state", name)
+	case now == 0:
+		log.Printf("**%s**: adopt: false, not autostarting: cannot determine the current host boot time", name)
+	case now == savedBoot:
+		log.Printf("**%s**: adopt: false, not autostarting: mezzaops restarted without a host reboot, so the previous process may still be running", name)
+	default:
+		return true
+	}
+	return false
 }
 
 // backendForConfig selects the appropriate backend based on the service config.
@@ -382,9 +412,9 @@ func (m *Manager) serviceLoop(ms *managedService) {
 			}
 
 		case <-ms.deployCh:
-			if retired {
-				// Reload is replacing this service; hand the deploy to
-				// the replacement once this loop exits.
+			if retired || ms.ctx.Err() != nil {
+				// Reload is replacing or removing this service; never
+				// run the deploy here. It is handed on when the loop exits.
 				forwardDeploy = true
 				continue
 			}
@@ -412,10 +442,13 @@ func (m *Manager) serviceLoop(ms *managedService) {
 				forwardDeploy = true
 			}
 			if forwardDeploy && m.ctx.Err() == nil {
-				// The replacement is installed before this context is
-				// cancelled, so this reaches it.
-				if err := m.RequestDeploy(ms.config.Name); err != nil {
-					log.Printf("**%s**: deploy requested during reload could not be forwarded: %v", ms.config.Name, err)
+				// This is the only place a deploy is forwarded. The
+				// replacement is installed before this context is
+				// cancelled, so the request reaches it; for a removed
+				// service there is none, and the failure is reported.
+				name := ms.config.Name
+				if err := m.RequestDeploy(name); err != nil {
+					m.notifier.DeployFailed(name, "reload", fmt.Sprintf("deploy was requested while the service was being reloaded and could not be run: %v", err))
 				}
 			}
 			return
@@ -452,9 +485,7 @@ func (m *Manager) drainOps(ms *managedService) {
 func (m *Manager) internalStop(ms *managedService) (reloadSnapshot, string) {
 	status, statusErr := ms.backend.Status(m.ctx)
 	wasRunning := statusErr == nil && status == "running"
-	// Leave any leftover (orphan) process alone: a config change is not a
-	// request to kill it.
-	if err := ms.backend.Stop(withKeepOrphan(m.ctx)); err != nil {
+	if err := ms.backend.Stop(m.ctx); err != nil {
 		return reloadSnapshot{}, fmt.Sprintf("stop failed: %v", err)
 	}
 	ms.stateMu.Lock()
@@ -647,6 +678,7 @@ func (m *Manager) saveServiceState(ms *managedService) {
 		LastOutput:    ms.state.LastOutput,
 		FailedStep:    ms.state.FailedStep,
 		Backend:       backendState,
+		BootTime:      bootTimeFn(),
 	}
 	ms.stateMu.Unlock()
 
@@ -713,10 +745,13 @@ func (m *Manager) doOn(ms *managedService, so syncOp) string {
 
 // RequestDeploy queues a deploy request for the named service (latest-wins).
 func (m *Manager) RequestDeploy(name string) error {
+	// Look up and enqueue under m.mu. Reload swaps the service in the map
+	// under the same lock before retiring the old one, so a request either
+	// reaches the replacement or is queued on the old service before its
+	// context is cancelled, where the retiring loop forwards it.
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	ms, ok := m.services[name]
-	m.mu.Unlock()
-
 	if !ok {
 		return fmt.Errorf("service %q not found", name)
 	}
@@ -736,17 +771,6 @@ func (m *Manager) RequestDeploy(name string) error {
 	select {
 	case ms.deployCh <- struct{}{}:
 	default:
-	}
-
-	// If Reload retired this service while we were queueing, its loop may
-	// already have exited; the replacement is installed by then, so ask it.
-	if ms.ctx.Err() != nil && m.ctx.Err() == nil {
-		m.mu.Lock()
-		current := m.services[name]
-		m.mu.Unlock()
-		if current != nil && current != ms {
-			return m.RequestDeploy(name)
-		}
 	}
 
 	return nil
@@ -856,14 +880,19 @@ func (m *Manager) Reload() error {
 	m.mu.Unlock()
 
 	for _, name := range toRemove {
-		m.Do(name, "stop")
 		m.mu.Lock()
 		removed := m.services[name]
+		m.mu.Unlock()
+		if removed == nil {
+			continue
+		}
+		// The internal stop retires the loop, so a deploy queued behind it
+		// is reported as failed instead of running on a removed service.
+		m.doOn(removed, syncOp{internalStop: true, result: make(chan string, 1)})
+		m.mu.Lock()
 		delete(m.services, name)
 		m.mu.Unlock()
-		if removed != nil {
-			removed.cancel() // end the loop of a service that no longer exists
-		}
+		removed.cancel() // end the loop of a service that no longer exists
 	}
 
 	m.cleanOrphans()
@@ -1085,6 +1114,9 @@ func (m *Manager) NotifyWebhook(name string, info WebhookInfo) {
 	m.notifier.WebhookReceived(name, info)
 }
 
+// killFn sends a signal; a seam so tests can observe cleanOrphans.
+var killFn = syscall.Kill
+
 // cleanOrphans removes state files for services not in the current config and
 // kills their processes if still alive.
 func (m *Manager) cleanOrphans() {
@@ -1121,8 +1153,8 @@ func (m *Manager) cleanOrphans() {
 		} else {
 			_ = json.Unmarshal(raw, &ps)
 		}
-		if ps.PID != 0 && IsAlive(ps.PID) && VerifyProcess(ps) {
-			_ = syscall.Kill(-ps.PGID, syscall.SIGKILL)
+		if ps.PID != 0 && ps.PGID > 0 && IsAlive(ps.PID) && VerifyProcess(ps) {
+			_ = killFn(-ps.PGID, syscall.SIGKILL)
 		}
 		RemoveState(m.stateDir, name)
 	}
