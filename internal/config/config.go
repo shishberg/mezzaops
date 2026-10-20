@@ -184,16 +184,15 @@ func LoadConfig(path string) (*Config, error) {
 // knownTopLevelConfigKeys is the set of top-level keys LoadConfig recognises.
 // It is derived from the yaml tags on Config, so a new field is recognised
 // automatically.
-var knownTopLevelConfigKeys, configAcceptsAnyKey = yamlKeys(reflect.TypeFor[Config]())
+var knownTopLevelConfigKeys = yamlKeys(reflect.TypeFor[Config]())
 
 // yamlKeys returns the set of YAML mapping keys that decoding into struct
 // type t accepts. It follows yaml.v3 conventions: a tag of "-" omits the
 // field, ",inline" on a struct field merges that struct's keys, an empty
 // name defaults to the lowercased field name, and unexported fields are
-// ignored unless embedded, as in yaml.v3. acceptsAny is true when the struct
-// has a ",inline" map field, in which case every key is valid.
-func yamlKeys(t reflect.Type) (keys map[string]struct{}, acceptsAny bool) {
-	keys = make(map[string]struct{})
+// ignored unless embedded, as in yaml.v3.
+func yamlKeys(t reflect.Type) map[string]struct{} {
+	keys := make(map[string]struct{})
 	for i := range t.NumField() {
 		f := t.Field(i)
 		if !f.IsExported() && !f.Anonymous {
@@ -208,13 +207,8 @@ func yamlKeys(t reflect.Type) (keys map[string]struct{}, acceptsAny bool) {
 			if ft.Kind() == reflect.Pointer {
 				ft = ft.Elem()
 			}
-			switch ft.Kind() {
-			case reflect.Struct:
-				inner, innerAny := yamlKeys(ft)
-				maps.Copy(keys, inner)
-				acceptsAny = acceptsAny || innerAny
-			case reflect.Map:
-				acceptsAny = true
+			if ft.Kind() == reflect.Struct {
+				maps.Copy(keys, yamlKeys(ft))
 			}
 			continue
 		}
@@ -223,7 +217,7 @@ func yamlKeys(t reflect.Type) (keys map[string]struct{}, acceptsAny bool) {
 		}
 		keys[name] = struct{}{}
 	}
-	return keys, acceptsAny
+	return keys
 }
 
 // warnUnknownTopLevelKeys walks the top-level mapping of a parsed config
@@ -236,9 +230,6 @@ func yamlKeys(t reflect.Type) (keys map[string]struct{}, acceptsAny bool) {
 // before we look at the top-level keys. Walking the raw Node.Content slice
 // would warn about `<<` itself, not the keys being merged in.
 func warnUnknownTopLevelKeys(path string, data []byte) {
-	if configAcceptsAnyKey {
-		return // Config has an inline map, so no key is unknown.
-	}
 	var top map[string]yaml.Node
 	if err := yaml.Unmarshal(data, &top); err != nil {
 		return
