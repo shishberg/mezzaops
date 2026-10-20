@@ -43,11 +43,11 @@ type verifyResult int
 const (
 	// verifyMismatch: definitely a different process, or gone.
 	verifyMismatch verifyResult = iota
-	// verifyVerified: the same process (or a record with no identity data
-	// to compare, accepted as graceful degradation, as on main).
+	// verifyVerified: the same process, or a record with no identity fields
+	// at all (accepted as graceful degradation, as on main).
 	verifyVerified
-	// verifyUnknown: the pid is alive but a lookup failed, so identity
-	// could not be determined.
+	// verifyUnknown: the pid is alive but no per-process comparison could be
+	// made (a lookup failed, or the record offers nothing to compare).
 	verifyUnknown
 )
 
@@ -57,76 +57,76 @@ func isGone(err error) bool {
 }
 
 // verifyProcessResult checks that the PID in the state still refers to the
-// same process we originally started.
+// same process we originally started. The steps, in order:
 //
-// When the record and the host both have a boot ID, they must match and the
-// process start ID (start ticks since boot on Linux, creation time on
-// macOS) must be identical; this is exact and unaffected by wall-clock
-// steps. A legacy record (no boot ID or no start ID) falls back to main's
-// approach: boot time within a small tolerance, then a CreateTime
-// comparison that is exact on macOS and, on Linux, allows
-// legacyCreateTimeTolerance because gopsutil recomputes the Linux boot time
-// from /proc/uptime on every read, so CreateTime wobbles by about a second.
-// A record with no identity data at all is accepted. A lookup failure for a
-// process that still exists is verifyUnknown; a vanished process is a
-// mismatch.
+//  1. A non-positive pid, or one that is not alive, is a mismatch.
+//  2. A record with no identity fields at all (BootID, StartID, BootTime and
+//     CreateTime all zero) is verified, as on main.
+//  3. The boot-level check can only rule a process out. If the record's boot
+//     ID and the current boot ID are both known and differ, it is a mismatch.
+//     If they are not both known, a recorded BootTime that differs (beyond
+//     sameBoot's tolerance) from a readable current boot time is a mismatch.
+//     (With matching boot IDs the boot time is not consulted: it is derived
+//     from the wall clock and moves when the clock is stepped.)
+//  4. If the record has a StartID and the boot IDs are both known and equal,
+//     the start ID (start ticks since boot on Linux, creation time on macOS;
+//     exact and clock-independent) is looked up: equal is verified, different
+//     is a mismatch. If the lookup fails, a process that has exited is a
+//     mismatch; otherwise the CreateTime check below is tried.
+//  5. If the record has a CreateTime it is looked up and compared with
+//     createTimeMatches (exact on macOS, legacyCreateTimeTolerance on Linux,
+//     where gopsutil recomputes the boot time and CreateTime wobbles by about a
+//     second). A match is verified, a difference a mismatch; a failed lookup
+//     is a mismatch if the process has exited and unknown if it is alive.
+//  6. Otherwise no per-process comparison was possible: unknown.
 func verifyProcessResult(ps processBackendState) verifyResult {
-	// lookupFailed classifies a failed lookup: if the process has since
-	// exited it is gone (mismatch); otherwise its identity is unknown.
-	lookupFailed := func(err error) verifyResult {
-		if isGone(err) || !isAliveFn(ps.PID) {
-			return verifyMismatch
-		}
-		return verifyUnknown
+	if ps.PID <= 0 || !isAliveFn(ps.PID) {
+		return verifyMismatch
 	}
-	// compared records whether any identity comparison was actually made.
-	compared := false
+	if ps.BootID == "" && ps.StartID == 0 && ps.BootTime == 0 && ps.CreateTime == 0 {
+		return verifyVerified
+	}
 
-	if cur := bootIDFn(); ps.BootID != "" && cur != "" {
+	cur := bootIDFn()
+	sameBootID := false
+	if ps.BootID != "" && cur != "" {
 		if ps.BootID != cur {
 			return verifyMismatch
 		}
-		compared = true
-		if ps.StartID != 0 {
-			id, err := processStartIDFn(ps.PID)
-			switch {
-			case err == nil && id == ps.StartID:
-				return verifyVerified
-			case err == nil:
-				return verifyMismatch
-			default:
-				return lookupFailed(err)
-			}
-		}
+		sameBootID = true
 	} else if ps.BootTime != 0 {
-		// If the boot time cannot be read but a CreateTime was recorded, the
-		// CreateTime comparison below decides.
-		if bootTime, err := bootTimeFn(); err == nil {
-			if !sameBoot(bootTime, ps.BootTime) {
-				return verifyMismatch
-			}
-			compared = true
-		}
-	}
-	if ps.CreateTime != 0 {
-		createTime, err := createTimeFn(ps.PID)
-		if err != nil {
-			return lookupFailed(err)
-		}
-		if !createTimeMatches(createTime, ps.CreateTime, legacyCreateTimeTolerance) {
+		if bt, err := bootTimeFn(); err == nil && !sameBoot(bt, ps.BootTime) {
 			return verifyMismatch
 		}
-		compared = true
 	}
-	// A record with identity fields where none could be compared (for
-	// example a boot ID and start ID with an unreadable current boot ID) is
-	// unknown. A record with no identity fields at all is accepted, as on
-	// main.
-	hasIdentity := ps.BootID != "" || ps.StartID != 0 || ps.BootTime != 0 || ps.CreateTime != 0
-	if hasIdentity && !compared {
-		return verifyUnknown
+
+	if ps.StartID != 0 && sameBootID {
+		id, err := processStartIDFn(ps.PID)
+		if err == nil {
+			if id == ps.StartID {
+				return verifyVerified
+			}
+			return verifyMismatch
+		}
+		if isGone(err) || !isAliveFn(ps.PID) {
+			return verifyMismatch
+		}
 	}
-	return verifyVerified
+
+	if ps.CreateTime != 0 {
+		live, err := createTimeFn(ps.PID)
+		if err != nil {
+			if isGone(err) || !isAliveFn(ps.PID) {
+				return verifyMismatch
+			}
+			return verifyUnknown
+		}
+		if createTimeMatches(live, ps.CreateTime, legacyCreateTimeTolerance) {
+			return verifyVerified
+		}
+		return verifyMismatch
+	}
+	return verifyUnknown
 }
 
 // createTimeMatches reports whether two creation times (ms) are within tol of

@@ -3265,6 +3265,7 @@ func withAlive(t *testing.T, alive bool) {
 }
 
 func TestVerifyProcess_BootIDAndBootTimeViaSeams(t *testing.T) {
+	withAlive(t, true)
 	const bt = int64(1_700_000_000)
 	withBootTime(t, func() (int64, error) { return bt, nil })
 	withStartID(t, func(int) (int64, error) { return 9, nil })
@@ -3313,6 +3314,7 @@ func TestVerifyProcessResult_ExitedMidCheckIsMismatch(t *testing.T) {
 }
 
 func TestVerifyProcessResult_BootTimeErrorFallsThroughToCreateTime(t *testing.T) {
+	withAlive(t, true)
 	withBootID(t, "")
 	withBootTime(t, func() (int64, error) { return 0, errors.New("no boot time") })
 	withCreateTime(t, func(int) (int64, error) { return 5000, nil })
@@ -3360,13 +3362,35 @@ func TestNewManager_UnknownIdentityIsNeitherAdoptedNorAutostarted(t *testing.T) 
 	cfg, svc := seedUnknownIdentity(t)
 	m := unknownIdentityManager(t, cfg, svc)
 	defer m.Stop()
-	time.Sleep(300 * time.Millisecond)
-	if got := m.Do("testsvc", "status"); got != "stopped" {
-		t.Fatalf("an alive pid with unknown identity is neither adopted nor autostarted: %q", got)
+
+	m.mu.Lock()
+	ms := m.services["testsvc"]
+	m.mu.Unlock()
+	// Nothing was scheduled at construction (before the loop could act on it).
+	if ms.restartOnStartup || ms.autostartOnReady {
+		t.Fatal("autostart was scheduled over a live process whose identity is unknown")
+	}
+	pb, _ := asProcessBackend(ms.backend)
+	if pb.IsRunning() {
+		t.Fatal("a process with unknown identity must not be adopted")
+	}
+}
+
+func TestProcessBackend_TryAdoptReportsUnknownIdentity(t *testing.T) {
+	withBootID(t, "boot-A")
+	withStartID(t, func(int) (int64, error) { return 0, errors.New("permission denied") })
+	withAlive(t, true)
+	b := NewProcessBackend("test", t.TempDir(), []string{"sleep", "3600"}, "", t.TempDir())
+	b.adopt = true
+	b.restoredState = &processBackendState{PID: unknownPID, PGID: unknownPID, BootID: "boot-A", StartID: 5}
+	b.restoredStatus = "running"
+	if outcome, msg := b.TryAdopt(); outcome != adoptUnknown {
+		t.Fatalf("outcome %v (%s), want adoptUnknown", outcome, msg)
 	}
 }
 
 func TestVerifyProcessResult_LegacyBootTimeErrorNeedsCreateTime(t *testing.T) {
+	withAlive(t, true)
 	withBootID(t, "")
 	withBootTime(t, func() (int64, error) { return 0, errors.New("no boot time") })
 	withCreateTime(t, func(int) (int64, error) { return 5000, nil })
@@ -3400,6 +3424,7 @@ func TestCreateTimeMatches(t *testing.T) {
 }
 
 func TestVerifyProcessResult_BootIDMatchWithoutStartIDUsesCreateTime(t *testing.T) {
+	withAlive(t, true)
 	withBootID(t, "boot-A")
 	withStartID(t, func(int) (int64, error) { t.Fatal("no start ID recorded: must not look one up"); return 0, nil })
 	withCreateTime(t, func(int) (int64, error) { return 1_700_000_000_000, nil })
@@ -3413,6 +3438,7 @@ func TestVerifyProcessResult_BootIDMatchWithoutStartIDUsesCreateTime(t *testing.
 }
 
 func TestVerifyProcessResult_NoComparisonPossibleIsUnknown(t *testing.T) {
+	withAlive(t, true)
 	withStartID(t, func(int) (int64, error) {
 		t.Fatal("must not look up a start ID without a current boot ID")
 		return 0, nil
@@ -3439,6 +3465,7 @@ func TestManager_FailedStopStillRecordsIntent(t *testing.T) {
 	m, _, _ := reloadFixtureWith(t, "", factory, NopNotifier{})
 	m.Do("svc1", "start")
 	waitForStatus(t, m, "svc1", "running")
+	t.Cleanup(func() { fail.Store(false) }) // let the fixture's cleanup stop the process
 	fail.Store(true)
 	if got := m.Do("svc1", "stop"); !strings.Contains(got, "stop failed") {
 		t.Fatalf("expected a failed stop, got %q", got)
@@ -3446,5 +3473,61 @@ func TestManager_FailedStopStillRecordsIntent(t *testing.T) {
 	if d := m.GetAllStates()["svc1"].DesiredStatus; d != "stopped" {
 		t.Fatalf("a failed stop still records the operator's intent: DesiredStatus %q", d)
 	}
-	fail.Store(false)
+}
+
+func TestVerifyProcessResult_Algorithm(t *testing.T) {
+	const live = int64(1_700_000_000_000)
+	const bt = int64(1_700_000_000)
+	errLookup := errors.New("lookup failed")
+	cases := []struct {
+		name       string
+		rec        processBackendState
+		curBootID  string
+		alive      bool
+		startID    func(int) (int64, error)
+		createTime func(int) (int64, error)
+		want       verifyResult
+	}{
+		{"not alive", processBackendState{PID: 10, CreateTime: live}, "", false, nil, nil, verifyMismatch},
+		{"non-positive pid", processBackendState{PID: 0, CreateTime: live}, "", true, nil, nil, verifyMismatch},
+		{"no identity fields", processBackendState{PID: 10}, "boot-A", true, nil, nil, verifyVerified},
+		{"boot ID differs", processBackendState{PID: 10, BootID: "boot-OLD", StartID: 7}, "boot-A", true, nil, nil, verifyMismatch},
+		{"boot time differs", processBackendState{PID: 10, BootTime: bt - 500, CreateTime: live}, "", true, nil, nil, verifyMismatch},
+		{"boot ID matches only", processBackendState{PID: 10, BootID: "boot-A"}, "boot-A", true, nil, nil, verifyUnknown},
+		{"start ID equal", processBackendState{PID: 10, BootID: "boot-A", StartID: 7}, "boot-A", true,
+			func(int) (int64, error) { return 7, nil }, nil, verifyVerified},
+		{"start ID differs", processBackendState{PID: 10, BootID: "boot-A", StartID: 7, CreateTime: live}, "boot-A", true,
+			func(int) (int64, error) { return 8, nil }, func(int) (int64, error) { return live, nil }, verifyMismatch},
+		{"start ID lookup fails, CreateTime matches", processBackendState{PID: 10, BootID: "boot-A", StartID: 7, CreateTime: live}, "boot-A", true,
+			func(int) (int64, error) { return 0, errLookup }, func(int) (int64, error) { return live, nil }, verifyVerified},
+		{"start ID lookup fails, nothing else", processBackendState{PID: 10, BootID: "boot-A", StartID: 7}, "boot-A", true,
+			func(int) (int64, error) { return 0, errLookup }, nil, verifyUnknown},
+		{"start ID lookup says gone", processBackendState{PID: 10, BootID: "boot-A", StartID: 7, CreateTime: live}, "boot-A", true,
+			func(int) (int64, error) { return 0, fs.ErrNotExist }, func(int) (int64, error) { return live, nil }, verifyMismatch},
+		{"CreateTime differs", processBackendState{PID: 10, CreateTime: live + 5000}, "", true, nil,
+			func(int) (int64, error) { return live, nil }, verifyMismatch},
+		{"CreateTime lookup fails, alive", processBackendState{PID: 10, CreateTime: live}, "", true, nil,
+			func(int) (int64, error) { return 0, errLookup }, verifyUnknown},
+		{"boot ID unreadable, start ID only", processBackendState{PID: 10, BootID: "boot-A", StartID: 7}, "", true, nil, nil, verifyUnknown},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			withBootID(t, c.curBootID)
+			withBootTime(t, func() (int64, error) { return bt, nil })
+			withAlive(t, c.alive)
+			if c.startID != nil {
+				withStartID(t, c.startID)
+			} else {
+				withStartID(t, func(int) (int64, error) { t.Error("unexpected start ID lookup"); return 0, nil })
+			}
+			if c.createTime != nil {
+				withCreateTime(t, c.createTime)
+			} else {
+				withCreateTime(t, func(int) (int64, error) { t.Error("unexpected CreateTime lookup"); return 0, nil })
+			}
+			if got := verifyProcessResult(c.rec); got != c.want {
+				t.Errorf("got %v, want %v", got, c.want)
+			}
+		})
+	}
 }

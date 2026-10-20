@@ -377,22 +377,23 @@ record has been overwritten. Operator start and deploy are not guarded
   and parentheses); on macOS the creation time, which the kernel records as an
   absolute time and a clock step does not move. `VerifyProcess` accepts a
   process when the boot IDs match and the start IDs are identical. A legacy
-  record (no boot ID or no start ID) falls back to main's approach: boot time
-  within a 10 second tolerance (gopsutil recomputes it), then a `CreateTime`
-  comparison that is exact on macOS and, on Linux, allows 1000 ms because
-  gopsutil derives the Linux value from a boot time it recomputes from
-  `/proc/uptime` on every read, so records written by main can shift by a
-  second. The result is three-state: verified, mismatch (a different process
-  or gone), or unknown (the pid is alive but a lookup failed). `TryAdopt`
-  adopts only on verified; on unknown it neither adopts nor lets autostart run
+  record (no boot ID or no start ID) is checked against its CreateTime
+  instead. The result is three-state (verified, mismatch, unknown) and
+  `verifyProcessResult` follows these steps: (1) a non-positive or dead pid is
+  a mismatch; (2) a record with no identity fields at all is verified, as on
+  main; (3) the boot-level check can only rule a process out: boot IDs both
+  known and different, or (when they are not both known) a recorded boot time
+  that differs from a readable current one beyond a 10 second tolerance, is a
+  mismatch; (4) with a start ID and equal boot IDs, the start ID is looked up
+  (equal verified, different mismatch; a failed lookup is a mismatch if the
+  process exited, otherwise it falls through); (5) with a CreateTime, it is
+  looked up and compared (exact on macOS, 1000 ms on Linux where gopsutil
+  recomputes the boot time and CreateTime wobbles by about a second); a failed
+  lookup is a mismatch if the process exited and unknown if alive; (6)
+  otherwise no per-process comparison was possible: unknown. `TryAdopt` adopts
+  only on verified; on unknown it neither adopts nor lets autostart run
   (logged once with the pid), so no duplicate is started for that run; nothing
-  is persisted for it. A lookup that fails because the process exited in the
-  meantime is a mismatch. If a record has identity fields but none could be
-  compared (for example a boot ID and start ID with an unreadable current boot
-  ID and no CreateTime) the result is unknown; a record with no identity
-  fields at all is accepted, as on main. On the legacy path an unreadable boot
-  time skips that check only when a CreateTime was recorded (which then
-  decides). `cleanOrphans` kills only on verified. There are no jitter or
+  is persisted for it. `cleanOrphans` kills only on verified. There are no jitter or
   clock-step thresholds. `adopt: true` is unchanged: adopt if possible,
   otherwise autostart. There is no orphan tracking.
 - [x] **IsAlive guard** — `IsAlive(pid <= 0)` is false, since `kill(0, 0)` and
