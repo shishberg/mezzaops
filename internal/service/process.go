@@ -235,7 +235,7 @@ func saveBackendStateFromFields(pid, pgid int, logPath string) json.RawMessage {
 			ps.CreateTime = ct
 		}
 	}
-	if ps.CreateTime != 0 && ps.BootTime != 0 {
+	if offsetVerification && ps.CreateTime != 0 && ps.BootTime != 0 {
 		ps.StartOffset = ps.CreateTime/1000 - ps.BootTime
 	}
 

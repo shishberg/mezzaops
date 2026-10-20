@@ -2774,7 +2774,16 @@ func liveStartOffset(t *testing.T) (createTime, offset int64) {
 	return ct, ct/1000 - int64(bt)
 }
 
+// withOffsetVerification sets the platform switch for the test.
+func withOffsetVerification(t *testing.T, on bool) {
+	t.Helper()
+	orig := offsetVerification
+	offsetVerification = on
+	t.Cleanup(func() { offsetVerification = orig })
+}
+
 func TestVerifyProcess_StartOffsetSurvivesClockStep(t *testing.T) {
+	withOffsetVerification(t, true) // the Linux behaviour, exercised on any platform
 	withBootID(t, "boot-A")
 	ct, off := liveStartOffset(t)
 	pid := os.Getpid()
@@ -2805,7 +2814,23 @@ func TestVerifyProcess_StartOffsetSurvivesClockStep(t *testing.T) {
 	}
 }
 
+func TestVerifyProcess_ExactCreateTimeWhenOffsetVerificationOff(t *testing.T) {
+	// The macOS behaviour: even with matching boot IDs and a matching
+	// offset, a CreateTime that differs must not verify.
+	withOffsetVerification(t, false)
+	withBootID(t, "boot-A")
+	ct, off := liveStartOffset(t)
+	pid := os.Getpid()
+	if VerifyProcess(processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct + 3*3600*1000, StartOffset: off}) {
+		t.Error("offset verification off: a shifted CreateTime must not verify")
+	}
+	if !VerifyProcess(processBackendState{PID: pid, BootID: "boot-A", CreateTime: ct, StartOffset: off + 100}) {
+		t.Error("offset verification off: the offset must be ignored when CreateTime matches")
+	}
+}
+
 func TestSaveBackendState_RecordsStartOffset(t *testing.T) {
+	withOffsetVerification(t, true)
 	child := exec.Command("sleep", "3600")
 	if err := child.Start(); err != nil {
 		t.Fatal(err)

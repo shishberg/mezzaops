@@ -351,11 +351,12 @@ behaviour on main.
   seconds since boot, recorded in the process record) with a 2 second
   tolerance, if both records have one, because CreateTime is derived from the
   wall clock and a clock step on the same boot would otherwise reject a genuine
-  child. On Linux gopsutil derives both from the same boot time, so the offset
-  is stable across a step. On macOS CreateTime is the kernel's absolute process
-  start time while `kern.boottime` can be adjusted when the clock is set, so
-  the offset is not guaranteed to be stable there; macOS machines normally have
-  an RTC, so steps are rare, but this is not claimed to be safe. `adopt: true` is
+  child. This applies on Linux only (`offsetVerification` in `bootid_linux.go`):
+  gopsutil derives CreateTime and BootTime from the same boot time, so the
+  offset is stable across a step. On macOS (`bootid_darwin.go`) CreateTime is
+  the kernel's absolute process start time and does not move when the clock is
+  stepped, while `kern.boottime` is adjusted, so the offset would be wrong
+  there; the exact CreateTime comparison is used even when boot IDs match. `adopt: true` is
   unchanged: adopt if possible, otherwise autostart. There is no orphan
   tracking.
 - [x] **IsAlive guard** — `IsAlive(pid <= 0)` is false, since `kill(0, 0)` and

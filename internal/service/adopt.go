@@ -67,7 +67,7 @@ func VerifyProcess(ps processBackendState) bool {
 			// CreateTime is derived from the wall clock, so a clock step
 			// on the same boot changes it. When the boot is known to be
 			// the same and an offset since boot was recorded, compare that.
-			if sameBootByID && ps.StartOffset != 0 {
+			if offsetVerification && sameBootByID && ps.StartOffset != 0 {
 				if bt, berr := host.BootTime(); berr == nil {
 					d := createTime/1000 - int64(bt) - ps.StartOffset
 					if d < 0 {
