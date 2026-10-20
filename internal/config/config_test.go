@@ -33,6 +33,9 @@ matrix:
   room: "!abc:matrix.example.org"
   command_prefix: "!ops"
   crypto_db: "/var/state/matrix.db"
+telegram:
+  chat_id: -1001234567890
+  api_url: "http://tg.local:8081"
 webhook:
   port: 9090
 dashboard:
@@ -61,6 +64,10 @@ dashboard:
 	assert.Equal(t, "!ops", cfg.Matrix.CommandPrefix)
 	assert.Equal(t, "/var/state/matrix.db", cfg.Matrix.CryptoDB)
 
+	require.NotNil(t, cfg.Telegram)
+	assert.Equal(t, int64(-1001234567890), cfg.Telegram.ChatID)
+	assert.Equal(t, "http://tg.local:8081", cfg.Telegram.APIURL)
+
 	require.NotNil(t, cfg.Webhook)
 	assert.Equal(t, 9090, cfg.Webhook.Port)
 
@@ -84,6 +91,7 @@ discord:
 	assert.Equal(t, "abc", cfg.Discord.GuildID)
 	assert.Nil(t, cfg.Mattermost)
 	assert.Nil(t, cfg.Matrix)
+	assert.Nil(t, cfg.Telegram)
 	assert.Nil(t, cfg.Webhook)
 	assert.Nil(t, cfg.Dashboard)
 }
@@ -109,6 +117,7 @@ MATRIX_USER_ID=@bot:matrix.example.org
 MATRIX_DEVICE_ID=DEV01
 MATRIX_ACCESS_TOKEN=syt_abc
 MATRIX_PICKLE_KEY=pickle-pass
+TELEGRAM_TOKEN=tg-tok
 `
 	path := filepath.Join(t.TempDir(), ".env")
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
@@ -123,6 +132,7 @@ MATRIX_PICKLE_KEY=pickle-pass
 	assert.Equal(t, "DEV01", env.MatrixDeviceID)
 	assert.Equal(t, "syt_abc", env.MatrixAccessToken)
 	assert.Equal(t, "pickle-pass", env.MatrixPickleKey)
+	assert.Equal(t, "tg-tok", env.TelegramToken)
 }
 
 func TestLoadEnv_FallbackToEnvironment(t *testing.T) {
@@ -133,6 +143,7 @@ func TestLoadEnv_FallbackToEnvironment(t *testing.T) {
 	t.Setenv("MATRIX_DEVICE_ID", "ENVDEV")
 	t.Setenv("MATRIX_ACCESS_TOKEN", "env-token")
 	t.Setenv("MATRIX_PICKLE_KEY", "env-pickle")
+	t.Setenv("TELEGRAM_TOKEN", "env-tg")
 
 	env, err := config.LoadEnv("")
 	require.NoError(t, err)
@@ -144,6 +155,7 @@ func TestLoadEnv_FallbackToEnvironment(t *testing.T) {
 	assert.Equal(t, "ENVDEV", env.MatrixDeviceID)
 	assert.Equal(t, "env-token", env.MatrixAccessToken)
 	assert.Equal(t, "env-pickle", env.MatrixPickleKey)
+	assert.Equal(t, "env-tg", env.TelegramToken)
 }
 
 func TestLoadEnv_FallbackWhenFileMissing(t *testing.T) {

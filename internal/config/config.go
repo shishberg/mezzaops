@@ -30,6 +30,14 @@ type MattermostConfig struct {
 
 // MatrixConfig holds Matrix bot connection settings. Secrets (user/device ID,
 // access token, pickle key) live in Env, not here.
+// TelegramConfig holds Telegram bot settings. The bot token lives in Env.
+// ChatID is negative for groups and supergroups. APIURL overrides the Bot API
+// base URL (self-hosted Bot API server); empty means https://api.telegram.org.
+type TelegramConfig struct {
+	ChatID int64  `yaml:"chat_id"`
+	APIURL string `yaml:"api_url"`
+}
+
 type MatrixConfig struct {
 	Homeserver    string `yaml:"homeserver"`
 	Room          string `yaml:"room"`
@@ -55,6 +63,7 @@ type Config struct {
 	Discord     *DiscordConfig    `yaml:"discord"`
 	Mattermost  *MattermostConfig `yaml:"mattermost"`
 	Matrix      *MatrixConfig     `yaml:"matrix"`
+	Telegram    *TelegramConfig   `yaml:"telegram"`
 	Webhook     *WebhookConfig    `yaml:"webhook"`
 	Dashboard   *DashboardConfig  `yaml:"dashboard"`
 
@@ -151,6 +160,7 @@ type Env struct {
 	MatrixDeviceID    string
 	MatrixAccessToken string
 	MatrixPickleKey   string
+	TelegramToken     string
 }
 
 // LoadConfig reads a YAML config file and applies defaults.
@@ -256,6 +266,7 @@ func LoadEnv(path string) (*Env, error) {
 				MatrixDeviceID:    vars["MATRIX_DEVICE_ID"],
 				MatrixAccessToken: vars["MATRIX_ACCESS_TOKEN"],
 				MatrixPickleKey:   vars["MATRIX_PICKLE_KEY"],
+				TelegramToken:     vars["TELEGRAM_TOKEN"],
 			}, nil
 		}
 		// Only fall through to os.Getenv if the file simply doesn't exist.
@@ -273,6 +284,7 @@ func LoadEnv(path string) (*Env, error) {
 		MatrixDeviceID:    os.Getenv("MATRIX_DEVICE_ID"),
 		MatrixAccessToken: os.Getenv("MATRIX_ACCESS_TOKEN"),
 		MatrixPickleKey:   os.Getenv("MATRIX_PICKLE_KEY"),
+		TelegramToken:     os.Getenv("TELEGRAM_TOKEN"),
 	}, nil
 }
 
