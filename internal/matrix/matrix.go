@@ -14,7 +14,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/shishberg/mezzaops/internal/reconnect"
@@ -129,6 +128,7 @@ type Bot struct {
 	userID     id.UserID
 	roomID     id.RoomID
 	readyCh    chan struct{}
+	readyOnce  sync.Once
 	connMu     sync.Mutex
 }
 
@@ -211,11 +211,9 @@ func (b *Bot) CommandPrefix() string { return b.cfg.CommandPrefix }
 // bootstrap, so callers know it is safe to call PostMessage.
 func (b *Bot) Ready() <-chan struct{} { return b.readyCh }
 
-// markReady closes readyCh exactly once. Safe to call from multiple retry
-// attempts; the second close is recovered.
+// markReady closes readyCh exactly once; later calls are no-ops.
 func (b *Bot) markReady() {
-	defer func() { _ = recover() }()
-	close(b.readyCh)
+	b.readyOnce.Do(func() { close(b.readyCh) })
 }
 
 // Run resolves the configured room, initialises crypto, and blocks on
@@ -232,15 +230,7 @@ func (b *Bot) markReady() {
 // construction are part of the first attempt and may be retried on
 // transient failure. ctx cancellation aborts the loop.
 func (b *Bot) Run(ctx context.Context) error {
-	return reconnect.RunWithBackoff(ctx, "matrix", reconnect.Options{
-		InitialDelay:   1 * time.Second,
-		MaxDelay:       60 * time.Second,
-		Factor:         2.0,
-		JitterFraction: 0.2,
-		Logger: func(name string, attempt int, err error, nextDelay time.Duration) {
-			log.Printf("%s: connect attempt %d failed: %v; retrying in %s", name, attempt, err, nextDelay)
-		},
-	}, b.runOnce)
+	return reconnect.RunWithBackoff(ctx, "matrix", reconnect.Options{}, b.runOnce)
 }
 
 // runOnce performs the per-attempt connect path: build a fresh mautrix
@@ -259,28 +249,10 @@ func (b *Bot) Run(ctx context.Context) error {
 // helper.Init succeeds, so PostMessage can never observe a client
 // without a working Crypto helper (which would otherwise let
 // SendMessageEvent send plaintext into a room the operator expects to
-// be encrypted). A failed Init returns without publishing, leaving the
-// previously-published state (if any) cleared at the top of runOnce
-// for the next attempt to repopulate.
+// be encrypted). A failed Init returns without publishing. The client is
+// always cleared again before runOnce returns, so no state carries over
+// between attempts.
 func (b *Bot) runOnce(ctx context.Context) error {
-	// Clear any prior published state from a previous attempt, and
-	// close its helper if any so the SQLite store is not leaked.
-	b.connMu.Lock()
-	prior := b.realClient
-	b.realClient = nil
-	b.client = nil
-	b.connMu.Unlock()
-	if prior != nil && prior.Crypto != nil {
-		// The Crypto field is typed as the CryptoHelper interface,
-		// which has no Close method; the concrete cryptohelper
-		// implementation does. Type-assert to call it.
-		if helper, ok := prior.Crypto.(*cryptohelper.CryptoHelper); ok {
-			if err := helper.Close(); err != nil {
-				log.Printf("matrix: closing crypto helper from previous attempt: %v", err)
-			}
-		}
-	}
-
 	client, err := b.buildLocalClient(ctx)
 	if err != nil {
 		return err

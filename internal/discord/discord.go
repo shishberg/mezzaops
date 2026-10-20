@@ -38,9 +38,10 @@ type Bot struct {
 	manager ServiceManager
 	session *discordgo.Session
 
-	mu       sync.Mutex
-	commands []*discordgo.ApplicationCommand
-	readyCh  chan struct{} // closed once the first setCommands succeeds
+	mu        sync.Mutex
+	commands  []*discordgo.ApplicationCommand
+	readyCh   chan struct{} // closed once the first setCommands succeeds
+	readyOnce sync.Once
 }
 
 // New creates a Discord bot. Does not connect yet — call Run() for that.
@@ -61,11 +62,9 @@ func (b *Bot) Ready() <-chan struct{} {
 	return b.readyCh
 }
 
-// markReady closes readyCh exactly once. Safe to call from multiple
-// retry attempts; the second close is recovered.
+// markReady closes readyCh exactly once; later calls are no-ops.
 func (b *Bot) markReady() {
-	defer func() { _ = recover() }()
-	close(b.readyCh)
+	b.readyOnce.Do(func() { close(b.readyCh) })
 }
 
 // Notifier returns a Notifier that sends messages to the bot's channel using
@@ -122,15 +121,7 @@ func (b *Bot) setSession(s *discordgo.Session) {
 // re-closed on subsequent retries — by then the C3 app-layer readiness
 // wait has already fired, and the gate is past.
 func (b *Bot) Run(ctx context.Context) error {
-	return reconnect.RunWithBackoff(ctx, "discord", reconnect.Options{
-		InitialDelay:   1 * time.Second,
-		MaxDelay:       60 * time.Second,
-		Factor:         2.0,
-		JitterFraction: 0.2,
-		Logger: func(name string, attempt int, err error, nextDelay time.Duration) {
-			log.Printf("%s: connect attempt %d failed: %v; retrying in %s", name, attempt, err, nextDelay)
-		},
-	}, b.runOnce)
+	return reconnect.RunWithBackoff(ctx, "discord", reconnect.Options{}, b.runOnce)
 }
 
 // runOnce performs one connect attempt: build a session, open it,

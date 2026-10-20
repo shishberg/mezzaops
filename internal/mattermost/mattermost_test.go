@@ -343,100 +343,78 @@ func TestConnectAndListen_ListenError(t *testing.T) {
 	}
 }
 
-func TestListenWebSocket_ReconnectsAfterDisconnect(t *testing.T) {
-	var connectCount atomic.Int32
-
-	bot := &Bot{
-		cfg: Config{URL: "http://localhost"},
-		connectWS: func(_, _ string) (wsClient, error) {
-			connectCount.Add(1)
-			ws := newMockWSClient()
-			go func() {
-				ws.PingTimeoutChan() <- true
-			}()
-			return ws, nil
-		},
+// newRunBot returns a Bot whose REST setup always succeeds and whose
+// WebSocket connections are produced by connect.
+func newRunBot(connect wsConnectFunc) *Bot {
+	return &Bot{
+		cfg:       Config{URL: "http://localhost", Channel: "team/chan"},
+		rest:      newMockRestClient(),
+		readyCh:   make(chan struct{}),
+		manager:   newMockServiceManager(),
+		connectWS: connect,
 	}
+}
+
+func stopRun(t *testing.T, cancel context.CancelFunc, done <-chan error) {
+	t.Helper()
+	cancel()
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not exit after cancel")
+	}
+}
+
+func TestRun_ReconnectsAfterWebSocketDrop(t *testing.T) {
+	var connectCount atomic.Int32
+	bot := newRunBot(func(_, _ string) (wsClient, error) {
+		connectCount.Add(1)
+		ws := newMockWSClient()
+		go func() { ws.PingTimeoutChan() <- true }()
+		return ws, nil
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-
 	done := make(chan error, 1)
-	go func() {
-		done <- bot.listenWebSocket(ctx)
-	}()
+	go func() { done <- bot.Run(ctx) }()
 
 	require.Eventually(t, func() bool {
 		return connectCount.Load() >= 2
-	}, 5*time.Second, 100*time.Millisecond, "expected at least 2 connection attempts")
-
-	cancel()
-
-	select {
-	case err := <-done:
-		assert.NoError(t, err)
-	case <-time.After(3 * time.Second):
-		t.Fatal("listenWebSocket did not exit after cancel")
-	}
+	}, 5*time.Second, 50*time.Millisecond, "expected at least 2 connection attempts")
+	stopRun(t, cancel, done)
 }
 
-func TestListenWebSocket_CancelDuringBackoff(t *testing.T) {
-	bot := &Bot{
-		cfg: Config{URL: "http://localhost"},
-		connectWS: func(_, _ string) (wsClient, error) {
-			ws := newMockWSClient()
-			go func() { ws.PingTimeoutChan() <- true }()
-			return ws, nil
-		},
-	}
+func TestRun_CancelDuringBackoff(t *testing.T) {
+	bot := newRunBot(func(_, _ string) (wsClient, error) {
+		ws := newMockWSClient()
+		go func() { ws.PingTimeoutChan() <- true }()
+		return ws, nil
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-
 	done := make(chan error, 1)
-	go func() {
-		done <- bot.listenWebSocket(ctx)
-	}()
+	go func() { done <- bot.Run(ctx) }()
 
 	time.Sleep(200 * time.Millisecond)
-	cancel()
-
-	select {
-	case err := <-done:
-		assert.NoError(t, err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("listenWebSocket did not exit during backoff")
-	}
+	stopRun(t, cancel, done)
 }
 
-func TestListenWebSocket_ConnectFailureReconnects(t *testing.T) {
+func TestRun_WebSocketConnectFailureReconnects(t *testing.T) {
 	var attempts atomic.Int32
-
-	bot := &Bot{
-		cfg: Config{URL: "http://localhost"},
-		connectWS: func(_, _ string) (wsClient, error) {
-			attempts.Add(1)
-			return nil, fmt.Errorf("connection refused")
-		},
-	}
+	bot := newRunBot(func(_, _ string) (wsClient, error) {
+		attempts.Add(1)
+		return nil, fmt.Errorf("connection refused")
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-
 	done := make(chan error, 1)
-	go func() {
-		done <- bot.listenWebSocket(ctx)
-	}()
+	go func() { done <- bot.Run(ctx) }()
 
 	require.Eventually(t, func() bool {
 		return attempts.Load() >= 2
-	}, 5*time.Second, 100*time.Millisecond)
-
-	cancel()
-
-	select {
-	case err := <-done:
-		assert.NoError(t, err)
-	case <-time.After(3 * time.Second):
-		t.Fatal("listenWebSocket did not exit after cancel")
-	}
+	}, 5*time.Second, 50*time.Millisecond)
+	stopRun(t, cancel, done)
 }
 
 // --- Event handling tests ---
