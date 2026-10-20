@@ -3,10 +3,11 @@
 // connect and long-running Run bodies when a chat server is unreachable
 // on boot (e.g. Tailscale MagicDNS not ready yet).
 //
-// The helper is intentionally tiny: one function, one Options struct, no
-// package-level state. Callers wrap their Run body in a closure and call
-// RunWithBackoff. The op's first ctx-aware return is reported as the
-// terminal error; a nil return exits the loop successfully.
+// The helper is intentionally tiny: one function and one Options struct
+// (plus two unexported test seams for the clock and sleep). Callers wrap
+// their Run body in a closure and call RunWithBackoff. It retries until op
+// returns nil or ctx is cancelled; cancellation also returns nil, so a clean
+// shutdown is not reported as an error.
 package reconnect
 
 import (
