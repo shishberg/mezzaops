@@ -24,10 +24,6 @@ type processBackendState struct {
 	// start ticks since boot on Linux, creation time on macOS. Together with
 	// BootID it identifies the process; zero means unknown (legacy record).
 	StartID int64 `json:"start_id,omitempty"`
-	// Unverified marks a record kept for a live process whose identity could
-	// not be verified (see TryAdopt). It is re-evaluated even though the
-	// service status saved with it is "stopped".
-	Unverified bool `json:"unverified,omitempty"`
 }
 
 // ProcessBackend manages a service as a child process with process adoption
@@ -40,17 +36,17 @@ type ProcessBackend struct {
 	logDir     string
 	adopt      bool // whether to attempt process adoption
 
-	// unknownRecord is the restored record of a live process whose identity
-	// could not be verified. While no process is tracked, SaveBackendState
-	// keeps returning it so each restart re-evaluates it. Cleared by Start.
-	unknownRecord *processBackendState
-
 	mu      sync.Mutex
 	pid     int
 	pgid    int
 	logPath string
 	process *exec.Cmd
 	done    chan struct{} // closed when process exits
+	// unknownRecord is the restored record of a live process whose identity
+	// could not be verified. While no process is tracked, Status reports
+	// "unknown", SaveBackendState keeps returning the record so each restart
+	// re-evaluates it, and Stop refuses. Cleared by Start.
+	unknownRecord *processBackendState
 
 	restoredState  *processBackendState // set by RestoreBackendState
 	restoredStatus string               // status from the state file
@@ -136,13 +132,25 @@ func (p *ProcessBackend) Start(ctx context.Context) error {
 	return nil
 }
 
+type internalStopKey struct{}
+
+// withInternalStop marks a Stop as Reload's stop-for-replacement, which must
+// not be refused because of an unverified leftover process.
+func withInternalStop(ctx context.Context) context.Context {
+	return context.WithValue(ctx, internalStopKey{}, true)
+}
+
 // Stop sends SIGTERM to the process group, waits up to 5 seconds,
 // then sends SIGKILL. Returns nil if the process is not running.
 func (p *ProcessBackend) Stop(ctx context.Context) error {
 	p.mu.Lock()
 
 	if !p.isRunning() {
+		unknown := p.unknownRecord
 		p.mu.Unlock()
+		if unknown != nil && ctx.Value(internalStopKey{}) == nil {
+			return fmt.Errorf("cannot stop unverified process pid %d; stop it manually", unknown.PID)
+		}
 		return nil
 	}
 
@@ -195,6 +203,9 @@ func (p *ProcessBackend) Status(ctx context.Context) (string, error) {
 
 	if p.isRunning() {
 		return "running", nil
+	}
+	if p.unknownRecord != nil {
+		return "unknown", nil
 	}
 	return "stopped", nil
 }
@@ -324,10 +335,8 @@ func (p *ProcessBackend) TryAdopt() (adoptOutcome, string) {
 
 	ps := *p.restoredState
 
-	// Desired state is stopped -- respect it (but a record kept for an
-	// unverified live process is re-evaluated: its status is "stopped"
-	// only because nothing is tracked).
-	if p.restoredStatus == "stopped" && !ps.Unverified {
+	// Desired state is stopped -- respect it
+	if p.restoredStatus == "stopped" {
 		return adoptNo, "stopped (preserved from previous session)"
 	}
 
@@ -338,7 +347,7 @@ func (p *ProcessBackend) TryAdopt() (adoptOutcome, string) {
 	}
 
 	// PID is dead -- process crashed while we were down
-	if !IsAlive(ps.PID) {
+	if !isAliveFn(ps.PID) {
 		return adoptNo, fmt.Sprintf("stale pid %d (process dead)", ps.PID)
 	}
 
@@ -351,7 +360,6 @@ func (p *ProcessBackend) TryAdopt() (adoptOutcome, string) {
 		// adopt it nor let autostart start a duplicate.
 		p.mu.Lock()
 		rec := ps
-		rec.Unverified = true
 		p.unknownRecord = &rec
 		p.mu.Unlock()
 		return adoptUnknown, fmt.Sprintf("pid %d is alive but its identity could not be verified; not adopting it and not autostarting", ps.PID)
@@ -399,7 +407,7 @@ func (p *ProcessBackend) isRunning() bool {
 		return false
 	}
 	if p.pid != 0 {
-		return IsAlive(p.pid)
+		return isAliveFn(p.pid)
 	}
 	return false
 }
@@ -408,7 +416,7 @@ func (p *ProcessBackend) isRunning() bool {
 func (p *ProcessBackend) pollAlive(pid int, done chan struct{}) {
 	for {
 		time.Sleep(2 * time.Second)
-		if !IsAlive(pid) {
+		if !isAliveFn(pid) {
 			p.mu.Lock()
 			p.pid = 0
 			p.pgid = 0

@@ -1,16 +1,11 @@
 package service
 
-import "github.com/shirou/gopsutil/v3/process"
-
 // processStartID returns the process creation time in milliseconds. On
 // macOS this is the kernel's absolute start time, which is not affected by
-// wall-clock steps, so an exact comparison is correct.
+// wall-clock steps, so an exact comparison is correct. It uses the same
+// lookup as createTimeFn so the two cannot diverge.
 func processStartID(pid int) (int64, error) {
-	p, err := process.NewProcess(int32(pid))
-	if err != nil {
-		return 0, err
-	}
-	return p.CreateTime()
+	return createTimeFn(pid)
 }
 
 // startIDIsCreateTime reports whether the start ID is the creation time, so a

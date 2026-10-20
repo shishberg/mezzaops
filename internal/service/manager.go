@@ -605,7 +605,7 @@ func (m *Manager) drainOps(ms *managedService) {
 func (m *Manager) internalStop(ms *managedService, startupPending bool) (reloadSnapshot, string) {
 	status, statusErr := ms.backend.Status(m.ctx)
 	backendRunning := statusErr == nil && status == "running"
-	if err := ms.backend.Stop(m.ctx); err != nil {
+	if err := ms.backend.Stop(withInternalStop(m.ctx)); err != nil {
 		return reloadSnapshot{}, fmt.Sprintf("stop failed: %v", err)
 	}
 	ms.stateMu.Lock()
@@ -633,16 +633,18 @@ func (m *Manager) handleOp(ms *managedService, op string) string {
 		return "started"
 
 	case "stop":
-		if err := ms.backend.Stop(ctx); err != nil {
-			return fmt.Sprintf("stop failed: %v", err)
-		}
-		// Record operator intent. Live status is also "stopped" but
-		// will be overwritten on the next saveServiceState when the
-		// backend reports its status; DesiredStatus is preserved
+		// Record operator intent when the command is accepted, before the
+		// backend call (as for start/restart), so even a refused stop
+		// is not overridden by a later autostart. Live status is also
+		// "stopped" but will be overwritten on the next saveServiceState
+		// when the backend reports its status; DesiredStatus is preserved
 		// across that rewrite.
 		ms.stateMu.Lock()
 		ms.state.DesiredStatus = "stopped"
 		ms.stateMu.Unlock()
+		if err := ms.backend.Stop(ctx); err != nil {
+			return fmt.Sprintf("stop failed: %v", err)
+		}
 		m.notifyEvent(ms.config.Name, "stopped")
 		return "stopped"
 
@@ -1289,7 +1291,7 @@ func (m *Manager) cleanOrphans() {
 		} else {
 			_ = json.Unmarshal(raw, &ps)
 		}
-		if ps.PID > 0 && ps.PGID > 0 && IsAlive(ps.PID) && VerifyProcess(ps) {
+		if ps.PID > 0 && ps.PGID > 0 && isAliveFn(ps.PID) && VerifyProcess(ps) {
 			_ = killFn(-ps.PGID, syscall.SIGKILL)
 		}
 		RemoveState(m.stateDir, name)

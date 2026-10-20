@@ -3191,35 +3191,6 @@ func TestVerifyProcessResult_ThreeStates(t *testing.T) {
 	}
 }
 
-func TestNewManager_UnknownIdentityIsNeitherAdoptedNorAutostarted(t *testing.T) {
-	withBootID(t, "boot-A")
-	withStartID(t, func(int) (int64, error) { return 0, errors.New("permission denied") })
-	cfg := testConfig(t)
-
-	child := exec.Command("sleep", "3600")
-	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := child.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
-	raw, _ := json.Marshal(processBackendState{PID: child.Process.Pid, PGID: child.Process.Pid, BootID: "boot-A", StartID: 5})
-	if err := SaveState(cfg.StateDir, "testsvc", State{Status: "running", DesiredStatus: "running", Backend: raw, BootID: "boot-A"}); err != nil {
-		t.Fatal(err)
-	}
-	yes := true
-	svc := autostartService("testsvc", t.TempDir(), &yes) // adopt defaults to true
-	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Stop()
-	m.SignalReady()
-	time.Sleep(400 * time.Millisecond)
-	if got := m.Do("testsvc", "status"); got != "stopped" {
-		t.Fatalf("an alive pid with unknown identity must be neither adopted nor autostarted: %q", got)
-	}
-}
-
 func TestSaveBackendState_StartIDReusesCreateTimeWhereItIsTheStartID(t *testing.T) {
 	var calls atomic.Int32
 	withStartID(t, func(int) (int64, error) { calls.Add(1); return 424242, nil })
@@ -3289,49 +3260,9 @@ func withBootTime(t *testing.T, fn func() (int64, error)) {
 
 func withAlive(t *testing.T, alive bool) {
 	t.Helper()
-	orig := isAliveFn
-	isAliveFn = func(int) bool { return alive }
-	t.Cleanup(func() { isAliveFn = orig })
-}
-
-func withTolerance(t *testing.T, ms int64) {
-	t.Helper()
-	orig := legacyCreateTimeTolerance
-	legacyCreateTimeTolerance = ms
-	t.Cleanup(func() { legacyCreateTimeTolerance = orig })
-}
-
-func TestVerifyProcess_LegacyCreateTimeComparison(t *testing.T) {
-	withBootID(t, "")
-	const live = int64(1_700_000_000_000)
-	withCreateTime(t, func(int) (int64, error) { return live, nil })
-
-	check := func(tol, delta int64, want bool) {
-		t.Helper()
-		withTolerance(t, tol)
-		got := VerifyProcess(processBackendState{PID: 1234, CreateTime: live + delta})
-		if got != want {
-			t.Errorf("tolerance %dms, CreateTime off by %dms: verified=%v, want %v", tol, delta, got, want)
-		}
-	}
-	// macOS: exact.
-	check(0, 0, true)
-	check(0, 1, false)
-	check(0, -1, false)
-	// Linux: gopsutil's boot time wobbles, allowing 1000ms.
-	check(1000, 1000, true)
-	check(1000, -1000, true)
-	check(1000, 1001, false)
-	check(1000, -1001, false)
-}
-
-func TestLegacyCreateTimeTolerance_PlatformDefaults(t *testing.T) {
-	if runtime.GOOS == "linux" && legacyCreateTimeTolerance != 1000 {
-		t.Errorf("Linux default tolerance: got %d, want 1000", legacyCreateTimeTolerance)
-	}
-	if runtime.GOOS == "darwin" && legacyCreateTimeTolerance != 0 {
-		t.Errorf("darwin must compare CreateTime exactly, got tolerance %d", legacyCreateTimeTolerance)
-	}
+	fn := func(int) bool { return alive }
+	isAliveOverride.Store(&fn)
+	t.Cleanup(func() { isAliveOverride.Store(nil) })
 }
 
 func TestVerifyProcess_BootIDAndBootTimeViaSeams(t *testing.T) {
@@ -3385,7 +3316,6 @@ func TestVerifyProcessResult_ExitedMidCheckIsMismatch(t *testing.T) {
 func TestVerifyProcessResult_BootTimeErrorFallsThroughToCreateTime(t *testing.T) {
 	withBootID(t, "")
 	withBootTime(t, func() (int64, error) { return 0, errors.New("no boot time") })
-	withTolerance(t, 0)
 	withCreateTime(t, func(int) (int64, error) { return 5000, nil })
 	rec := processBackendState{PID: 1234, BootTime: 1_700_000_000, CreateTime: 5000}
 	if got := verifyProcessResult(rec); got != verifyVerified {
@@ -3397,48 +3327,151 @@ func TestVerifyProcessResult_BootTimeErrorFallsThroughToCreateTime(t *testing.T)
 	}
 }
 
-func TestNewManager_UnknownIdentityRecordSurvivesSaveAndRestart(t *testing.T) {
-	withBootID(t, "boot-A")
-	withStartID(t, func(int) (int64, error) { return 0, errors.New("permission denied") })
-	cfg := testConfig(t)
+// --- unverified (unknown identity) records, driven through seams ---
 
-	child := exec.Command("sleep", "3600")
-	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := child.Start(); err != nil {
+const unknownPID = 424242
+
+// unknownIdentityManager returns a manager for an autostart service whose
+// saved record names a live pid whose identity cannot be looked up.
+func unknownIdentityManager(t *testing.T, cfg *config.Config, svc config.ServiceConfig) *Manager {
+	t.Helper()
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
-	raw, _ := json.Marshal(processBackendState{PID: child.Process.Pid, PGID: child.Process.Pid, BootID: "boot-A", StartID: 5})
+	m.SignalReady()
+	return m
+}
+
+func seedUnknownIdentity(t *testing.T) (*config.Config, config.ServiceConfig) {
+	t.Helper()
+	withBootID(t, "boot-A")
+	withStartID(t, func(int) (int64, error) { return 0, errors.New("permission denied") })
+	withAlive(t, true)
+	cfg := testConfig(t)
+	raw, _ := json.Marshal(processBackendState{PID: unknownPID, PGID: unknownPID, BootID: "boot-A", StartID: 5})
 	if err := SaveState(cfg.StateDir, "testsvc", State{Status: "running", DesiredStatus: "running", Backend: raw, BootID: "boot-A"}); err != nil {
 		t.Fatal(err)
 	}
 	yes := true
-	svc := autostartService("testsvc", t.TempDir(), &yes)
-	newMgr := func() *Manager {
-		m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		m.SignalReady()
-		return m
-	}
+	return cfg, autostartService("testsvc", t.TempDir(), &yes) // adopt defaults to true
+}
 
-	m1 := newMgr()
-	// Any save (an exit event, a deploy, an operator op) must keep the record.
+func TestNewManager_UnknownIdentityIsNeitherAdoptedNorAutostarted(t *testing.T) {
+	cfg, svc := seedUnknownIdentity(t)
+	m := unknownIdentityManager(t, cfg, svc)
+	defer m.Stop()
+	time.Sleep(300 * time.Millisecond)
+	if got := m.Do("testsvc", "status"); got != "unknown" {
+		t.Fatalf("an alive pid with unknown identity is neither adopted nor autostarted, and reports unknown: %q", got)
+	}
+}
+
+func TestNewManager_UnknownIdentityRecordSurvivesSaveAndRestart(t *testing.T) {
+	cfg, svc := seedUnknownIdentity(t)
+	m1 := unknownIdentityManager(t, cfg, svc)
 	m1.mu.Lock()
 	ms := m1.services["testsvc"]
 	m1.mu.Unlock()
-	m1.saveServiceState(ms)
+	m1.saveServiceState(ms) // any save (exit event, deploy, op)
 	m1.Stop()
-	_, saved, err := LoadState(cfg.StateDir, "testsvc")
-	if err != nil || !strings.Contains(string(saved), fmt.Sprintf(`"pid":%d`, child.Process.Pid)) {
+	s, saved, err := LoadState(cfg.StateDir, "testsvc")
+	if err != nil || !strings.Contains(string(saved), fmt.Sprintf(`"pid":%d`, unknownPID)) {
 		t.Fatalf("the unverified record was dropped by a save: %s (err %v)", saved, err)
 	}
+	if s.Status != "unknown" {
+		t.Fatalf("saved status: got %q, want unknown (so \"stopped\" handling does not apply)", s.Status)
+	}
 
-	m2 := newMgr()
+	// A restart re-evaluates the record: still unknown, still no autostart.
+	m2 := unknownIdentityManager(t, cfg, svc)
 	defer m2.Stop()
-	time.Sleep(400 * time.Millisecond)
-	if got := m2.Do("testsvc", "status"); got != "stopped" {
-		t.Fatalf("after a restart an unverifiable process must still not be autostarted over: %q", got)
+	time.Sleep(300 * time.Millisecond)
+	if got := m2.Do("testsvc", "status"); got != "unknown" {
+		t.Fatalf("after a restart: %q", got)
+	}
+}
+
+func TestManager_StopRefusesUnverifiedProcessButRecordsIntent(t *testing.T) {
+	cfg, svc := seedUnknownIdentity(t)
+	m := unknownIdentityManager(t, cfg, svc)
+	defer m.Stop()
+
+	got := m.Do("testsvc", "stop")
+	if got == "stopped" || !strings.Contains(got, fmt.Sprint(unknownPID)) || !strings.Contains(got, "stop it manually") {
+		t.Fatalf("stop of an unverified process: got %q, want an error naming the pid", got)
+	}
+	if d := m.GetAllStates()["testsvc"].DesiredStatus; d != "stopped" {
+		t.Fatalf("the operator's intent is recorded first: DesiredStatus %q", d)
+	}
+}
+
+func TestManager_ReloadIsNotBlockedByUnverifiedProcess(t *testing.T) {
+	cfg, _ := seedUnknownIdentity(t)
+	servicesDir := t.TempDir()
+	cfg.ServicesDir = servicesDir
+	svcPath := filepath.Join(servicesDir, "testsvc.yaml")
+	data := "dir: /tmp\nautostart: true\nentrypoint:\n  - sleep\n  - \"3600\"\n"
+	if err := os.WriteFile(svcPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+	services, _ := config.LoadServices(servicesDir)
+	m, err := NewManager(cfg, services, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	m.SignalReady()
+	if err := os.WriteFile(svcPath, []byte(data+"branch: other\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Reload(); err != nil {
+		t.Fatalf("a config reload must not be blocked by the unverified process: %v", err)
+	}
+}
+
+func TestVerifyProcessResult_LegacyBootTimeErrorNeedsCreateTime(t *testing.T) {
+	withBootID(t, "")
+	withBootTime(t, func() (int64, error) { return 0, errors.New("no boot time") })
+	withCreateTime(t, func(int) (int64, error) { return 5000, nil })
+	// A record with only a boot time and an unreadable boot time has no
+	// identity check at all: unknown, never verified.
+	if got := verifyProcessResult(processBackendState{PID: 1234, BootTime: 1_700_000_000}); got != verifyUnknown {
+		t.Errorf("boot time only, unreadable: got %v, want unknown", got)
+	}
+}
+
+func TestCreateTimeMatches(t *testing.T) {
+	for _, c := range []struct {
+		live, rec, tol int64
+		want           bool
+	}{
+		{5000, 5000, 0, true},
+		{5000, 5001, 0, false},
+		{5000, 4999, 0, false},
+		{5000, 6000, 1000, true},
+		{5000, 4000, 1000, true},
+		{5000, 6001, 1000, false},
+		{5000, 3999, 1000, false},
+	} {
+		if got := createTimeMatches(c.live, c.rec, c.tol); got != c.want {
+			t.Errorf("createTimeMatches(%d, %d, tol %d) = %v, want %v", c.live, c.rec, c.tol, got, c.want)
+		}
+	}
+	if got := int64(legacyCreateTimeTolerance); (runtime.GOOS == "linux" && got != 1000) || (runtime.GOOS == "darwin" && got != 0) {
+		t.Errorf("platform tolerance: got %d on %s", got, runtime.GOOS)
+	}
+}
+
+func TestVerifyProcessResult_BootIDMatchWithoutStartIDUsesCreateTime(t *testing.T) {
+	withBootID(t, "boot-A")
+	withStartID(t, func(int) (int64, error) { t.Fatal("no start ID recorded: must not look one up"); return 0, nil })
+	withCreateTime(t, func(int) (int64, error) { return 1_700_000_000_000, nil })
+	// Far enough off to be a mismatch on every platform.
+	if got := verifyProcessResult(processBackendState{PID: 1234, BootID: "boot-A", CreateTime: 1_700_000_005_000}); got != verifyMismatch {
+		t.Errorf("CreateTime mismatch: got %v, want mismatch", got)
+	}
+	if got := verifyProcessResult(processBackendState{PID: 1234, BootID: "boot-A", CreateTime: 1_700_000_000_000}); got != verifyVerified {
+		t.Errorf("CreateTime match: got %v, want verified", got)
 	}
 }

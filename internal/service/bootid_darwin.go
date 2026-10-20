@@ -13,4 +13,4 @@ func bootID() string {
 
 // legacyCreateTimeTolerance is 0 on macOS: CreateTime is the kernel's absolute
 // start time and is compared exactly.
-var legacyCreateTimeTolerance int64 = 0
+const legacyCreateTimeTolerance int64 = 0

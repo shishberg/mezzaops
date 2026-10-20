@@ -382,14 +382,19 @@ second copy. This is pre-existing behaviour on main.
   second. The result is three-state: verified, mismatch (a different process
   or gone), or unknown (the pid is alive but a lookup failed). `TryAdopt`
   adopts only on verified; on unknown it neither adopts nor lets autostart run
-  (logged with the pid), so no duplicate is started; the unverified record is
-  kept in later saves, marked `unverified` so that it is re-evaluated even though the service status saved with it is "stopped", (until the backend starts a process) so each
-  restart re-evaluates it; a lookup that fails because the process exited in
-  the meantime is a mismatch; on the legacy path an unreadable boot time skips
-  that check and the CreateTime comparison decides. `cleanOrphans` kills only
-  on verified. A record with no identity data at all is accepted, as on main.
-  There
-  are no jitter or clock-step thresholds. `adopt: true` is
+  (logged with the pid), so no duplicate is started. While the unverified
+  record is held and no process is tracked, the backend's `Status` reports
+  `unknown` (so the saved status is `unknown`, not `stopped`, and main's
+  "stopped" early return does not apply on the next restart); its record is
+  kept unchanged in later saves until the backend starts a process, so every
+  restart re-evaluates it; and an operator `stop` returns an error naming the
+  pid ("cannot stop unverified process pid N; stop it manually") after the
+  intent has been recorded. Reload's internal stop is not refused. A lookup
+  that fails because the process exited in the meantime is a mismatch. On the
+  legacy path an unreadable boot time skips that check only when a CreateTime
+  was recorded (which then decides); with no CreateTime the result is unknown.
+  `cleanOrphans` kills only on verified. A record with no identity data at all
+  is accepted, as on main. are no jitter or clock-step thresholds. `adopt: true` is
   unchanged: adopt if possible, otherwise autostart. There is no orphan
   tracking.
 - [x] **IsAlive guard** — `IsAlive(pid <= 0)` is false, since `kill(0, 0)` and
@@ -397,9 +402,10 @@ second copy. This is pre-existing behaviour on main.
   `cleanOrphans`, `isRunning` and `pollAlive`, and `cleanOrphans` also needs
   `PID > 0` and `PGID > 0`.
 - [x] **F** — `ProcessBackend.TryAdopt` returns `(outcome, msg string)`;
-  the autostart decision branches on the outcome, not a message prefix. `TryAdopt` now returns a three-state outcome
-  (adopted, not adopted, identity unknown) rather than a bool. A record
-  with a non-positive pid is never adopted.
+  the autostart decision branches on the outcome, not a message prefix.
+  `TryAdopt` returns a three-state outcome (adopted, not adopted, identity
+  unknown) rather than a bool. A record with a non-positive pid is never
+  adopted.
 - [x] **G** — `reconnect.RunWithBackoff` resets the delay to `InitialDelay`
   when an attempt ran for at least `MaxDelay` before failing; its doc comment
   now says it retries until ctx is cancelled.

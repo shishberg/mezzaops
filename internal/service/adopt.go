@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"io/fs"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/shirou/gopsutil/v3/host"
@@ -95,26 +96,38 @@ func verifyProcessResult(ps processBackendState) verifyResult {
 			}
 		}
 	} else if ps.BootTime != 0 {
-		// If the boot time cannot be read, skip this check and rely on the
-		// CreateTime comparison below.
-		if bootTime, err := bootTimeFn(); err == nil && !sameBoot(bootTime, ps.BootTime) {
+		bootTime, err := bootTimeFn()
+		switch {
+		case err == nil && !sameBoot(bootTime, ps.BootTime):
 			return verifyMismatch
+		case err != nil && ps.CreateTime == 0:
+			// Nothing else to check the process against.
+			return verifyUnknown
 		}
+		// If the boot time cannot be read but a CreateTime was recorded,
+		// the CreateTime comparison below decides.
 	}
 	if ps.CreateTime != 0 {
 		createTime, err := createTimeFn(ps.PID)
 		if err != nil {
 			return lookupFailed(err)
 		}
-		delta := createTime - ps.CreateTime
-		if delta < 0 {
-			delta = -delta
-		}
-		if delta > legacyCreateTimeTolerance {
+		if !createTimeMatches(createTime, ps.CreateTime, legacyCreateTimeTolerance) {
 			return verifyMismatch
 		}
 	}
 	return verifyVerified
+}
+
+// createTimeMatches reports whether two creation times (ms) are within tol of
+// each other. The tolerance is a parameter so both platform values can be
+// tested directly.
+func createTimeMatches(live, recorded, tol int64) bool {
+	d := live - recorded
+	if d < 0 {
+		d = -d
+	}
+	return d <= tol
 }
 
 // Seams for the platform lookups, so tests can drive verification
@@ -133,9 +146,19 @@ var (
 		bt, err := host.BootTime()
 		return int64(bt), err
 	}
-	// isAliveFn reports whether a pid exists.
-	isAliveFn = IsAlive
 )
+
+// isAliveOverride replaces IsAlive in tests. It is atomic because adopted
+// processes are polled from background goroutines that outlive a test.
+var isAliveOverride atomic.Pointer[func(pid int) bool]
+
+// isAliveFn reports whether a pid exists (IsAlive, unless a test overrides it).
+func isAliveFn(pid int) bool {
+	if f := isAliveOverride.Load(); f != nil {
+		return (*f)(pid)
+	}
+	return IsAlive(pid)
+}
 
 // VerifyProcess reports whether the record is positively the live process.
 // An unknown result is not verified (cleanOrphans, for one, must not kill on
