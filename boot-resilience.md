@@ -302,13 +302,15 @@ safer one for cold-boot recovery. Documented inline in
   boot: the host boot time (gopsutil `host.BootTime`, recorded in the service
   state on every save as `boot_time`) must differ from the one in the saved
   state. After a host reboot no child can have survived, so there is no
-  duplicate to avoid. If mezzaops restarts without a host reboot, an
-  `adopt: false` service is not autostarted and one line is logged saying why
-  (the previous process may still be running); this matches the behaviour
-  before this branch, when `adopt: false` never started anything at boot. If
-  the boot time cannot be determined, or the saved state has none, it is
-  likewise not autostarted. `adopt: true` is unchanged: adopt if possible,
-  otherwise autostart. There is no orphan tracking.
+  duplicate to avoid. A service with no state file at all in a configured
+  state dir has never run here, so it is autostarted too. If mezzaops
+  restarts without a host reboot, an `adopt: false` service is not
+  autostarted and one line is logged saying why (the previous process may
+  still be running); this matches the behaviour before this branch, when
+  `adopt: false` never started anything at boot. If the boot time cannot be
+  determined, or an existing saved state has none (or no state dir is
+  configured), it is likewise not autostarted. `adopt: true` is unchanged:
+  adopt if possible, otherwise autostart. There is no orphan tracking.
 - [x] **F** — `ProcessBackend.TryAdopt` returns `(adopted bool, msg string)`;
   the autostart decision branches on the bool, not a message prefix.
 - [x] **G** — `reconnect.RunWithBackoff` resets the delay to `InitialDelay`

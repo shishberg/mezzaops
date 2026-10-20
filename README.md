@@ -71,7 +71,8 @@ with `status: "stopped"` — use with care, it ignores the operator's
 last command.
 
 A service with `adopt: false` is autostarted only after a host reboot
-(the boot time recorded in its state differs from the current one). If
+(the boot time recorded in its state differs from the current one), or
+when it has no state file yet (it has never run here). If
 mezzaops itself restarts without a reboot, the previous child may still
 be running, so nothing is started and a log line says so.
 

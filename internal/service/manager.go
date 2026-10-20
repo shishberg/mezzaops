@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"maps"
 	"os"
@@ -221,6 +222,9 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot, repla
 	var persistedDesired string
 	var persistedBoot int64
 	s, raw, err := LoadState(m.stateDir, svc.Name)
+	// With a state dir configured but no state file for this service, it
+	// has never run here, so no previous child can exist.
+	neverRan := err != nil && m.stateDir != "" && errors.Is(err, fs.ErrNotExist)
 	if err == nil {
 		persistedBoot = s.BootTime
 		ms.state.LastDeploy = s.LastDeploy
@@ -257,7 +261,7 @@ func (m *Manager) newManagedService(svc config.ServiceConfig, startOnBoot, repla
 		// (no child can have survived one); see rebootedSince.
 		if !adopted && !replacing && svc.ShouldAutostart(startOnBoot) {
 			if (persistedDesired != "stopped" || svc.AutostartForce) &&
-				(adopt || m.rebootedSince(svc.Name, persistedBoot)) {
+				(adopt || neverRan || m.rebootedSince(svc.Name, persistedBoot)) {
 				ms.autostartOnReady = true
 				ms.restartOnStartup = true
 				reason := "cold boot (adoption failed)"

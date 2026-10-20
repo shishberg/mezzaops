@@ -2335,3 +2335,19 @@ func TestCleanOrphans_KillsVerifiedGroup(t *testing.T) {
 		t.Fatalf("cleanOrphans kill target: got %d, want -424242", got.Load())
 	}
 }
+
+func TestNewManager_AdoptFalseAutostartsWhenNoStateFileExists(t *testing.T) {
+	// A configured state dir with no state for the service means this
+	// service never ran here, so no previous child can exist.
+	cfg := testConfig(t)
+	yes, no := true, false
+	svc := autostartService("testsvc", t.TempDir(), &yes)
+	svc.Adopt = &no
+	m, err := NewManager(cfg, []config.ServiceConfig{svc}, NopNotifier{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+	m.SignalReady()
+	waitForStatus(t, m, "testsvc", "running")
+}
